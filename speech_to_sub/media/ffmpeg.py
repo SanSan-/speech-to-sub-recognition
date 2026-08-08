@@ -55,13 +55,15 @@ class FFprobePayload(TypedDict, total=False):
     format: FFprobeFormatPayload
 
 
+_ENGLISH_LANGUAGE_ALIASES = frozenset({"en", "eng", "english"})
+_RUSSIAN_LANGUAGE_ALIASES = frozenset({"ru", "rus", "russian", "русский"})
 _LANGUAGE_ALIASES: dict[str, frozenset[str]] = {
-    "en": frozenset({"en", "eng", "english"}),
-    "eng": frozenset({"en", "eng", "english"}),
-    "english": frozenset({"en", "eng", "english"}),
-    "ru": frozenset({"ru", "rus", "russian", "русский"}),
-    "rus": frozenset({"ru", "rus", "russian", "русский"}),
-    "russian": frozenset({"ru", "rus", "russian", "русский"}),
+    "en": _ENGLISH_LANGUAGE_ALIASES,
+    "eng": _ENGLISH_LANGUAGE_ALIASES,
+    "english": _ENGLISH_LANGUAGE_ALIASES,
+    "ru": _RUSSIAN_LANGUAGE_ALIASES,
+    "rus": _RUSSIAN_LANGUAGE_ALIASES,
+    "russian": _RUSSIAN_LANGUAGE_ALIASES,
 }
 
 

@@ -31,22 +31,23 @@ def discover_media(paths: Iterable[Path], recursive: bool) -> list[Path]:
     """Детерминированно собирает поддерживаемые файлы из путей и папок."""
     found: dict[str, Path] = {}
     for raw_path in paths:
-        resolved = _resolve_existing(raw_path, "Входной путь")
-        if resolved.is_file():
-            media = validate_media_file(resolved)
-            found[str(media).casefold()] = media
-            continue
-        iterator = resolved.rglob("*") if recursive else resolved.iterdir()
-        for candidate in iterator:
-            if not candidate.is_file():
-                continue
-            if candidate.suffix.casefold() not in SUPPORTED_MEDIA_EXTENSIONS:
-                continue
-            if _is_generated_audio(candidate):
-                continue
-            media = validate_media_file(candidate)
+        for media in _discover_from_path(raw_path, recursive):
             found[str(media).casefold()] = media
     return sorted(found.values(), key=lambda value: str(value).casefold())
+
+
+def _discover_from_path(raw_path: Path, recursive: bool) -> list[Path]:
+    resolved = _resolve_existing(raw_path, "Входной путь")
+    if resolved.is_file():
+        return [validate_media_file(resolved)]
+    iterator = resolved.rglob("*") if recursive else resolved.iterdir()
+    return [
+        validate_media_file(candidate)
+        for candidate in iterator
+        if candidate.is_file()
+        and candidate.suffix.casefold() in SUPPORTED_MEDIA_EXTENSIONS
+        and not _is_generated_audio(candidate)
+    ]
 
 
 def validate_model_path(path: Path) -> Path:

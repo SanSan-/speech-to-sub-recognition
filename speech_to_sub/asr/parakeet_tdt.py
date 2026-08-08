@@ -323,24 +323,7 @@ def _merge_window_segments(
     result: list[TranscriptSegment] = []
     previous_word: TranscriptWord | None = None
     for segment in segments:
-        words: list[TranscriptWord] = []
-        for word in segment.words:
-            if previous_word is not None and word.start < previous_word.end:
-                if _normalized_word(word.text) == _normalized_word(previous_word.text):
-                    continue
-                start = previous_word.end
-            else:
-                start = word.start
-            if word.end <= start:
-                continue
-            current = TranscriptWord(
-                start=start,
-                end=word.end,
-                text=word.text,
-                probability=word.probability,
-            )
-            words.append(current)
-            previous_word = current
+        words, previous_word = _merge_segment_words(segment.words, previous_word)
         if not words:
             continue
         result.append(
@@ -355,6 +338,36 @@ def _merge_window_segments(
     return result
 
 
+def _merge_segment_words(
+    source: Sequence[TranscriptWord],
+    previous_word: TranscriptWord | None,
+) -> tuple[list[TranscriptWord], TranscriptWord | None]:
+    words: list[TranscriptWord] = []
+    for word in source:
+        start = _merged_word_start(word, previous_word)
+        if start is None or word.end <= start:
+            continue
+        previous_word = TranscriptWord(
+            start=start,
+            end=word.end,
+            text=word.text,
+            probability=word.probability,
+        )
+        words.append(previous_word)
+    return words, previous_word
+
+
+def _merged_word_start(
+    word: TranscriptWord,
+    previous_word: TranscriptWord | None,
+) -> float | None:
+    if previous_word is None or word.start >= previous_word.end:
+        return word.start
+    if _normalized_word(word.text) == _normalized_word(previous_word.text):
+        return None
+    return previous_word.end
+
+
 def _normalized_word(value: str) -> str:
     return value.strip().casefold()
 
@@ -365,16 +378,10 @@ def _group_subword_tokens(raw_tokens: Sequence[Any]) -> list[tuple[str, float, f
     current_start = 0.0
     current_end = 0.0
     for raw in raw_tokens:
-        if not isinstance(raw, Mapping):
+        parsed = _parse_subword_token(raw)
+        if parsed is None:
             continue
-        token = str(raw.get("token") or "")
-        try:
-            start = float(raw.get("start", 0.0))
-            end = float(raw.get("end", start))
-        except (TypeError, ValueError):
-            continue
-        if not token or not math.isfinite(start) or not math.isfinite(end):
-            continue
+        token, start, end = parsed
         starts_word = bool(token[:1].isspace())
         normalized = token.strip() if starts_word else token
         if not normalized:
@@ -390,6 +397,20 @@ def _group_subword_tokens(raw_tokens: Sequence[Any]) -> list[tuple[str, float, f
     if current_text:
         result.append((current_text, current_start, max(current_start + 0.001, current_end)))
     return result
+
+
+def _parse_subword_token(raw: Any) -> tuple[str, float, float] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    token = str(raw.get("token") or "")
+    try:
+        start = float(raw.get("start", 0.0))
+        end = float(raw.get("end", start))
+    except (TypeError, ValueError):
+        return None
+    if not token or not math.isfinite(start) or not math.isfinite(end):
+        return None
+    return token, start, end
 
 
 def _build_transcript(

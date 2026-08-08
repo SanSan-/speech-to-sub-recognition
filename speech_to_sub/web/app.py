@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Annotated, Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -56,6 +56,13 @@ STATIC_DIR = ROOT_DIR / "static"
 PROJECT_ROOT = ROOT_DIR.parents[1]
 DEFAULT_JOB_DB = PROJECT_ROOT / "resources" / "state" / "jobs.sqlite3"
 DEFAULT_WEB_PORT = 7862
+SERVICE_MODULE = "speech_to_sub.service"
+JOB_NOT_FOUND_DETAIL = "Задача не найдена."
+
+_BAD_REQUEST_RESPONSE = {"description": "Некорректные входные данные."}
+_JOB_NOT_FOUND_RESPONSE = {"description": JOB_NOT_FOUND_DETAIL}
+_JOB_CONFLICT_RESPONSE = {"description": "Операция конфликтует с состоянием задачи."}
+_INTERNAL_ERROR_RESPONSE = {"description": "Внутренняя ошибка локального сервиса."}
 
 load_environment()
 logger = logging.getLogger(__name__)
@@ -72,7 +79,7 @@ class ServiceAdapter:
 
     @staticmethod
     def get_preflight_status(settings: dict[str, Any]) -> dict[str, Any]:
-        module = importlib.import_module("speech_to_sub.service")
+        module = importlib.import_module(SERVICE_MODULE)
         result = module.get_preflight_status(settings)
         if not isinstance(result, Mapping):
             raise TypeError("Сервис должен вернуть результат предварительной проверки.")
@@ -80,7 +87,7 @@ class ServiceAdapter:
 
     @staticmethod
     def build_items(paths: list[str], settings: dict[str, Any]) -> list[dict[str, Any]]:
-        module = importlib.import_module("speech_to_sub.service")
+        module = importlib.import_module(SERVICE_MODULE)
         result = module.build_items(paths, settings)
         if not isinstance(result, list) or any(not isinstance(item, Mapping) for item in result):
             raise TypeError("Сервис должен вернуть список карточек файлов.")
@@ -95,7 +102,7 @@ class ServiceAdapter:
         *,
         cancel_check: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
-        module = importlib.import_module("speech_to_sub.service")
+        module = importlib.import_module(SERVICE_MODULE)
         result = module.process_paths(
             paths,
             settings,
@@ -117,7 +124,7 @@ class ServiceAdapter:
 
     @staticmethod
     def cleanup_workspaces() -> list[Path]:
-        module = importlib.import_module("speech_to_sub.service")
+        module = importlib.import_module(SERVICE_MODULE)
         return list(module.cleanup_stale_workspaces())
 
 
@@ -252,27 +259,32 @@ def active_job() -> dict[str, Any]:
 
 
 @app.get("/api/jobs")
-def list_jobs(limit: int = Query(default=16, ge=1, le=100)) -> dict[str, Any]:
+def list_jobs(
+    limit: Annotated[int, Query(ge=1, le=100)] = 16,
+) -> dict[str, Any]:
     """Возвращает bounded-историю сохранённых пакетных задач."""
     return {"jobs": job_registry.list_snapshots(limit=limit)}
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", responses={404: _JOB_NOT_FOUND_RESPONSE})
 def get_job(job_id: str) -> dict[str, Any]:
     """Возвращает persisted snapshot и историю событий конкретной задачи."""
     try:
         return job_registry.snapshot(job_id, include_events=True)
     except JobNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Задача не найдена.") from exc
+        raise HTTPException(status_code=404, detail=JOB_NOT_FOUND_DETAIL) from exc
 
 
-@app.post("/api/jobs/{job_id}/cancel")
+@app.post(
+    "/api/jobs/{job_id}/cancel",
+    responses={404: _JOB_NOT_FOUND_RESPONSE, 409: _JOB_CONFLICT_RESPONSE},
+)
 def cancel_job(job_id: str) -> dict[str, Any]:
     """Запрашивает безопасную кооперативную отмену активной задачи."""
     try:
         snapshot = job_registry.cancel(job_id)
     except JobNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Задача не найдена.") from exc
+        raise HTTPException(status_code=404, detail=JOB_NOT_FOUND_DETAIL) from exc
     except JobStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
@@ -282,7 +294,10 @@ def cancel_job(job_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/jobs/{job_id}/retry")
+@app.post(
+    "/api/jobs/{job_id}/retry",
+    responses={404: _JOB_NOT_FOUND_RESPONSE, 409: _JOB_CONFLICT_RESPONSE},
+)
 def retry_job(job_id: str) -> dict[str, Any]:
     """Запускает заново только failed/cancelled/interrupted элементы."""
     try:
@@ -297,7 +312,7 @@ def retry_job(job_id: str) -> dict[str, Any]:
             reservation_token=reservation,
         )
     except JobNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Задача не найдена.") from exc
+        raise HTTPException(status_code=404, detail=JOB_NOT_FOUND_DETAIL) from exc
     except (JobBusyError, JobStateError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
@@ -309,7 +324,10 @@ def retry_job(job_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/pick")
+@app.post(
+    "/api/pick",
+    responses={400: _BAD_REQUEST_RESPONSE, 500: _INTERNAL_ERROR_RESPONSE},
+)
 def pick(payload: PickRequest) -> dict[str, Any]:
     """Открывает локальный picker и строит карточки выбранных файлов."""
     with _picker_refresh_lock:
@@ -323,7 +341,7 @@ def pick(payload: PickRequest) -> dict[str, Any]:
     return _selection_payload(selection, items)
 
 
-@app.post("/api/refresh")
+@app.post("/api/refresh", responses={400: _BAD_REQUEST_RESPONSE})
 def refresh(payload: RefreshRequest) -> dict[str, Any]:
     """Повторно строит карточки без запуска тяжёлого ASR."""
     with _picker_refresh_lock:
@@ -332,7 +350,10 @@ def refresh(payload: RefreshRequest) -> dict[str, Any]:
         return {"items": _build_items(paths, settings)}
 
 
-@app.post("/api/transcribe")
+@app.post(
+    "/api/transcribe",
+    responses={400: _BAD_REQUEST_RESPONSE, 409: _JOB_CONFLICT_RESPONSE},
+)
 def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
     """Запускает единственную фоновую пакетную задачу."""
     source_paths = _normalize_source_paths(payload.paths)
@@ -359,11 +380,11 @@ def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
     return {"job_id": job.job_id, "items": items}
 
 
-@app.get("/api/stream/{job_id}")
+@app.get("/api/stream/{job_id}", responses={404: _JOB_NOT_FOUND_RESPONSE})
 def stream(
     job_id: str,
-    cursor: int = Query(default=0, ge=0),
-    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    cursor: Annotated[int, Query(ge=0)] = 0,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
     """Передаёт SSE-историю и гарантированно завершает terminal-подключение."""
     try:
@@ -371,7 +392,7 @@ def stream(
         events = job_registry.iter_sse(job_id, after_event_id=after_event_id)
         job_registry.get(job_id)
     except JobNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Задача не найдена.") from exc
+        raise HTTPException(status_code=404, detail=JOB_NOT_FOUND_DETAIL) from exc
     return StreamingResponse(
         events,
         media_type="text/event-stream",
@@ -382,7 +403,10 @@ def stream(
     )
 
 
-@app.post("/api/unload")
+@app.post(
+    "/api/unload",
+    responses={409: _JOB_CONFLICT_RESPONSE, 500: _INTERNAL_ERROR_RESPONSE},
+)
 def unload_models() -> dict[str, str]:
     """Выгружает локальную модель, если пакетный worker свободен."""
     try:

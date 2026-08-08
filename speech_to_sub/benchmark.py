@@ -207,27 +207,28 @@ def _sidecar_word_spans(
     transcript: Mapping[str, Any],
 ) -> list[tuple[float, float, str]]:
     result: list[tuple[float, float, str]] = []
-    segments = transcript.get("segments")
-    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
-        return result
-    for segment in segments:
-        if not isinstance(segment, Mapping):
-            continue
-        raw_words = segment.get("words")
-        if not isinstance(raw_words, Sequence) or isinstance(raw_words, (str, bytes)):
-            continue
-        for word in raw_words:
-            if not isinstance(word, Mapping):
-                continue
-            try:
-                start = float(word["start"])
-                end = float(word["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            text = str(word.get("text", "")).strip()
-            if text and end > start:
-                result.append((start, end, text))
+    for segment in _mapping_sequence(transcript.get("segments")):
+        for word in _mapping_sequence(segment.get("words")):
+            span = _parse_word_span(word)
+            if span is not None:
+                result.append(span)
     return result
+
+
+def _mapping_sequence(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _parse_word_span(word: Mapping[str, Any]) -> tuple[float, float, str] | None:
+    try:
+        start = float(word["start"])
+        end = float(word["end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    text = str(word.get("text", "")).strip()
+    return (start, end, text) if text and end > start else None
 
 
 def _tokens(text: str) -> list[str]:
@@ -256,7 +257,7 @@ def _gpu_used_vram_mib() -> int | None:
             errors="replace",
             timeout=5,
         )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if completed.returncode != 0:
         return None

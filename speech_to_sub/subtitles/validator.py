@@ -24,6 +24,21 @@ def validate_cues(
     """Проверяет нумерацию, текст, интервалы и границу длительности."""
     if not cues:
         raise ValidationError("SRT не содержит ни одной реплики")
+    _validate_duration_settings(audio_duration, duration_tolerance)
+
+    previous_end = 0.0
+    for expected_index, cue in enumerate(cues, start=1):
+        _validate_cue(cue, expected_index, previous_end)
+        previous_end = cue.end
+
+    if audio_duration is not None and cues[-1].end > audio_duration + duration_tolerance:
+        raise ValidationError("Последняя реплика выходит за длительность аудио")
+
+
+def _validate_duration_settings(
+    audio_duration: float | None,
+    duration_tolerance: float,
+) -> None:
     if duration_tolerance < 0:
         raise ValidationError("Допуск длительности не может быть отрицательным")
     if audio_duration is not None and (
@@ -31,25 +46,21 @@ def validate_cues(
     ):
         raise ValidationError("Длительность аудио должна быть положительной")
 
-    previous_end = 0.0
-    for expected_index, cue in enumerate(cues, start=1):
-        if cue.index != expected_index:
-            raise ValidationError("Нумерация SRT должна быть последовательной и начинаться с единицы")
-        if not cue.text.strip():
-            raise ValidationError(f"Реплика {cue.index} не содержит текста")
-        lines = cue.text.splitlines()
-        if len(lines) not in (1, 2) or any(not line.strip() for line in lines):
-            raise ValidationError(f"Реплика {cue.index} должна содержать одну или две непустые строки")
-        if not math.isfinite(cue.start) or not math.isfinite(cue.end):
-            raise ValidationError(f"Реплика {cue.index} содержит неконечную временную метку")
-        if cue.start < 0 or cue.end <= cue.start:
-            raise ValidationError(f"Реплика {cue.index} содержит некорректный интервал")
-        if cue.start < previous_end:
-            raise ValidationError(f"Реплика {cue.index} пересекается с предыдущей")
-        previous_end = cue.end
 
-    if audio_duration is not None and cues[-1].end > audio_duration + duration_tolerance:
-        raise ValidationError("Последняя реплика выходит за длительность аудио")
+def _validate_cue(cue: Cue, expected_index: int, previous_end: float) -> None:
+    if cue.index != expected_index:
+        raise ValidationError("Нумерация SRT должна быть последовательной и начинаться с единицы")
+    if not cue.text.strip():
+        raise ValidationError(f"Реплика {cue.index} не содержит текста")
+    lines = cue.text.splitlines()
+    if len(lines) not in (1, 2) or any(not line.strip() for line in lines):
+        raise ValidationError(f"Реплика {cue.index} должна содержать одну или две непустые строки")
+    if not math.isfinite(cue.start) or not math.isfinite(cue.end):
+        raise ValidationError(f"Реплика {cue.index} содержит неконечную временную метку")
+    if cue.start < 0 or cue.end <= cue.start:
+        raise ValidationError(f"Реплика {cue.index} содержит некорректный интервал")
+    if cue.start < previous_end:
+        raise ValidationError(f"Реплика {cue.index} пересекается с предыдущей")
 
 
 def parse_srt(content: str) -> tuple[Cue, ...]:

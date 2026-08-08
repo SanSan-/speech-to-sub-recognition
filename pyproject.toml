@@ -26,3 +26,13 @@ markers = [
   "integration: тяжёлые проверки с FFmpeg или реальной локальной ASR-моделью",
 ]
 
+[tool.coverage.run]
+branch = true
+source = ["speech_to_sub"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"

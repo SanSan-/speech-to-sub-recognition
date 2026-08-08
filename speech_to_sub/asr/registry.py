@@ -55,12 +55,11 @@ def activate_backend(name: str) -> AsrBackend:
     backend_id = _normalize_backend_id(name)
     with _LOCK:
         backend = get_backend(backend_id)
-        if _ACTIVE_BACKEND_ID == backend_id:
-            return backend
-        previous = _INSTANCES.get(_ACTIVE_BACKEND_ID or "")
-        if previous is not None:
-            previous.unload()
-        _ACTIVE_BACKEND_ID = backend_id
+        if _ACTIVE_BACKEND_ID != backend_id:
+            previous = _INSTANCES.get(_ACTIVE_BACKEND_ID or "")
+            if previous is not None:
+                previous.unload()
+            _ACTIVE_BACKEND_ID = backend_id
         return backend
 
 

@@ -14,6 +14,8 @@ DEFAULT_MAX_JOBS = 16
 DEFAULT_MAX_EVENTS_PER_JOB = 2_000
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 RECOVERY_ERROR = "Задача была прервана перезапуском приложения."
+_SNAPSHOT_LABEL = "Snapshot задачи"
+_DELETE_JOB_SQL = "DELETE FROM jobs WHERE job_id = ?"
 
 TERMINAL_ITEM_STATES = frozenset(
     {"cached", "skipped", "done", "error", "cancelled", "interrupted"}
@@ -69,7 +71,7 @@ class SQLiteJobStore:
         events: Iterable[tuple[int, Mapping[str, Any]]] = (),
     ) -> None:
         """Атомарно сохраняет snapshot, его элементы и новые события."""
-        normalized = _json_mapping(snapshot, "Snapshot задачи")
+        normalized = _json_mapping(snapshot, _SNAPSHOT_LABEL)
         job_id = str(normalized.get("job_id") or "").strip()
         if not job_id:
             raise ValueError("Snapshot задачи должен содержать job_id.")
@@ -181,7 +183,7 @@ class SQLiteJobStore:
                     "failed": counts["failed"],
                     "cancelled": counts["cancelled"],
                 }
-                snapshot = _json_object(str(row["snapshot_json"]), "Snapshot задачи")
+                snapshot = _json_object(str(row["snapshot_json"]), _SNAPSHOT_LABEL)
                 snapshot["error"] = message
                 snapshot["terminal_event"] = terminal_event
                 logs = snapshot.get("logs")
@@ -208,7 +210,7 @@ class SQLiteJobStore:
         """Удаляет задачу вместе с элементами и событиями через foreign key cascade."""
         with self._lock, self._transaction():
             cursor = self._connection.execute(
-                "DELETE FROM jobs WHERE job_id = ?",
+                _DELETE_JOB_SQL,
                 (job_id,),
             )
             return cursor.rowcount > 0
@@ -228,7 +230,7 @@ class SQLiteJobStore:
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             self._connection.executemany(
-                "DELETE FROM jobs WHERE job_id = ?",
+                _DELETE_JOB_SQL,
                 [(job_id,) for job_id in job_ids],
             )
             return job_ids
@@ -407,7 +409,7 @@ class SQLiteJobStore:
 
     def _load_row(self, row: sqlite3.Row) -> dict[str, Any]:
         job_id = str(row["job_id"])
-        snapshot = _json_object(str(row["snapshot_json"]), "Snapshot задачи")
+        snapshot = _json_object(str(row["snapshot_json"]), _SNAPSHOT_LABEL)
         items = self._load_items(job_id)
         events = self._load_events(job_id)
         counts = _count_items(items)
@@ -502,7 +504,7 @@ class SQLiteJobStore:
             (excess,),
         ).fetchall()
         self._connection.executemany(
-            "DELETE FROM jobs WHERE job_id = ?",
+            _DELETE_JOB_SQL,
             [(str(row["job_id"]),) for row in rows],
         )
 

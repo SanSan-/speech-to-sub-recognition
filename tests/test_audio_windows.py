@@ -48,21 +48,20 @@ def test_pcm_windows_emit_tail_only_when_it_contains_new_samples() -> None:
 
 
 def test_pcm_windows_reject_invalid_settings_and_partial_sample() -> None:
+    invalid_overlap = iter_pcm_s16_windows(
+        (_pcm([1, 2]),),
+        window_seconds=1.0,
+        overlap_seconds=1.0,
+        sample_rate=10,
+    )
     with pytest.raises(ValidationError, match="короче"):
-        list(
-            iter_pcm_s16_windows(
-                (_pcm([1, 2]),),
-                window_seconds=1.0,
-                overlap_seconds=1.0,
-                sample_rate=10,
-            )
-        )
+        list(invalid_overlap)
+
+    partial_sample = iter_pcm_s16_windows(
+        (b"\x01",),
+        window_seconds=1.0,
+        overlap_seconds=0.0,
+        sample_rate=10,
+    )
     with pytest.raises(ValidationError, match="неполным"):
-        list(
-            iter_pcm_s16_windows(
-                (b"\x01",),
-                window_seconds=1.0,
-                overlap_seconds=0.0,
-                sample_rate=10,
-            )
-        )
+        list(partial_sample)

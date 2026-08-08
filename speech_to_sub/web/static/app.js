@@ -29,10 +29,13 @@ const ACTIVE_STATES = new Set(["queued", "probing", "extracting", "transcribing"
 const CANCELLED_STATES = new Set(["cancelled", "interrupted"]);
 const RETRYABLE_STATES = new Set(["error", ...CANCELLED_STATES]);
 const FINAL_STATES = new Set(["cached", "skipped", "done", "error", ...CANCELLED_STATES]);
+const JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+const STREAM_PATH_PREFIX = "/api/stream/";
+const STREAM_ALLOWED_ORIGINS = Object.freeze([window.location.origin]);
 
 const BUILTIN_DEFAULTS = {
   backend: "faster-whisper",
-  model_path: "D:\\Projects\\-ai\\+automatic-speech-recognition\\whisper-large-v3-ct2",
+  model_path: String.raw`D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2`,
   aligner: "none",
   aligner_model_path: null,
   worker_python_path: null,
@@ -97,7 +100,7 @@ const terminalLabels = {
 const state = {
   items: [],
   itemMap: new Map(),
-  mode: null,
+  mode: /** @type {string | null} */ (null),
   sourcePaths: [],
   selectionLabel: "Ничего не выбрано",
   jobId: null,
@@ -107,7 +110,7 @@ const state = {
   jobDone: 0,
   completed: new Set(),
   isBusy: false,
-  eventSource: null,
+  eventSource: /** @type {EventSource | null} */ (null),
   uiConfig: null,
   itemRequestGeneration: 0,
   itemRequestController: null,
@@ -120,7 +123,7 @@ function appendLog(message) {
   if (message === undefined || message === null) {
     return;
   }
-  const lines = String(message).replace(/\r\n/g, "\n").split("\n");
+  const lines = String(message).replaceAll("\r\n", "\n").split("\n");
   if (lines.at(-1) === "") {
     lines.pop();
   }
@@ -133,7 +136,7 @@ function appendLog(message) {
 }
 
 function setTerminalState(status) {
-  const normalized = Object.prototype.hasOwnProperty.call(terminalLabels, status) ? status : "idle";
+  const normalized = Object.hasOwn(terminalLabels, status) ? status : "idle";
   terminalStatus.className = `terminal-status ${normalized}`;
   terminalStatus.textContent = terminalLabels[normalized];
 }
@@ -184,7 +187,7 @@ function completeItemRequest(controller) {
 }
 
 function isAbortError(error) {
-  return error && error.name === "AbortError";
+  return error?.name === "AbortError";
 }
 
 function updateJobProgress() {
@@ -249,9 +252,8 @@ function setSelectOptions(select, options, fallbackValue) {
   }
   select.innerHTML = "";
   select.append(fragment);
-  const preferred = values.includes(currentValue)
-    ? currentValue
-    : String(fallbackValue === undefined || fallbackValue === null ? "" : fallbackValue);
+  const fallback = fallbackValue ?? "";
+  const preferred = values.includes(currentValue) ? currentValue : String(fallback);
   select.value = values.includes(preferred) ? preferred : values[0];
   select.defaultValue = select.value;
 }
@@ -283,7 +285,7 @@ function applySettingValues(values) {
   }
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     const key = input.dataset.setting;
-    if (Object.prototype.hasOwnProperty.call(values, key)) {
+    if (Object.hasOwn(values, key)) {
       setInputValue(input, values[key]);
     }
   });
@@ -297,7 +299,8 @@ function loadStoredSettings() {
     }
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === "object" ? parsed : null;
-  } catch (error) {
+  } catch {
+    appendLog("Не удалось прочитать сохранённые настройки.");
     return null;
   }
 }
@@ -336,7 +339,7 @@ function applyBackendModelDefault() {
     return;
   }
   const selected = state.uiConfig.backends.find((item) => item.value === backendSelect.value);
-  if (!selected || !selected.model_path) {
+  if (!selected?.model_path) {
     return;
   }
   const knownDefaults = state.uiConfig.backends
@@ -401,7 +404,7 @@ function formatDetail(detail) {
     return detail;
   }
   if (Array.isArray(detail)) {
-    return detail.map((item) => item && item.msg ? item.msg : String(item)).join("; ");
+    return detail.map((item) => item?.msg ? item.msg : String(item)).join("; ");
   }
   if (detail && typeof detail === "object") {
     try {
@@ -441,11 +444,11 @@ async function postJson(url, payload, options = {}) {
     let detail = response.statusText || `HTTP ${response.status}`;
     try {
       const data = await response.json();
-      if (data && data.detail !== undefined) {
+      if (data?.detail !== undefined) {
         detail = formatDetail(data.detail);
       }
-    } catch (error) {
-      // Текст HTTP-статуса уже содержит безопасное описание.
+    } catch {
+      appendLog("Ответ API с ошибкой не содержит корректный JSON.");
     }
     const requestError = new Error(detail);
     requestError.status = response.status;
@@ -463,7 +466,7 @@ function fileExtension(item) {
     return String(item.format).replace(/^\./, "").toUpperCase();
   }
   const source = String(item.name || item.path || "");
-  const match = source.match(/\.([^./\\]+)$/);
+  const match = /\.([^./\\]+)$/.exec(source);
   return match ? match[1].toUpperCase() : "MEDIA";
 }
 
@@ -472,17 +475,17 @@ function fileName(item) {
     return String(item.name);
   }
   const parts = String(item.path || "").split(/[\\/]/);
-  return parts[parts.length - 1] || "Без имени";
+  return parts.at(-1) || "Без имени";
 }
 
 function normalizeState(item) {
-  if (item && item.state && statusLabels[item.state]) {
+  if (item?.state && statusLabels[item.state]) {
     return item.state;
   }
-  if (item && item.cached) {
+  if (item?.cached) {
     return "cached";
   }
-  if (item && item.skipped) {
+  if (item?.skipped) {
     return "skipped";
   }
   return "queued";
@@ -519,7 +522,7 @@ function appendMeta(meta, text, className) {
 function updateMeta(entry, item) {
   entry.metaEl.innerHTML = "";
   appendMeta(entry.metaEl, fileExtension(item), "badge");
-  const probe = item && item.probe && typeof item.probe === "object" ? item.probe : null;
+  const probe = item?.probe && typeof item.probe === "object" ? item.probe : null;
   const duration = probe ? formatDuration(probe.duration) : null;
   if (duration) {
     appendMeta(entry.metaEl, duration);
@@ -548,7 +551,7 @@ function collectNotice(item) {
   if (Array.isArray(item.warnings)) {
     item.warnings.forEach((warning) => warnings.push(String(warning)));
   }
-  if (item.probe && item.probe.warning) {
+  if (item.probe?.warning) {
     warnings.push(String(item.probe.warning));
   }
   if (item.probe && Array.isArray(item.probe.warnings)) {
@@ -593,7 +596,7 @@ function updateOutputs(entry, item) {
 function updateNotice(entry, item) {
   const notice = collectNotice(item);
   entry.noticeEl.hidden = notice === null;
-  entry.noticeEl.className = notice && notice.kind === "error" ? "file-error" : "file-warning";
+  entry.noticeEl.className = notice?.kind === "error" ? "file-error" : "file-warning";
   entry.noticeEl.textContent = notice ? notice.text : "";
   entry.card.title = item.error ? String(item.error) : "";
 }
@@ -826,11 +829,15 @@ async function pick(kind) {
   state.displayedJobId = null;
   state.canRetry = false;
   state.cancelRequested = false;
-  state.sourcePaths = state.mode === "folder" && result.path
-    ? [String(result.path)]
-    : Array.isArray(result.paths)
-      ? result.paths.map((path) => String(path))
-      : (result.items || []).map((item) => String(item.path || "")).filter(Boolean);
+  if (state.mode === "folder" && result.path) {
+    state.sourcePaths = [String(result.path)];
+  } else if (Array.isArray(result.paths)) {
+    state.sourcePaths = result.paths.map(String);
+  } else {
+    state.sourcePaths = (result.items || [])
+      .map((item) => String(item.path || ""))
+      .filter(Boolean);
+  }
   renderItems(result.items || [], selectionLabel(result, state.mode));
   setTerminalState("idle");
 }
@@ -907,7 +914,7 @@ async function loadActiveJob(options = {}) {
   );
   state.cancelRequested = Boolean(result.cancel_requested);
   state.sourcePaths = Array.isArray(result.source_paths) && result.source_paths.length > 0
-    ? result.source_paths.map((path) => String(path))
+    ? result.source_paths.map(String)
     : items.map((item) => String(item.path || "")).filter(Boolean);
   state.eventCursor = Math.max(0, asFiniteNumber(result.latest_event_id, 0));
   renderItems(items, `Задача · ${items.length} файлов`);
@@ -945,15 +952,16 @@ function terminalMessage(payload) {
   const skipped = asFiniteNumber(payload.skipped, 0);
   const failed = asFiniteNumber(payload.failed, 0);
   const cancelled = asFiniteNumber(payload.cancelled, 0);
-  const prefix = status === "ok"
-    ? "Распознавание завершено"
-    : status === "partial"
-      ? "Распознавание завершено частично"
-      : status === "cancelled"
-        ? "Распознавание отменено"
-        : status === "interrupted"
-          ? "Распознавание прервано перезапуском"
-          : "Распознавание завершено с ошибкой";
+  let prefix = "Распознавание завершено с ошибкой";
+  if (status === "ok") {
+    prefix = "Распознавание завершено";
+  } else if (status === "partial") {
+    prefix = "Распознавание завершено частично";
+  } else if (status === "cancelled") {
+    prefix = "Распознавание отменено";
+  } else if (status === "interrupted") {
+    prefix = "Распознавание прервано перезапуском";
+  }
   return `${prefix}: обработано ${done}, кеш ${cached}, пропущено ${skipped}, ошибок ${failed}, отменено ${cancelled}.`;
 }
 
@@ -992,14 +1000,22 @@ function listenJob(jobId, cursor = 0) {
   if (!jobId) {
     return;
   }
+  const normalizedJobId = String(jobId);
+  if (!JOB_ID_PATTERN.test(normalizedJobId)) {
+    throw new Error("Сервер вернул некорректный идентификатор задачи.");
+  }
   if (state.eventSource) {
     state.eventSource.close();
   }
   const normalizedCursor = Math.max(0, asFiniteNumber(cursor, 0));
   state.eventCursor = normalizedCursor;
-  const stream = new EventSource(
-    `/api/stream/${encodeURIComponent(jobId)}?cursor=${encodeURIComponent(normalizedCursor)}`,
-  );
+  const streamUrl = new URL(STREAM_PATH_PREFIX, window.location.origin);
+  streamUrl.pathname += encodeURIComponent(normalizedJobId);
+  streamUrl.searchParams.set("cursor", String(normalizedCursor));
+  if (!STREAM_ALLOWED_ORIGINS.includes(streamUrl.origin)) {
+    throw new Error("Адрес потока задачи не входит в список разрешённых.");
+  }
+  const stream = new EventSource(streamUrl.toString());
   state.eventSource = stream;
 
   stream.onmessage = (event) => {
@@ -1189,7 +1205,7 @@ async function unloadModel() {
 async function loadUiConfig() {
   const config = await getJson("/api/ui-config");
   state.uiConfig = config;
-  const defaults = { ...BUILTIN_DEFAULTS, ...(config.defaults || {}) };
+  const defaults = { ...BUILTIN_DEFAULTS, ...config.defaults };
   setSelectOptions(backendSelect, config.backends, defaults.backend);
   setSelectOptions(alignerSelect, config.aligners, defaults.aligner);
   setSelectOptions(deviceSelect, config.devices, defaults.device);

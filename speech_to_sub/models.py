@@ -164,47 +164,12 @@ class ProcessingSettings:
         if not values:
             return cls()
         data = dict(values)
-        if data.get("backend"):
-            data["backend"] = str(data["backend"]).strip().casefold()
-        else:
-            data.pop("backend", None)
-        if data.get("model_path"):
-            data["model_path"] = Path(str(data["model_path"]))
-        elif "backend" in data:
-            try:
-                data["model_path"] = DEFAULT_BACKEND_MODEL_PATHS[data["backend"]]
-            except KeyError as exc:
-                variants = ", ".join(DEFAULT_BACKEND_MODEL_PATHS)
-                raise ValidationError(
-                    f"Неизвестный ASR backend '{data['backend']}'. "
-                    f"Поддерживаются: {variants}."
-                ) from exc
-        else:
-            data.pop("model_path", None)
-        if data.get("aligner"):
-            data["aligner"] = str(data["aligner"]).strip().casefold()
-        else:
-            data.pop("aligner", None)
-        if data.get("aligner_model_path"):
-            data["aligner_model_path"] = Path(str(data["aligner_model_path"]))
-        elif data.get("aligner") == "qwen3-forced-aligner":
-            data["aligner_model_path"] = DEFAULT_QWEN_ALIGNER_MODEL_PATH
-        else:
-            data["aligner_model_path"] = None
-        if data.get("worker_python_path"):
-            data["worker_python_path"] = Path(str(data["worker_python_path"]))
-        else:
-            data["worker_python_path"] = None
-        if data.get("aligner_worker_python_path"):
-            data["aligner_worker_python_path"] = Path(
-                str(data["aligner_worker_python_path"])
-            )
-        else:
-            data["aligner_worker_python_path"] = None
-        if data.get("output_dir"):
-            data["output_dir"] = Path(str(data["output_dir"]))
-        else:
-            data["output_dir"] = None
+        _normalize_choice_field(data, "backend")
+        _normalize_model_path(data)
+        _normalize_choice_field(data, "aligner")
+        _normalize_aligner_model_path(data)
+        for key in ("worker_python_path", "aligner_worker_python_path", "output_dir"):
+            _normalize_optional_path(data, key)
         known = cls.__dataclass_fields__.keys()
         return cls(**{key: value for key, value in data.items() if key in known})
 
@@ -222,6 +187,44 @@ class ProcessingSettings:
         )
         data["output_dir"] = str(self.output_dir) if self.output_dir else None
         return data
+
+
+def _normalize_choice_field(data: dict[str, Any], key: str) -> None:
+    value = data.get(key)
+    if value:
+        data[key] = str(value).strip().casefold()
+    else:
+        data.pop(key, None)
+
+
+def _normalize_model_path(data: dict[str, Any]) -> None:
+    if data.get("model_path"):
+        data["model_path"] = Path(str(data["model_path"]))
+        return
+    if "backend" not in data:
+        data.pop("model_path", None)
+        return
+    try:
+        data["model_path"] = DEFAULT_BACKEND_MODEL_PATHS[data["backend"]]
+    except KeyError as exc:
+        variants = ", ".join(DEFAULT_BACKEND_MODEL_PATHS)
+        raise ValidationError(
+            f"Неизвестный ASR backend '{data['backend']}'. Поддерживаются: {variants}."
+        ) from exc
+
+
+def _normalize_aligner_model_path(data: dict[str, Any]) -> None:
+    if data.get("aligner_model_path"):
+        data["aligner_model_path"] = Path(str(data["aligner_model_path"]))
+    elif data.get("aligner") == "qwen3-forced-aligner":
+        data["aligner_model_path"] = DEFAULT_QWEN_ALIGNER_MODEL_PATH
+    else:
+        data["aligner_model_path"] = None
+
+
+def _normalize_optional_path(data: dict[str, Any], key: str) -> None:
+    value = data.get(key)
+    data[key] = Path(str(value)) if value else None
 
 
 @dataclass(frozen=True)

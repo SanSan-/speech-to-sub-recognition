@@ -16,19 +16,21 @@ class NoAlignmentAdapter:
     requires_exclusive_runtime = False
 
     def preflight(self, settings: ProcessingSettings) -> None:
+        del settings
         return None
 
     def expected_runtime_signature(
         self,
         settings: ProcessingSettings,
     ) -> RuntimeSignature | None:
-        return None
+        return self.runtime_signature(settings)
 
     def runtime_signature(
         self,
         settings: ProcessingSettings,
         transcript: Transcript | None = None,
     ) -> RuntimeSignature | None:
+        del settings, transcript
         return None
 
     def align(

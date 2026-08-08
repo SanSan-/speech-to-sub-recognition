@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,9 @@ from speech_to_sub.media.ffmpeg import (
     select_audio_stream,
 )
 from speech_to_sub.models import (
+    AudioStreamInfo,
     FileResult,
+    MediaProbe,
     OutputPaths,
     ProcessingSettings,
     RuntimeSignature,
@@ -59,6 +62,21 @@ DEFAULT_WORKSPACE_TTL_SECONDS = 60 * 60
 EventCallback = Callable[[dict[str, Any]], None]
 LogCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _FileProcessingContext:
+    path: Path
+    index: int
+    total: int
+    settings: ProcessingSettings
+    outputs: OutputPaths
+    temporary_audio: Path
+    ffmpeg_path: str
+    ffprobe_path: str
+    emit_event: EventCallback
+    log: LogCallback
+    cancel_check: CancelCheck | None
 
 
 def get_preflight_status(settings_values: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -415,89 +433,28 @@ def _process_one_locked(
             _write_log(log, f"{path.name}: {warning}")
         source = build_source_fingerprint(path)
         temporary_audio = temporary_root / f"{index:04d}-{path.stem}.asr.flac"
-        lookup_settings = _cache_settings_for_lookup(
-            outputs,
-            settings,
-            stream.ordinal,
-            backend=backend if backend is not None else get_backend(settings.backend),
+        context = _FileProcessingContext(
+            path=path,
+            index=index,
+            total=total,
+            settings=settings,
+            outputs=outputs,
+            temporary_audio=temporary_audio,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            emit_event=emit_event,
+            log=log,
+            cancel_check=cancel_check,
         )
-        cache_valid = bool(
-            lookup_settings and _is_valid_cache(outputs, source, lookup_settings)
+        existing_result = _reuse_existing_result(
+            context,
+            probe=probe,
+            stream=stream,
+            source=source,
+            backend=backend,
         )
-        if not settings.force and cache_valid:
-            if settings.keep_audio and not _has_saved_audio(outputs):
-                _raise_if_cancelled(cancel_check)
-                _emit_file(
-                    emit_event,
-                    path,
-                    index,
-                    total,
-                    "extracting",
-                    "Сохранение нормализованного аудио",
-                    25,
-                )
-                normalize_audio(
-                    path,
-                    temporary_audio,
-                    stream,
-                    ffmpeg_path=ffmpeg_path,
-                    overwrite=True,
-                )
-                normalized_duration = get_media_duration(
-                    temporary_audio,
-                    ffprobe_path=ffprobe_path,
-                )
-                _raise_if_cancelled(cancel_check)
-                _record_saved_audio(outputs, temporary_audio, normalized_duration)
-            _emit_file(
-                emit_event,
-                path,
-                index,
-                total,
-                "cached",
-                "Готовый кеш",
-                100,
-                outputs=outputs,
-                audio_output=(
-                    outputs.normalized_audio_path if settings.keep_audio else None
-                ),
-            )
-            _write_log(log, f"Файл {index}/{total}: {path.name} — готовый кеш.")
-            return (
-                FileResult(
-                    input_path=path,
-                    state="cached",
-                    srt_path=outputs.srt_path,
-                    sidecar_path=outputs.sidecar_path,
-                    audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
-                    cached=True,
-                    probe=probe,
-                ),
-                backend,
-            )
-        if outputs.srt_path.exists() and not settings.force:
-            _emit_file(
-                emit_event,
-                path,
-                index,
-                total,
-                "skipped",
-                "SRT уже существует",
-                100,
-                outputs=outputs,
-            )
-            _write_log(log, f"Файл {index}/{total}: {path.name} — SRT безопасно пропущен.")
-            return (
-                FileResult(
-                    input_path=path,
-                    state="skipped",
-                    srt_path=outputs.srt_path,
-                    sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
-                    skipped=True,
-                    probe=probe,
-                ),
-                backend,
-            )
+        if existing_result is not None:
+            return existing_result, backend
 
         _emit_file(emit_event, path, index, total, "extracting", "Нормализация аудио", 10)
         _raise_if_cancelled(cancel_check)
@@ -515,63 +472,11 @@ def _process_one_locked(
         _raise_if_cancelled(cancel_check)
         _emit_file(emit_event, path, index, total, "transcribing", "Локальная ASR", 20)
         _write_log(log, f"Файл {index}/{total}: {path.name} — локальное распознавание.")
-        if backend is None:
-            backend = activate_backend(settings.backend)
-        aligner = get_aligner(settings.aligner)
-        if aligner.requires_exclusive_runtime:
-            aligner.unload()
-
-        def asr_progress(value: int) -> None:
-            _raise_if_cancelled(cancel_check)
-            mapped = 20 + int(max(0, min(100, value)) * 0.65)
-            _emit_file(
-                emit_event,
-                path,
-                index,
-                total,
-                "transcribing",
-                "Локальная ASR",
-                mapped,
-            )
-
-        transcript = backend.transcribe(
-            temporary_audio,
-            settings,
+        transcript, runtime, aligner, backend = _transcribe_with_alignment(
+            context,
             normalized_duration,
-            progress_callback=asr_progress,
-            cancel_check=cancel_check,
+            backend=backend,
         )
-        _raise_if_cancelled(cancel_check)
-        runtime = _loaded_runtime_signature(backend, settings)
-        if runtime is None:
-            runtime = _runtime_from_transcript(backend, transcript, settings)
-        if settings.aligner != "none":
-            _emit_file(emit_event, path, index, total, "aligning", "Выравнивание слов", 86)
-
-        def align_progress(value: int) -> None:
-            _raise_if_cancelled(cancel_check)
-            mapped = 86 + int(max(0, min(100, value)) * 0.01)
-            _emit_file(
-                emit_event,
-                path,
-                index,
-                total,
-                "aligning",
-                "Выравнивание слов",
-                mapped,
-            )
-
-        if aligner.requires_exclusive_runtime:
-            backend.unload()
-        transcript = aligner.align(
-            temporary_audio,
-            transcript,
-            settings,
-            normalized_duration,
-            progress_callback=align_progress,
-            cancel_check=cancel_check,
-        )
-        _raise_if_cancelled(cancel_check)
         _emit_file(emit_event, path, index, total, "writing", "Формирование SRT", 88)
         cues = build_cues(
             transcript.segments,
@@ -665,6 +570,187 @@ def _process_one_locked(
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — ошибка: {message}")
         return FileResult(input_path=path, state="error", error=message), backend
+
+
+def _reuse_existing_result(
+    context: _FileProcessingContext,
+    *,
+    probe: MediaProbe,
+    stream: AudioStreamInfo,
+    source: dict[str, Any],
+    backend: AsrBackend | None,
+) -> FileResult | None:
+    path = context.path
+    settings = context.settings
+    outputs = context.outputs
+    lookup_settings = _cache_settings_for_lookup(
+        outputs,
+        settings,
+        stream.ordinal,
+        backend=backend if backend is not None else get_backend(settings.backend),
+    )
+    cache_valid = bool(
+        lookup_settings and _is_valid_cache(outputs, source, lookup_settings)
+    )
+    if not settings.force and cache_valid:
+        if settings.keep_audio and not _has_saved_audio(outputs):
+            _save_cached_audio(
+                context,
+                stream=stream,
+            )
+        _emit_file(
+            context.emit_event,
+            path,
+            context.index,
+            context.total,
+            "cached",
+            "Готовый кеш",
+            100,
+            outputs=outputs,
+            audio_output=outputs.normalized_audio_path if settings.keep_audio else None,
+        )
+        _write_log(
+            context.log,
+            f"Файл {context.index}/{context.total}: {path.name} — готовый кеш.",
+        )
+        return FileResult(
+            input_path=path,
+            state="cached",
+            srt_path=outputs.srt_path,
+            sidecar_path=outputs.sidecar_path,
+            audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
+            cached=True,
+            probe=probe,
+        )
+    if outputs.srt_path.exists() and not settings.force:
+        _emit_file(
+            context.emit_event,
+            path,
+            context.index,
+            context.total,
+            "skipped",
+            "SRT уже существует",
+            100,
+            outputs=outputs,
+        )
+        _write_log(
+            context.log,
+            f"Файл {context.index}/{context.total}: {path.name} — SRT безопасно пропущен.",
+        )
+        return FileResult(
+            input_path=path,
+            state="skipped",
+            srt_path=outputs.srt_path,
+            sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
+            skipped=True,
+            probe=probe,
+        )
+    return None
+
+
+def _save_cached_audio(
+    context: _FileProcessingContext,
+    *,
+    stream: AudioStreamInfo,
+) -> None:
+    _raise_if_cancelled(context.cancel_check)
+    _emit_file(
+        context.emit_event,
+        context.path,
+        context.index,
+        context.total,
+        "extracting",
+        "Сохранение нормализованного аудио",
+        25,
+    )
+    normalize_audio(
+        context.path,
+        context.temporary_audio,
+        stream,
+        ffmpeg_path=context.ffmpeg_path,
+        overwrite=True,
+    )
+    normalized_duration = get_media_duration(
+        context.temporary_audio,
+        ffprobe_path=context.ffprobe_path,
+    )
+    _raise_if_cancelled(context.cancel_check)
+    _record_saved_audio(context.outputs, context.temporary_audio, normalized_duration)
+
+
+def _transcribe_with_alignment(
+    context: _FileProcessingContext,
+    normalized_duration: float,
+    *,
+    backend: AsrBackend | None,
+) -> tuple[Transcript, RuntimeSignature, AlignmentAdapter, AsrBackend]:
+    settings = context.settings
+    if backend is None:
+        backend = activate_backend(settings.backend)
+    aligner = get_aligner(settings.aligner)
+    if aligner.requires_exclusive_runtime:
+        aligner.unload()
+
+    def asr_progress(value: int) -> None:
+        _raise_if_cancelled(context.cancel_check)
+        mapped = 20 + int(max(0, min(100, value)) * 0.65)
+        _emit_file(
+            context.emit_event,
+            context.path,
+            context.index,
+            context.total,
+            "transcribing",
+            "Локальная ASR",
+            mapped,
+        )
+
+    transcript = backend.transcribe(
+        context.temporary_audio,
+        settings,
+        normalized_duration,
+        progress_callback=asr_progress,
+        cancel_check=context.cancel_check,
+    )
+    _raise_if_cancelled(context.cancel_check)
+    runtime = _loaded_runtime_signature(backend, settings)
+    if runtime is None:
+        runtime = _runtime_from_transcript(backend, transcript, settings)
+    if settings.aligner != "none":
+        _emit_file(
+            context.emit_event,
+            context.path,
+            context.index,
+            context.total,
+            "aligning",
+            "Выравнивание слов",
+            86,
+        )
+
+    def align_progress(value: int) -> None:
+        _raise_if_cancelled(context.cancel_check)
+        mapped = 86 + int(max(0, min(100, value)) * 0.01)
+        _emit_file(
+            context.emit_event,
+            context.path,
+            context.index,
+            context.total,
+            "aligning",
+            "Выравнивание слов",
+            mapped,
+        )
+
+    if aligner.requires_exclusive_runtime:
+        backend.unload()
+    transcript = aligner.align(
+        context.temporary_audio,
+        transcript,
+        settings,
+        normalized_duration,
+        progress_callback=align_progress,
+        cancel_check=context.cancel_check,
+    )
+    _raise_if_cancelled(context.cancel_check)
+    return transcript, runtime, aligner, backend
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -947,6 +1033,14 @@ def _backup_path(target: Path, token: str) -> Path:
 
 
 def _validate_settings(settings: ProcessingSettings) -> None:
+    _validate_backend_settings(settings)
+    _validate_output_settings(settings)
+    _validate_chunk_settings(settings)
+    _validate_long_form_settings(settings)
+    _validate_decoding_settings(settings)
+
+
+def _validate_backend_settings(settings: ProcessingSettings) -> None:
     if settings.backend.casefold() not in backend_names():
         variants = ", ".join(backend_names())
         raise ValidationError(f"ASR backend должен иметь одно из значений: {variants}.")
@@ -955,16 +1049,25 @@ def _validate_settings(settings: ProcessingSettings) -> None:
         raise ValidationError(f"Aligner должен иметь одно из значений: {variants}.")
     if settings.language.casefold() not in {"en", "ru", "auto"}:
         raise ValidationError("Язык должен быть en, ru или auto.")
+
+
+def _validate_output_settings(settings: ProcessingSettings) -> None:
     if settings.audio_stream_index is not None and settings.audio_stream_index < 0:
         raise ValidationError("Индекс аудиопотока не может быть отрицательным.")
     if settings.max_chars_per_line < 20 or settings.max_chars_per_line > 80:
         raise ValidationError("Лимит строки SRT должен быть от 20 до 80 символов.")
+
+
+def _validate_chunk_settings(settings: ProcessingSettings) -> None:
     if settings.chunk_length_seconds < 10:
         raise ValidationError("Длина ASR-фрагмента должна быть не меньше 10 секунд.")
     if settings.stride_length_seconds < 0:
         raise ValidationError("ASR stride не может быть отрицательным.")
     if settings.stride_length_seconds * 2 >= settings.chunk_length_seconds:
         raise ValidationError("ASR stride должен быть меньше половины длины фрагмента.")
+
+
+def _validate_long_form_settings(settings: ProcessingSettings) -> None:
     if settings.long_form_window_seconds < 30 or settings.long_form_window_seconds > 3600:
         raise ValidationError("Long-form окно должно быть от 30 до 3600 секунд.")
     if (
@@ -972,6 +1075,9 @@ def _validate_settings(settings: ProcessingSettings) -> None:
         or settings.long_form_overlap_seconds >= settings.long_form_window_seconds
     ):
         raise ValidationError("Long-form overlap должен быть короче основного окна.")
+
+
+def _validate_decoding_settings(settings: ProcessingSettings) -> None:
     if settings.vad_min_silence_ms < 100 or settings.vad_min_silence_ms > 10_000:
         raise ValidationError("VAD min silence должен быть от 100 до 10000 мс.")
     if settings.beam_size < 1 or settings.beam_size > 20:

@@ -106,7 +106,6 @@ class QwenForcedAlignerAdapter:
             try:
                 response = self._request_alignment(
                     resolved_audio,
-                    settings,
                     prepared,
                     segments,
                     progress_callback,
@@ -167,7 +166,6 @@ class QwenForcedAlignerAdapter:
     def _request_alignment(
         self,
         audio_path: Path,
-        settings: ProcessingSettings,
         prepared: _PreparedRequest,
         segments: list[dict[str, Any]],
         progress_callback: ProgressCallback | None,
@@ -212,7 +210,6 @@ class QwenForcedAlignerAdapter:
             )
             response = self._request_alignment(
                 audio_path,
-                settings,
                 cpu_prepared,
                 segments,
                 progress_callback,

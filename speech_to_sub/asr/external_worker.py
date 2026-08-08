@@ -13,7 +13,7 @@ import uuid
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Never, TextIO
 
 from speech_to_sub.exceptions import AsrModelError, ProcessingCancelled
 
@@ -147,7 +147,7 @@ class PersistentNdjsonWorker:
             assert process.stdin is not None
             process.stdin.write(encode_frame(message))
             process.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
+        except OSError as exc:
             detail = self._diagnostic_suffix()
             self._terminate_locked(process)
             raise ExternalWorkerError(
@@ -175,40 +175,91 @@ class PersistentNdjsonWorker:
     ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds
         while True:
-            if cancel_check is not None and cancel_check():
-                self._terminate_locked(process)
-                raise ProcessingCancelled(
-                    f"Команда worker-а '{command}' отменена во время выполнения."
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._terminate_locked(process)
-                raise ExternalWorkerError(
-                    f"Worker не ответил на команду '{command}' за {timeout_seconds:g} с.",
-                    error_type="TimeoutError",
-                )
-            try:
-                owner, response = self._responses.get(timeout=min(remaining, 0.1))
-            except queue.Empty:
-                if process.poll() is not None:
-                    return self._raise_terminated(process, command)
+            self._raise_if_wait_cancelled(process, command, cancel_check)
+            remaining = self._remaining_wait_time(
+                process,
+                command,
+                deadline,
+                timeout_seconds,
+            )
+            queued = self._next_response(process, command, remaining)
+            if queued is None:
                 continue
+            owner, response = queued
             if owner is not process:
                 continue
             if response is None:
                 return self._raise_terminated(process, command)
-            if str(response.get("id", "")) != request_id:
-                logger.warning("Worker вернул ответ с неожиданным идентификатором.")
+            if not self._has_expected_request_id(response, request_id):
                 continue
-            if response.get("event") == "progress":
-                if progress_callback is not None:
-                    try:
-                        progress_callback(_normalize_progress(response.get("progress")))
-                    except Exception:
-                        self._terminate_locked(process)
-                        raise
+            if self._handle_progress(process, response, progress_callback):
                 continue
             return self._unwrap_response(response, command)
+
+    def _raise_if_wait_cancelled(
+        self,
+        process: subprocess.Popen[str],
+        command: str,
+        cancel_check: CancelCheck | None,
+    ) -> None:
+        if cancel_check is not None and cancel_check():
+            self._terminate_locked(process)
+            raise ProcessingCancelled(
+                f"Команда worker-а '{command}' отменена во время выполнения."
+            )
+
+    def _remaining_wait_time(
+        self,
+        process: subprocess.Popen[str],
+        command: str,
+        deadline: float,
+        timeout_seconds: float,
+    ) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._terminate_locked(process)
+            raise ExternalWorkerError(
+                f"Worker не ответил на команду '{command}' за {timeout_seconds:g} с.",
+                error_type="TimeoutError",
+            )
+        return remaining
+
+    def _next_response(
+        self,
+        process: subprocess.Popen[str],
+        command: str,
+        remaining: float,
+    ) -> tuple[subprocess.Popen[str], dict[str, Any] | None] | None:
+        try:
+            return self._responses.get(timeout=min(remaining, 0.1))
+        except queue.Empty:
+            if process.poll() is not None:
+                return self._raise_terminated(process, command)
+            return None
+
+    @staticmethod
+    def _has_expected_request_id(response: Mapping[str, Any], request_id: str) -> bool:
+        if str(response.get("id", "")) == request_id:
+            return True
+        logger.warning("Worker вернул ответ с неожиданным идентификатором.")
+        return False
+
+    def _handle_progress(
+        self,
+        process: subprocess.Popen[str],
+        response: Mapping[str, Any],
+        progress_callback: ProgressCallback | None,
+    ) -> bool:
+        if response.get("event") != "progress":
+            return False
+        if progress_callback is None:
+            return True
+        try:
+            progress_callback(_normalize_progress(response.get("progress")))
+        except Exception:
+            self._terminate_locked(process)
+            raise
+        return True
 
     def _unwrap_response(
         self,
@@ -310,7 +361,7 @@ class PersistentNdjsonWorker:
         self,
         process: subprocess.Popen[str],
         command: str,
-    ) -> dict[str, Any]:
+    ) -> Never:
         code = process.poll()
         detail = self._diagnostic_suffix()
         self._terminate_locked(process)

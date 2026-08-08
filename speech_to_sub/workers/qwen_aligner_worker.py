@@ -6,14 +6,16 @@ import gc
 import importlib.metadata
 import math
 import os
-import sys
-import traceback
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from speech_to_sub.asr.checkpoints import require_local_checkpoint
-from speech_to_sub.asr.external_worker import decode_frame, encode_frame
+from speech_to_sub.workers.common import (
+    make_worker_request_handler,
+    resolve_device,
+    run_worker_loop,
+)
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -151,63 +153,15 @@ class QwenAlignerWorkerRuntime:
         return self._modules
 
 
-def handle_request(
-    runtime: QwenAlignerWorkerRuntime,
-    request: Mapping[str, Any],
-    progress_callback: WorkerProgressCallback | None = None,
-) -> tuple[dict[str, Any], bool]:
-    """Выполняет одну команду и формирует безопасный ответ протокола."""
-    request_id = str(request.get("id") or "")
-    command = str(request.get("command") or "").strip().casefold()
-    raw_payload = request.get("payload")
-    payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
-    try:
-        if command == "ping":
-            result = {"protocol": 1}
-        elif command == "preflight":
-            result = runtime.preflight(payload)
-        elif command == "align":
-            result = runtime.align(payload, progress_callback)
-        elif command == "unload":
-            result = runtime.unload()
-        elif command == "shutdown":
-            result = runtime.unload()
-            result["shutdown"] = True
-        else:
-            raise ValueError(f"Неизвестная команда ForcedAligner worker-а: {command or '?'}")
-        return {"id": request_id, "ok": True, "result": result}, command == "shutdown"
-    except Exception as exc:
-        traceback.print_exc(file=sys.stderr)
-        return {
-            "id": request_id,
-            "ok": False,
-            "error": {"type": type(exc).__name__, "message": str(exc)},
-        }, False
+handle_request = make_worker_request_handler(
+    action_name="align",
+    worker_name="ForcedAligner",
+)
 
 
 def main() -> int:
     """Читает framed NDJSON из stdin до команды shutdown или EOF."""
-    _configure_streams()
-    runtime = QwenAlignerWorkerRuntime()
-    for line in sys.stdin:
-        request = decode_frame(line)
-        if request is None:
-            continue
-        request_id = str(request.get("id") or "")
-
-        def emit_progress(value: int) -> None:
-            sys.stdout.write(
-                encode_frame({"id": request_id, "event": "progress", "progress": value})
-            )
-            sys.stdout.flush()
-
-        response, should_stop = handle_request(runtime, request, emit_progress)
-        sys.stdout.write(encode_frame(response))
-        sys.stdout.flush()
-        if should_stop:
-            break
-    runtime.unload()
-    return 0
+    return run_worker_loop(QwenAlignerWorkerRuntime(), handle_request)
 
 
 def _request_segments(value: Any, audio_duration: float) -> list[dict[str, Any]]:
@@ -259,19 +213,7 @@ def _serialize_words(result: Any, offset: float) -> list[dict[str, Any]]:
 
 
 def _resolve_device(torch: Any, requested_device: str) -> tuple[str, str, Any]:
-    requested = requested_device.strip().casefold()
-    if requested not in {"auto", "cuda", "cpu"}:
-        raise ValueError("Устройство ForcedAligner должно быть auto, cuda или cpu.")
-    cuda_available = bool(torch.cuda.is_available())
-    if requested == "cuda" and not cuda_available:
-        raise RuntimeError("Запрошена CUDA, но PyTorch worker-а не обнаружил CUDA-устройство.")
-    device = "cuda" if cuda_available and requested != "cpu" else "cpu"
-    if device == "cpu":
-        return device, "float32", torch.float32
-    supports_bfloat16 = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
-    if supports_bfloat16:
-        return device, "bfloat16", torch.bfloat16
-    return device, "float16", torch.float16
+    return resolve_device(torch, requested_device, device_name="ForcedAligner")
 
 
 def _runtime_signature(engine_version: str, device: str, compute_type: str) -> dict[str, Any]:
@@ -289,15 +231,6 @@ def _language_name(language: str) -> str:
         return _SUPPORTED_LANGUAGES[language]
     except KeyError as exc:
         raise ValueError("Qwen3 ForcedAligner поддерживает язык en или ru.") from exc
-
-
-def _configure_streams() -> None:
-    if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(encoding="utf-8", errors="strict")
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="strict", write_through=True)
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace", write_through=True)
 
 
 def _value(value: Any, name: str, default: Any) -> Any:

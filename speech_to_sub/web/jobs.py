@@ -470,17 +470,18 @@ class JobRegistry:
         cursor = max(0, after_event_id)
         while True:
             events, completed, terminal = job.events_after(cursor)
+            frames, next_cursor, terminal_seen = _format_sse_batch(events)
+            yield from frames
+            if next_cursor is not None:
+                cursor = next_cursor
+            if terminal_seen:
+                return
             if events:
-                for event_id, event in events:
-                    cursor = event_id
-                    yield _format_sse(event_id, event)
-                    if event.get("type") == "done":
-                        return
                 continue
             if completed:
-                terminal_id = job.terminal_event_id
-                if terminal is not None and terminal_id is not None and terminal_id > cursor:
-                    yield _format_sse(terminal_id, terminal)
+                terminal_frame = _terminal_sse_frame(job, terminal, cursor)
+                if terminal_frame is not None:
+                    yield terminal_frame
                 return
             if not job.wait_for_events(cursor, SSE_KEEP_ALIVE_SECONDS):
                 yield ": keep-alive\n\n"
@@ -855,6 +856,13 @@ def _job_from_snapshot(
         ),
     )
     job.log_lines.extend(str(line) for line in snapshot.get("logs", []))
+    _restore_event_history(job, snapshot)
+    _restore_terminal_state(job, snapshot)
+    return job
+
+
+def _restore_event_history(job: BatchJob, snapshot: Mapping[str, Any]) -> None:
+    """Восстанавливает валидные события и следующий номер из snapshot-а."""
     stored_events = snapshot.get("events", [])
     for entry in stored_events:
         if not isinstance(entry, Mapping) or not isinstance(entry.get("event"), Mapping):
@@ -864,6 +872,10 @@ def _job_from_snapshot(
         int(snapshot.get("latest_event_id") or 0) + 1,
         max((event_id for event_id, _ in job.event_history), default=0) + 1,
     )
+
+
+def _restore_terminal_state(job: BatchJob, snapshot: Mapping[str, Any]) -> None:
+    """Восстанавливает terminal-событие и локальные флаги задачи."""
     terminal_entry = next(
         (
             (event_id, event)
@@ -885,7 +897,6 @@ def _job_from_snapshot(
         job.cancel_requested.set()
     if snapshot.get("terminal"):
         job.finished.set()
-    return job
 
 
 def _optional_epoch(value: Any) -> float | None:
@@ -941,3 +952,25 @@ def _timestamp_to_epoch(value: Any, fallback: float) -> float:
 def _format_sse(event_id: int, event: Event) -> str:
     payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
     return f"id: {event_id}\ndata: {payload}\n\n"
+
+
+def _format_sse_batch(
+    events: list[tuple[int, Event]],
+) -> tuple[list[str], int | None, bool]:
+    """Форматирует накопленные события до первого terminal-события."""
+    frames: list[str] = []
+    last_event_id: int | None = None
+    for event_id, event in events:
+        last_event_id = event_id
+        frames.append(_format_sse(event_id, event))
+        if event.get("type") == "done":
+            return frames, last_event_id, True
+    return frames, last_event_id, False
+
+
+def _terminal_sse_frame(job: BatchJob, terminal: Event | None, cursor: int) -> str | None:
+    """Возвращает отсутствующий terminal-кадр для восстановленного SSE-потока."""
+    terminal_id = job.terminal_event_id
+    if terminal is None or terminal_id is None or terminal_id <= cursor:
+        return None
+    return _format_sse(terminal_id, terminal)

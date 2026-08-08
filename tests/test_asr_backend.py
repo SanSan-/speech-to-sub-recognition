@@ -300,14 +300,15 @@ def test_cuda_inference_error_is_not_retried_without_permission(
         "_load_once",
         lambda *_args: pytest.fail("CPU не должен загружаться без разрешения"),
     )
+    settings = ProcessingSettings(
+        model_path=tmp_path / "model",
+        device="cuda",
+        allow_cpu_fallback=False,
+    )
 
     with pytest.raises(AsrModelError, match="CUDA failure"):
         backend.transcribe(
             tmp_path / "audio.flac",
-            ProcessingSettings(
-                model_path=tmp_path / "model",
-                device="cuda",
-                allow_cpu_fallback=False,
-            ),
+            settings,
             duration=1.0,
         )

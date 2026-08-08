@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "target": "ES2022"
+  },
+  "include": ["speech_to_sub/web/static/**/*.js"]
+}

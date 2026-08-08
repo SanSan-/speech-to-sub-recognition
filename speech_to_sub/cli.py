@@ -4,7 +4,6 @@ import argparse
 import logging
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -156,7 +155,7 @@ def _merge_settings(base: ProcessingSettings, args: argparse.Namespace) -> Proce
             changes["aligner_model_path"] = DEFAULT_QWEN_ALIGNER_MODEL_PATH
         elif args.aligner == "none":
             changes["aligner_model_path"] = None
-    return replace(base, **changes)
+    return ProcessingSettings.from_mapping({**base.to_dict(), **changes})
 
 
 def _log_event(logger: logging.Logger, event: dict[str, object]) -> None:

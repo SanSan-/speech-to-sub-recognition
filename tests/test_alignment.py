@@ -288,9 +288,10 @@ def test_qwen_aligner_rejects_missing_words(tmp_path: Path) -> None:
     adapter = QwenForcedAlignerAdapter(
         lambda _python, _module: client  # type: ignore[arg-type]
     )
+    transcript = _transcript()
 
     with pytest.raises(AsrModelError, match="не вернул слова"):
-        adapter.align(audio, _transcript(), settings, 2.0)
+        adapter.align(audio, transcript, settings, 2.0)
 
 
 def test_qwen_aligner_honors_cancel_before_worker_load(tmp_path: Path) -> None:
@@ -304,14 +305,19 @@ def test_qwen_aligner_honors_cancel_before_worker_load(tmp_path: Path) -> None:
     audio = tmp_path / "audio.flac"
     audio.write_bytes(b"audio")
     adapter = QwenForcedAlignerAdapter(factory)  # type: ignore[arg-type]
+    transcript = _transcript()
+    settings = _settings(tmp_path)
+
+    def cancel_check() -> bool:
+        return True
 
     with pytest.raises(ProcessingCancelled, match="отменено"):
         adapter.align(
             audio,
-            _transcript(),
-            _settings(tmp_path),
+            transcript,
+            settings,
             2.0,
-            cancel_check=lambda: True,
+            cancel_check=cancel_check,
         )
     assert created is False
 
@@ -353,11 +359,13 @@ def test_qwen_aligner_honors_cancel_during_long_segment_split(tmp_path: Path) ->
         checks += 1
         return checks >= 4
 
+    adapter = QwenForcedAlignerAdapter(factory)  # type: ignore[arg-type]
+    settings = _settings(tmp_path)
     with pytest.raises(ProcessingCancelled, match="отменено"):
-        QwenForcedAlignerAdapter(factory).align(  # type: ignore[arg-type]
+        adapter.align(
             audio,
             transcript,
-            _settings(tmp_path),
+            settings,
             300.0,
             cancel_check=cancelled_during_split,
         )

@@ -72,8 +72,10 @@ def test_folder_limit_is_checked_before_service_build(
             web_app.PickerError("За один запуск можно выбрать не более 2 файлов.")
         ),
     )
+    paths = [str(tmp_path)]
+    settings = {"recursive": True}
 
     with pytest.raises(web_app.HTTPException, match="не более 2"):
-        web_app._build_items([str(tmp_path)], {"recursive": True})
+        web_app._build_items(paths, settings)
 
     assert calls == []

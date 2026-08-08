@@ -120,15 +120,14 @@ def test_worker_rejects_segment_over_180_seconds(
         lambda: (fake_torch, object(), lambda _path: [SizedWaveform()], "0.0.6"),
     )
     runtime = qwen_aligner_worker.QwenAlignerWorkerRuntime()
+    payload = {
+        "audio_path": str(audio),
+        "model_path": str(model_path),
+        "device": "cpu",
+        "segments": [
+            {"text": "too long", "language": "en", "start": 0, "end": 181}
+        ],
+    }
 
     with pytest.raises(ValueError, match="180"):
-        runtime.align(
-            {
-                "audio_path": str(audio),
-                "model_path": str(model_path),
-                "device": "cpu",
-                "segments": [
-                    {"text": "too long", "language": "en", "start": 0, "end": 181}
-                ],
-            }
-        )
+        runtime.align(payload)

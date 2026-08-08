@@ -110,12 +110,17 @@ def test_validator_rejects_invalid_srt(content: str, message: str) -> None:
 
 
 def test_validator_rejects_overlap_empty_text_and_duration_overrun() -> None:
+    overlapping = (Cue(1, 0.0, 2.0, "One"), Cue(2, 1.0, 3.0, "Two"))
     with pytest.raises(ValidationError, match="пересекается"):
-        validate_cues((Cue(1, 0.0, 2.0, "One"), Cue(2, 1.0, 3.0, "Two")))
+        validate_cues(overlapping)
+
+    empty_text = (Cue(1, 0.0, 1.0, "  "),)
     with pytest.raises(ValidationError, match="не содержит текста"):
-        validate_cues((Cue(1, 0.0, 1.0, "  "),))
+        validate_cues(empty_text)
+
+    duration_overrun = (Cue(1, 0.0, 2.0, "One"),)
     with pytest.raises(ValidationError, match="выходит за длительность"):
-        validate_cues((Cue(1, 0.0, 2.0, "One"),), audio_duration=1.0)
+        validate_cues(duration_overrun, audio_duration=1.0)
 
 
 def test_parse_srt_accepts_crlf_and_two_text_lines() -> None:

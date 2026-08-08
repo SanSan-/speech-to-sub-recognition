@@ -437,6 +437,40 @@ $env:ASR_MULTITRACK_EN_STREAM_INDEX = "1"
 .\.venv\Scripts\python.exe -B -m pytest tests\test_integration_multitrack_asr.py -m integration
 ```
 
+### SonarQube и coverage
+
+В репозитории хранится безопасный шаблон `sonar-project.properties.example`. Рабочий файл
+локален и не содержит token:
+
+```powershell
+Copy-Item -LiteralPath sonar-project.properties.example -Destination sonar-project.properties
+$env:SONAR_TOKEN = "<локальный-token>"
+```
+
+Рекомендуемый `$fix-sonar` runner сначала запускает pytest-cov, создаёт `coverage.xml`, затем
+выполняет свежий `sonar-scanner`, ждёт завершения CE task и получает issues, SECURITY,
+duplication и coverage через API:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .codex\skills\fix-sonar\scripts\sonar_cycle.ps1
+```
+
+Для финальной проверки с нулём Sonar findings:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .codex\skills\fix-sonar\scripts\sonar_cycle.ps1 -RequireClean
+```
+
+`SONAR_HOST_URL` и `SONAR_TOKEN` можно задать в локальном `.env`; значения token не попадают
+в properties, логи или `SONAR.md`. `coverage.xml` и `.coverage` являются локальными
+артефактами и не добавляются в репозиторий. В SonarQube импортируется строковое и веточное
+покрытие Python из pytest-cov. Статические HTML/CSS/JavaScript продолжают анализироваться,
+но исключены только из строчной метрики coverage до появления LCOV; основной браузерный
+сценарий проверяется Playwright. `tsconfig.sonar.json` ограничивает семантический анализ
+JavaScript исходниками frontend и не позволяет scanner-у обходить изолированные ML-runtime-ы.
+
 ### Подтверждённый прогон макета
 
 Для проверки были без изменения исходников созданы короткие аудиофрагменты из указанных
@@ -455,7 +489,7 @@ Transformers 5.6.2, faster-whisper 1.2.1 и CTranslate2 4.8.1. Числа ско
 и длины файла и не являются обещанием
 производительности. Отдельно проверены штатный `run_web.ps1`, health endpoint, SSE/reload,
 ранний `409` для второй задачи и запрет внешнего bind. Исторический быстрый набор V1.1:
-`89 passed, 3 skipped`; финальный быстрый набор V1.4 — `184 passed, 3 skipped`.
+`89 passed, 3 skipped`; финальный быстрый набор V1.4 — `185 passed, 3 skipped`.
 Три opt-in интеграционные проверки завершились как `3 passed`: одиночное медиа, реальная
 пачка `done/done/error` с cache pass и multi-track RU/EN. Live batch
 `done/done/error` завершился как `partial`, а второй проход дал

@@ -180,7 +180,6 @@ class TransformersWhisperBackend:
             model_path = validate_model_path(settings.model_path)
             self._load_once(model_path, "cpu", False)
             self._load_key = requested_key
-            assert self._pipeline is not None
             return self._run_pipeline(
                 audio_samples,
                 settings=settings,

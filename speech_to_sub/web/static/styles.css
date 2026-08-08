@@ -312,6 +312,8 @@ select {
 
 .panel-logs {
   --delay: 0.12s;
+  min-height: 176px;
+  margin-top: auto;
 }
 
 .panel-header {
@@ -575,12 +577,12 @@ select {
 
 .file-warning {
   color: #79500f;
-  background: rgba(214, 151, 44, 0.13);
+  background: #f7ead5;
 }
 
 .file-error {
   color: #912d2d;
-  background: rgba(203, 66, 66, 0.12);
+  background: #f8e5e5;
 }
 
 .settings-form {
@@ -671,11 +673,6 @@ input[type="checkbox"] {
   accent-color: var(--danger);
 }
 
-.panel-logs {
-  min-height: 176px;
-  margin-top: auto;
-}
-
 .log-header {
   align-items: center;
 }
@@ -689,8 +686,8 @@ input[type="checkbox"] {
 .terminal-status {
   padding: 3px 7px;
   border-radius: 999px;
-  color: #707980;
-  background: rgba(112, 121, 128, 0.12);
+  color: #4b555b;
+  background: #edf0f1;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.45px;

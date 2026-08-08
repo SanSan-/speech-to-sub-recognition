@@ -2,6 +2,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.coverage
+.codex
+.scannerwork
+coverage.xml
+htmlcov/
 .venv/
 node_modules/
 .idea/
@@ -15,4 +20,6 @@ tests/e2e/.artifacts/
 .env
 *.code-workspace
 *.md
-!README.md, PRD.md
+!PRD.md
+!README.md
+sonar-project.properties

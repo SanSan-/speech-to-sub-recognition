@@ -51,15 +51,17 @@ def settings_from_environment() -> ProcessingSettings:
     aligner_path_raw = os.getenv("ASR_ALIGNER_MODEL_PATH", "").strip()
     worker_python_raw = os.getenv("ASR_WORKER_PYTHON", "").strip()
     aligner_worker_python_raw = os.getenv("ASR_ALIGNER_WORKER_PYTHON", "").strip()
+    if aligner_path_raw:
+        aligner_model_path = Path(aligner_path_raw)
+    elif aligner == "qwen3-forced-aligner":
+        aligner_model_path = DEFAULT_QWEN_ALIGNER_MODEL_PATH
+    else:
+        aligner_model_path = None
     return ProcessingSettings(
         backend=backend,
         model_path=Path(os.getenv("ASR_MODEL_PATH", str(default_model_path))),
         aligner=aligner,
-        aligner_model_path=(
-            Path(aligner_path_raw)
-            if aligner_path_raw
-            else DEFAULT_QWEN_ALIGNER_MODEL_PATH if aligner == "qwen3-forced-aligner" else None
-        ),
+        aligner_model_path=aligner_model_path,
         worker_python_path=Path(worker_python_raw) if worker_python_raw else None,
         aligner_worker_python_path=(
             Path(aligner_worker_python_raw) if aligner_worker_python_raw else None

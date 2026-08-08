@@ -325,15 +325,16 @@ def _normalize_window_segments(
         else:
             if raw_words:
                 continue
-            start = max(0.0, window.offset + float(getattr(raw_segment, "start", 0.0)))
-            end = min(
+            untimed = _normalize_untimed_segment(
+                raw_segment,
+                window,
+                commit_start,
+                commit_end,
                 audio_duration,
-                window.offset + float(getattr(raw_segment, "end", 0.0)),
             )
-            midpoint = (start + end) / 2.0
-            if midpoint < commit_start or midpoint >= commit_end or end <= start:
+            if untimed is None:
                 continue
-            text = str(getattr(raw_segment, "text", "")).strip()
+            start, end, text = untimed
         if not text:
             continue
         result.append(
@@ -346,6 +347,24 @@ def _normalize_window_segments(
             )
         )
     return result
+
+
+def _normalize_untimed_segment(
+    raw_segment: Any,
+    window: AudioWindow,
+    commit_start: float,
+    commit_end: float,
+    audio_duration: float,
+) -> tuple[float, float, str] | None:
+    start = max(0.0, window.offset + float(getattr(raw_segment, "start", 0.0)))
+    end = min(
+        audio_duration,
+        window.offset + float(getattr(raw_segment, "end", 0.0)),
+    )
+    midpoint = (start + end) / 2.0
+    if midpoint < commit_start or midpoint >= commit_end or end <= start:
+        return None
+    return start, end, str(getattr(raw_segment, "text", "")).strip()
 
 
 def _normalize_words(

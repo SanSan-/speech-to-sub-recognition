@@ -114,12 +114,12 @@ def _iter_resampled_pcm(container: Any, stream: Any, resampler: Any) -> Iterator
         yield _frame_to_s16_bytes(converted)
 
 
-def _as_frames(value: Any) -> tuple[Any, ...]:
+def _as_frames(value: Any) -> list[Any]:
     if value is None:
-        return ()
+        return []
     if isinstance(value, (list, tuple)):
-        return tuple(value)
-    return (value,)
+        return list(value)
+    return [value]
 
 
 def _frame_to_s16_bytes(frame: Any) -> bytes:

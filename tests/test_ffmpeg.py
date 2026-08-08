@@ -138,8 +138,9 @@ def test_select_audio_stream_warns_on_ambiguous_match_and_fallback() -> None:
 
 
 def test_select_audio_stream_rejects_missing_explicit_ordinal() -> None:
+    streams = (_stream(0, 7),)
     with pytest.raises(MediaError, match="доступны: 0"):
-        select_audio_stream((_stream(0, 7),), requested_ordinal=7)
+        select_audio_stream(streams, requested_ordinal=7)
 
 
 def test_normalize_audio_builds_safe_command_and_requires_created_file(tmp_path: Path) -> None:
@@ -183,9 +184,10 @@ def test_normalize_audio_does_not_hide_overwrite(tmp_path: Path) -> None:
     destination = tmp_path / "normalized.flac"
     source.write_bytes(b"media")
     destination.write_bytes(b"ready")
+    stream = _stream(0, 1)
 
     with pytest.raises(MediaError, match="перезапись не разрешена"):
-        normalize_audio(source, destination, _stream(0, 1))
+        normalize_audio(source, destination, stream)
 
     args = build_ffmpeg_normalize_args(source, destination, _stream(0, 1), overwrite=True)
     assert "-y" in args

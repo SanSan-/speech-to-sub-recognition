@@ -121,8 +121,9 @@ def test_preflight_rejects_checkpoint_without_weights_before_worker(tmp_path: Pa
         created = True
         return _FakeClient()
 
+    backend = Qwen3AsrBackend(factory)  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="отсутствуют локальные веса"):
-        Qwen3AsrBackend(factory).preflight(settings)  # type: ignore[arg-type]
+        backend.preflight(settings)
     assert created is False
 
 
@@ -137,9 +138,10 @@ def test_preflight_rejects_missing_indexed_shard(tmp_path: Path) -> None:
     worker_python = tmp_path / "python.exe"
     worker_python.write_bytes(b"")
     settings = ProcessingSettings(model_path=model_path, worker_python_path=worker_python)
+    backend = Qwen3AsrBackend()
 
     with pytest.raises(ValidationError, match="отсутствуют шарды"):
-        Qwen3AsrBackend().preflight(settings)
+        backend.preflight(settings)
 
 
 def test_cuda_error_restarts_worker_and_retries_on_cpu(tmp_path: Path) -> None:
@@ -243,8 +245,8 @@ def test_worker_rejects_incompatible_qwen_package_version(
         "_import_qwen_runtime",
         lambda: (fake_torch, object(), object(), object(), "0.0.5"),
     )
+    runtime = qwen_worker.QwenWorkerRuntime()
+    payload = {"model_path": str(model_path), "device": "cpu"}
 
     with pytest.raises(RuntimeError, match="qwen-asr==0.0.6"):
-        qwen_worker.QwenWorkerRuntime().preflight(
-            {"model_path": str(model_path), "device": "cpu"}
-        )
+        runtime.preflight(payload)

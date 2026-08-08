@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from collections.abc import Sequence
 
 from speech_to_sub.constants import DEFAULT_MAX_CHARS_PER_LINE
@@ -241,27 +241,65 @@ def _normalize_timing(
     normalized: list[_RawCue] = []
     previous_end = 0.0
     for index, cue in enumerate(cues):
-        start = max(0.0, cue.start, previous_end)
-        if audio_duration is not None and start >= audio_duration:
-            raise ValidationError("Начало реплики находится за пределами длительности аудио")
-
         next_start = cues[index + 1].start if index + 1 < len(cues) else None
-        end = max(cue.end, start + 0.001)
-        if next_start is not None and next_start > start:
-            end = min(end, next_start)
-        if end - start < min_duration:
-            limit = next_start if next_start is not None and next_start > start else start + min_duration
-            if audio_duration is not None:
-                limit = min(limit, audio_duration)
-            end = max(end, min(start + min_duration, limit))
-        if audio_duration is not None:
-            end = min(end, audio_duration)
-        if end <= start:
-            raise ValidationError("После нормализации получена реплика нулевой длительности")
-
-        normalized.append(replace(cue, start=start, end=end))
-        previous_end = end
+        normalized_cue = _normalize_cue_timing(
+            cue,
+            previous_end,
+            next_start,
+            min_duration,
+            audio_duration,
+        )
+        normalized.append(normalized_cue)
+        previous_end = normalized_cue.end
     return normalized
+
+
+def _normalize_cue_timing(
+    cue: _RawCue,
+    previous_end: float,
+    next_start: float | None,
+    min_duration: float,
+    audio_duration: float | None,
+) -> _RawCue:
+    start = max(0.0, cue.start, previous_end)
+    if audio_duration is not None and start >= audio_duration:
+        raise ValidationError("Начало реплики находится за пределами длительности аудио")
+    end = _normalized_cue_end(
+        cue.end,
+        start,
+        next_start,
+        min_duration,
+        audio_duration,
+    )
+    if end <= start:
+        raise ValidationError("После нормализации получена реплика нулевой длительности")
+    return _RawCue(start=start, end=end, text=cue.text)
+
+
+def _normalized_cue_end(
+    cue_end: float,
+    start: float,
+    next_start: float | None,
+    min_duration: float,
+    audio_duration: float | None,
+) -> float:
+    end = max(cue_end, start + 0.001)
+    if next_start is not None and next_start > start:
+        end = min(end, next_start)
+    if end - start < min_duration:
+        limit = _cue_end_limit(start, next_start, min_duration, audio_duration)
+        end = max(end, min(start + min_duration, limit))
+    return min(end, audio_duration) if audio_duration is not None else end
+
+
+def _cue_end_limit(
+    start: float,
+    next_start: float | None,
+    min_duration: float,
+    audio_duration: float | None,
+) -> float:
+    limit = next_start if next_start is not None and next_start > start else start + min_duration
+    return min(limit, audio_duration) if audio_duration is not None else limit
 
 
 def _wrap_text(text: str, max_chars: int, max_lines: int) -> str:

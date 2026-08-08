@@ -1,0 +1,22 @@
+# Метаданные проекта
+sonar.projectKey=speech-to-sub-recognition
+sonar.projectName=speech-to-sub-recognition
+sonar.projectVersion=1.4.0
+sonar.sourceEncoding=UTF-8
+
+# Локальный SonarQube. Токен передаётся только через SONAR_TOKEN.
+sonar.host.url=http://localhost
+
+# Исходники и тесты
+sonar.sources=speech_to_sub
+sonar.tests=tests
+sonar.test.inclusions=tests/**/*.py,tests/e2e/**/*.mjs
+sonar.exclusions=resources/**,.venv/**,node_modules/**,tests/e2e/.artifacts/**,**/__pycache__/**
+sonar.typescript.tsconfigPaths=tsconfig.sonar.json
+
+# Python
+sonar.python.version=3.14
+
+# Отчёт создаётся pytest-cov перед каждым scanner-циклом.
+sonar.python.coverage.reportPaths=coverage.xml
+sonar.coverage.exclusions=speech_to_sub/web/static/**
