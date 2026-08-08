@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speech-to-sub-recognition"
+dynamic = ["version"]
+description = "Local batch speech recognition and SRT generation."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.setuptools.dynamic]
+version = { attr = "speech_to_sub.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["speech_to_sub*"]
+
+[tool.setuptools.package-data]
+"speech_to_sub.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: тяжёлые проверки с FFmpeg или реальной локальной ASR-моделью",
+]
+
