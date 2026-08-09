@@ -62,7 +62,7 @@ def test_real_multitrack_media_uses_explicit_audio_stream(tmp_path: Path) -> Non
             sidecar_path = Path(str(results[0]["sidecar_output"]))
             sidecar = json.loads(read_text_utf8(sidecar_path))
             assert sidecar["selected_stream"]["ordinal"] == stream_index
-            assert sidecar["settings"]["language"] == language
+            assert sidecar["recognition_settings"]["language"] == language
             assert sidecar["transcript"]["language"] == language
             assert sidecar["transcript"]["text"].strip()
             validate_srt_text(read_text_utf8(srt_path))

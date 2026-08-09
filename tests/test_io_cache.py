@@ -7,13 +7,17 @@ from pathlib import Path
 import pytest
 
 from speech_to_sub.exceptions import ValidationError
+from speech_to_sub.constants import SIDECAR_SCHEMA_VERSION
 from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils import io_utils
 from speech_to_sub.utils.cache import (
-    build_settings_fingerprint,
+    build_layout_fingerprint,
+    build_recognition_fingerprint,
     build_source_fingerprint,
     load_sidecar,
+    sidecar_fingerprints,
     sidecar_matches,
+    sidecar_recognition_matches,
     write_sidecar,
 )
 from speech_to_sub.utils.io_utils import (
@@ -105,7 +109,7 @@ def test_validate_model_path_requires_local_configs_and_weights(tmp_path: Path) 
         validate_model_path(model_path)
 
 
-def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path) -> None:
+def test_cache_fingerprints_separate_recognition_and_layout_settings(tmp_path: Path) -> None:
     source_path = tmp_path / "source.mp4"
     source_path.write_bytes(b"media-v1")
 
@@ -126,7 +130,12 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
         "compute_type": "float32",
         "quantized": False,
     }
-    fingerprint = build_settings_fingerprint(settings, stream_ordinal=2, runtime=runtime)
+    recognition = build_recognition_fingerprint(
+        settings,
+        stream_ordinal=2,
+        runtime=runtime,
+    )
+    layout = build_layout_fingerprint(settings)
     operational_only = replace(
         settings,
         force=True,
@@ -134,10 +143,34 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
         output_dir=tmp_path / "outputs",
         verbose=True,
     )
-    assert build_settings_fingerprint(operational_only, 2, runtime=runtime) == fingerprint
-    assert build_settings_fingerprint(replace(settings, language="en"), 2, runtime=runtime) != fingerprint
-    assert build_settings_fingerprint(settings, 1, runtime=runtime) != fingerprint
-    assert build_settings_fingerprint(
+    assert build_recognition_fingerprint(operational_only, 2, runtime=runtime) == recognition
+    assert build_layout_fingerprint(operational_only) == layout
+    assert build_recognition_fingerprint(
+        replace(settings, language="en"),
+        2,
+        runtime=runtime,
+    ) != recognition
+    for changed_layout in (
+        replace(settings, max_chars_per_line=40),
+        replace(settings, line_length_gap=0),
+        replace(settings, max_cps=16.5),
+    ):
+        assert build_recognition_fingerprint(
+            changed_layout,
+            2,
+            runtime=runtime,
+        ) == recognition
+        assert build_layout_fingerprint(changed_layout) != layout
+    assert recognition["pipeline_version"] == "7"
+    assert "srt_builder_version" not in recognition
+    assert layout == {
+        "srt_builder_version": "3",
+        "max_chars_per_line": 42,
+        "line_length_gap": 8,
+        "max_cps": 17.0,
+    }
+    assert build_recognition_fingerprint(settings, 1, runtime=runtime) != recognition
+    assert build_recognition_fingerprint(
         settings,
         2,
         runtime={
@@ -147,41 +180,41 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
             "compute_type": "int8",
             "quantized": True,
         },
-    ) != fingerprint
+    ) != recognition
 
     faster_settings = replace(settings, backend="faster-whisper")
     faster_runtime = {**runtime, "backend": "faster-whisper"}
-    faster_fingerprint = build_settings_fingerprint(
+    faster_fingerprint = build_recognition_fingerprint(
         faster_settings,
         2,
         runtime=faster_runtime,
     )
-    assert build_settings_fingerprint(
+    assert build_recognition_fingerprint(
         replace(faster_settings, long_form_window_seconds=240),
         2,
         runtime=faster_runtime,
     ) != faster_fingerprint
-    assert build_settings_fingerprint(
+    assert build_recognition_fingerprint(
         replace(settings, long_form_window_seconds=240),
         2,
         runtime=runtime,
-    ) == fingerprint
-    assert build_settings_fingerprint(
+    ) == recognition
+    assert build_recognition_fingerprint(
         settings,
         2,
         runtime={
             **runtime,
             "backend": "faster-whisper",
         },
-    ) != fingerprint
-    assert build_settings_fingerprint(
+    ) != recognition
+    assert build_recognition_fingerprint(
         settings,
         2,
         runtime={
             **runtime,
             "engine_version": "5.7.0",
         },
-    ) != fingerprint
+    ) != recognition
 
     aligner_settings = replace(
         settings,
@@ -200,7 +233,7 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
         **qwen_runtime,
         "backend": "qwen3-forced-aligner",
     }
-    aligned_fingerprint = build_settings_fingerprint(
+    aligned_fingerprint = build_recognition_fingerprint(
         aligner_settings,
         2,
         runtime=qwen_runtime,
@@ -210,13 +243,13 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
     assert aligned_fingerprint["aligner"]["parameters"] == {
         "max_segment_seconds": 180,
     }
-    assert build_settings_fingerprint(
+    assert build_recognition_fingerprint(
         replace(aligner_settings, aligner_model_path=tmp_path / "other-aligner"),
         2,
         runtime=qwen_runtime,
         aligner_runtime=aligner_runtime,
     ) != aligned_fingerprint
-    assert build_settings_fingerprint(
+    assert build_recognition_fingerprint(
         aligner_settings,
         2,
         runtime=qwen_runtime,
@@ -230,11 +263,19 @@ def test_cache_fingerprints_track_source_and_only_result_settings(tmp_path: Path
 def test_sidecar_round_trip_and_match_validation(tmp_path: Path) -> None:
     sidecar_path = tmp_path / "sample.asr.json"
     source = {"sha256": "source-hash"}
-    settings = {"language": "ru"}
+    recognition = {"pipeline_version": "7", "language": "ru"}
+    layout = {
+        "srt_builder_version": "3",
+        "max_chars_per_line": 42,
+        "line_length_gap": 8,
+        "max_cps": 17.0,
+    }
     payload = {
+        "sidecar_schema_version": SIDECAR_SCHEMA_VERSION,
         "status": "done",
         "source": source,
-        "settings": settings,
+        "recognition_settings": recognition,
+        "layout_settings": layout,
         "message": "Готово",
     }
 
@@ -242,11 +283,92 @@ def test_sidecar_round_trip_and_match_validation(tmp_path: Path) -> None:
 
     assert sidecar_path.read_bytes()[:3] != b"\xef\xbb\xbf"
     assert load_sidecar(sidecar_path) == payload
-    assert sidecar_matches(load_sidecar(sidecar_path), source, settings) is True
-    assert sidecar_matches({**payload, "status": "error"}, source, settings) is False
-    assert sidecar_matches(payload, {"sha256": "other"}, settings) is False
+    assert sidecar_matches(load_sidecar(sidecar_path), source, recognition, layout) is True
+    assert sidecar_recognition_matches(payload, source, recognition) is True
+    assert sidecar_matches(
+        {**payload, "status": "error"},
+        source,
+        recognition,
+        layout,
+    ) is False
+    assert sidecar_matches(
+        payload,
+        {"sha256": "other"},
+        recognition,
+        layout,
+    ) is False
+    assert sidecar_matches(
+        payload,
+        source,
+        recognition,
+        {**layout, "max_cps": 15.0},
+    ) is False
+    assert sidecar_recognition_matches(
+        payload,
+        source,
+        {**recognition, "language": "en"},
+    ) is False
 
     sidecar_path.write_bytes(b"not-json")
     assert load_sidecar(sidecar_path) is None
     sidecar_path.write_text("[]\n", encoding="utf-8", newline="\n")
     assert load_sidecar(sidecar_path) is None
+
+
+def test_legacy_pipeline7_builder2_sidecar_reuses_only_recognition() -> None:
+    recognition = {"pipeline_version": "7", "language": "ru"}
+    legacy = {
+        "status": "done",
+        "source": {"sha256": "source-hash"},
+        "settings": {
+            **recognition,
+            "srt_builder_version": "2",
+            "max_chars_per_line": 42,
+        },
+    }
+
+    fingerprints = sidecar_fingerprints(legacy)
+
+    assert fingerprints == (
+        recognition,
+        {
+            "srt_builder_version": "2",
+            "max_chars_per_line": 42,
+        },
+    )
+    assert sidecar_recognition_matches(
+        legacy,
+        legacy["source"],
+        recognition,
+    ) is True
+    extended_layout = {
+        **legacy,
+        "settings": {
+            **legacy["settings"],
+            "line_length_gap": 8,
+            "max_cps": 17.0,
+        },
+    }
+    assert sidecar_fingerprints(extended_layout) == (
+        recognition,
+        {
+            "srt_builder_version": "2",
+            "max_chars_per_line": 42,
+            "line_length_gap": 8,
+            "max_cps": 17.0,
+        },
+    )
+    assert sidecar_fingerprints(
+        {
+            **legacy,
+            "settings": {**legacy["settings"], "pipeline_version": "6"},
+        }
+    ) is None
+    assert sidecar_fingerprints(
+        {
+            **legacy,
+            "settings": {**legacy["settings"], "srt_builder_version": "3"},
+        }
+    ) is None
+    assert sidecar_fingerprints({**legacy, "sidecar_schema_version": 99}) is None
+    assert sidecar_fingerprints({**legacy, "sidecar_schema_version": 2.0}) is None

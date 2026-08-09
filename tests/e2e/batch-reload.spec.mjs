@@ -23,10 +23,125 @@ async function e2eState(request) {
   return response.json();
 }
 
+test("рабочие панели ограничены, настройки сгруппированы и мобильный поток свободен", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+
+  const alignmentSettings = page.locator("#alignmentSettings");
+  const srtSettings = page.locator("#srtSettings");
+  const longFormSettings = page.locator("#longFormSettings");
+  const advancedSettings = page.locator("#advancedSettings");
+  await expect(alignmentSettings).not.toHaveAttribute("open", "");
+  await expect(srtSettings).toHaveAttribute("open", "");
+  await expect(longFormSettings).not.toHaveAttribute("open", "");
+  await expect(advancedSettings).not.toHaveAttribute("open", "");
+
+  await alignmentSettings.locator("summary").click();
+  await longFormSettings.locator("summary").click();
+  await advancedSettings.locator("summary").click();
+  await expect(alignmentSettings).toHaveAttribute("open", "");
+  await expect(longFormSettings).toHaveAttribute("open", "");
+  await expect(advancedSettings).toHaveAttribute("open", "");
+
+  await page.getByLabel("Допуск длины строки SRT").fill("7");
+  await page.getByLabel("Окно длинной записи, сек.").fill("420");
+  await page.getByLabel("Сохранить нормализованный FLAC").check();
+  await expect
+    .poll(() =>
+      page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "null"), SETTINGS_KEY),
+    )
+    .toMatchObject({
+      line_length_gap: 7,
+      long_form_window_seconds: 420,
+      keep_audio: true,
+    });
+
+  await page.getByRole("button", { name: "Файлы" }).click();
+  await expect(page.locator(".file-card")).toHaveCount(3);
+  await page.locator("#fileList").evaluate((list) => {
+    const template = list.querySelector(".file-card");
+    if (!template) return;
+    for (let index = 0; index < 3; index += 1) {
+      list.append(template.cloneNode(true));
+    }
+  });
+
+  const desktopLayout = await page.evaluate(() => {
+    const main = document.querySelector(".main-grid");
+    const files = document.querySelector(".panel-files");
+    const settings = document.querySelector(".panel-settings");
+    const fileList = document.querySelector("#fileList");
+    const settingsForm = document.querySelector("#settingsForm");
+    const logs = document.querySelector(".panel-logs");
+    const actions = document.querySelector(".job-actions");
+    const mainRect = main.getBoundingClientRect();
+    const filesRect = files.getBoundingClientRect();
+    const settingsRect = settings.getBoundingClientRect();
+    const logsRect = logs.getBoundingClientRect();
+    const actionsRect = actions.getBoundingClientRect();
+    return {
+      equalPanelHeight: Math.abs(filesRect.height - settingsRect.height) < 1,
+      fileOverflow: getComputedStyle(fileList).overflowY,
+      settingsOverflow: getComputedStyle(settingsForm).overflowY,
+      fileScrollable: fileList.scrollHeight > fileList.clientHeight,
+      settingsScrollable: settingsForm.scrollHeight > settingsForm.clientHeight,
+      logsFollowMain: main.nextElementSibling === logs && logsRect.top >= mainRect.bottom,
+      logsGap: Math.round(logsRect.top - mainRect.bottom),
+      logsVisible: logsRect.bottom <= window.innerHeight,
+      actionsVisible: actionsRect.top >= 0 && actionsRect.bottom <= window.innerHeight,
+    };
+  });
+  expect(desktopLayout).toMatchObject({
+    equalPanelHeight: true,
+    fileOverflow: "auto",
+    settingsOverflow: "auto",
+    fileScrollable: true,
+    settingsScrollable: true,
+    logsFollowMain: true,
+    logsVisible: true,
+    actionsVisible: true,
+  });
+  expect(desktopLayout.logsGap).toBeLessThanOrEqual(20);
+  await expect(page.locator("body")).not.toContainText("ASR backend");
+  await expect(page.locator("body")).not.toContainText("Beam size");
+  await expect(page.locator("body")).not.toContainText("Long-form");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await expect(page.locator("#advancedSettings")).not.toHaveAttribute("open", "");
+  await page.locator("#advancedSettings > summary").click();
+  await expect(page.getByLabel("Сохранить нормализованный FLAC")).toBeChecked();
+  await page.locator("#longFormSettings > summary").click();
+  await expect(page.getByLabel("Окно длинной записи, сек.")).toHaveValue("420");
+  await expect(page.getByLabel("Допуск длины строки SRT")).toHaveValue("7");
+
+  const mobileLayout = await page.evaluate(() => {
+    const fileList = document.querySelector("#fileList");
+    const settingsForm = document.querySelector("#settingsForm");
+    const files = document.querySelector(".panel-files");
+    const settings = document.querySelector(".panel-settings");
+    return {
+      fileOverflow: getComputedStyle(fileList).overflowY,
+      settingsOverflow: getComputedStyle(settingsForm).overflowY,
+      fileFitsContent: fileList.scrollHeight <= fileList.clientHeight + 1,
+      settingsFitsContent: settingsForm.scrollHeight <= settingsForm.clientHeight + 1,
+      ordinaryFlow: settings.getBoundingClientRect().top >= files.getBoundingClientRect().bottom,
+    };
+  });
+  expect(mobileLayout).toEqual({
+    fileOverflow: "visible",
+    settingsOverflow: "visible",
+    fileFitsContent: true,
+    settingsFitsContent: true,
+    ordinaryFlow: true,
+  });
+});
+
 test("SQLite сохраняет batch при reload, cancel и retry", async ({ page, request }) => {
   await page.goto("/");
 
   const backend = page.locator("#backend");
+  await page.locator("#alignmentSettings > summary").click();
   const aligner = page.locator("#aligner");
   await backend.selectOption("faster-whisper");
   await aligner.selectOption("qwen3-forced-aligner");
@@ -42,20 +157,35 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
 
   const language = page.getByLabel("Язык распознавания");
   const device = page.getByLabel("Устройство");
+  const maxCharsPerLine = page.getByLabel("Базовая длина строки SRT");
+  const lineLengthGap = page.getByLabel("Допуск длины строки SRT");
+  const maxCps = page.getByLabel("Скорость чтения, символов/с");
   const cancel = page.getByRole("button", { name: "Отменить" });
   const retry = page.getByRole("button", { name: "Повторить ошибки" });
   await language.selectOption("ru");
   await device.selectOption("cpu");
+  await maxCharsPerLine.fill("40");
+  await lineLengthGap.fill("6");
+  await maxCps.fill("16.5");
 
   await expect
     .poll(() =>
       page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "null"), SETTINGS_KEY),
     )
-    .toMatchObject({ language: "ru", device: "cpu" });
+    .toMatchObject({
+      language: "ru",
+      device: "cpu",
+      max_chars_per_line: 40,
+      line_length_gap: 6,
+      max_cps: 16.5,
+    });
 
   await page.reload();
   await expect(language).toHaveValue("ru");
   await expect(device).toHaveValue("cpu");
+  await expect(maxCharsPerLine).toHaveValue("40");
+  await expect(lineLengthGap).toHaveValue("6");
+  await expect(maxCps).toHaveValue("16.5");
 
   await page.getByRole("button", { name: "Файлы" }).click();
   await expect(page.locator(".file-card")).toHaveCount(3);

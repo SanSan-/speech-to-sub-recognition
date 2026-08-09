@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping, TypedDict
@@ -11,9 +12,11 @@ from speech_to_sub.constants import (
     DEFAULT_AUDIO_LANGUAGE,
     DEFAULT_CHUNK_LENGTH_SECONDS,
     DEFAULT_LANGUAGE,
+    DEFAULT_LINE_LENGTH_GAP,
     DEFAULT_LONG_FORM_OVERLAP_SECONDS,
     DEFAULT_LONG_FORM_WINDOW_SECONDS,
     DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_MAX_CPS,
     DEFAULT_MODEL_PATH,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_STRIDE_LENGTH_SECONDS,
@@ -80,6 +83,22 @@ class TranscriptWord:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any], *, duration: float) -> TranscriptWord:
+        """Безопасно восстанавливает слово из диагностического JSON."""
+        start = _finite_float(value.get("start"), "начала слова", minimum=0.0)
+        end = _finite_float(value.get("end"), "конца слова", minimum=0.0)
+        if end <= start or end > duration + 0.25:
+            raise ValidationError("Слово в sidecar содержит некорректный интервал.")
+        text = _required_string(value.get("text"), "текст слова")
+        probability_raw = value.get("probability")
+        probability = (
+            None
+            if probability_raw is None
+            else _finite_float(probability_raw, "вероятность слова")
+        )
+        return cls(start=start, end=end, text=text, probability=probability)
+
 
 @dataclass(frozen=True)
 class TranscriptSegment:
@@ -99,6 +118,39 @@ class TranscriptSegment:
             "text": self.text,
             "words": [word.to_dict() for word in self.words],
         }
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        duration: float,
+    ) -> TranscriptSegment:
+        """Безопасно восстанавливает сегмент и его словные метки."""
+        start = _finite_float(value.get("start"), "начала сегмента", minimum=0.0)
+        end = _finite_float(value.get("end"), "конца сегмента", minimum=0.0)
+        if end <= start or end > duration + 0.25:
+            raise ValidationError("Сегмент в sidecar содержит некорректный интервал.")
+        words_raw = value.get("words", [])
+        if not isinstance(words_raw, list) or any(
+            not isinstance(word, Mapping) for word in words_raw
+        ):
+            raise ValidationError("Список слов сегмента в sidecar имеет неверный формат.")
+        segment_id = value.get("id")
+        if segment_id is not None and (
+            isinstance(segment_id, bool) or not isinstance(segment_id, int)
+        ):
+            raise ValidationError("Идентификатор сегмента в sidecar должен быть целым числом.")
+        return cls(
+            start=start,
+            end=end,
+            text=_required_string(value.get("text"), "текст сегмента"),
+            words=tuple(
+                TranscriptWord.from_mapping(word, duration=duration)
+                for word in words_raw
+            ),
+            segment_id=segment_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -126,6 +178,39 @@ class Transcript:
             "metadata": dict(self.metadata),
         }
 
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> Transcript:
+        """Безопасно восстанавливает распознавание из sidecar без преобразования типов."""
+        duration = _finite_float(value.get("duration"), "длительность распознавания")
+        if duration <= 0:
+            raise ValidationError("Длительность распознавания в sidecar должна быть положительной.")
+        segments_raw = value.get("segments")
+        if (
+            not isinstance(segments_raw, list)
+            or not segments_raw
+            or any(not isinstance(segment, Mapping) for segment in segments_raw)
+        ):
+            raise ValidationError("Список сегментов распознавания в sidecar имеет неверный формат.")
+        quantized = value.get("quantized")
+        if not isinstance(quantized, bool):
+            raise ValidationError("Признак квантования в sidecar должен быть логическим.")
+        metadata = value.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValidationError("Метаданные распознавания в sidecar имеют неверный формат.")
+        return cls(
+            text=_required_string(value.get("text"), "текст распознавания"),
+            language=_required_string(value.get("language"), "язык распознавания"),
+            duration=duration,
+            segments=tuple(
+                TranscriptSegment.from_mapping(segment, duration=duration)
+                for segment in segments_raw
+            ),
+            model=_required_string(value.get("model"), "модель распознавания"),
+            device=_required_string(value.get("device"), "устройство распознавания"),
+            quantized=quantized,
+            metadata=dict(metadata),
+        )
+
 
 @dataclass(frozen=True)
 class ProcessingSettings:
@@ -149,6 +234,8 @@ class ProcessingSettings:
     output_dir: Path | None = None
     verbose: bool = False
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE
+    line_length_gap: int = DEFAULT_LINE_LENGTH_GAP
+    max_cps: float = DEFAULT_MAX_CPS
     chunk_length_seconds: int = DEFAULT_CHUNK_LENGTH_SECONDS
     stride_length_seconds: int = DEFAULT_STRIDE_LENGTH_SECONDS
     long_form_window_seconds: int = DEFAULT_LONG_FORM_WINDOW_SECONDS
@@ -225,6 +312,26 @@ def _normalize_aligner_model_path(data: dict[str, Any]) -> None:
 def _normalize_optional_path(data: dict[str, Any], key: str) -> None:
     value = data.get(key)
     data[key] = Path(str(value)) if value else None
+
+
+def _required_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"Поле «{label}» в sidecar должно быть непустой строкой.")
+    return value
+
+
+def _finite_float(
+    value: Any,
+    label: str,
+    *,
+    minimum: float | None = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"Поле «{label}» в sidecar должно быть числом.")
+    number = float(value)
+    if not math.isfinite(number) or (minimum is not None and number < minimum):
+        raise ValidationError(f"Поле «{label}» в sidecar содержит недопустимое число.")
+    return number
 
 
 @dataclass(frozen=True)

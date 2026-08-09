@@ -20,7 +20,11 @@ from speech_to_sub.alignment.base import AlignmentAdapter
 from speech_to_sub.alignment.registry import aligner_names, get_aligner
 from speech_to_sub.asr.base import AsrBackend
 from speech_to_sub.asr.registry import activate_backend, backend_names, get_backend
-from speech_to_sub.constants import WORK_DIR
+from speech_to_sub.constants import (
+    MAX_LINE_LENGTH_GAP,
+    SIDECAR_SCHEMA_VERSION,
+    WORK_DIR,
+)
 from speech_to_sub.exceptions import ProcessingCancelled, SpeechToSubError, ValidationError
 from speech_to_sub.media.ffmpeg import (
     get_media_duration,
@@ -37,12 +41,14 @@ from speech_to_sub.models import (
     RuntimeSignature,
     Transcript,
 )
-from speech_to_sub.subtitles.builder import build_cues, render_srt
+from speech_to_sub.subtitles.builder import build_cues_with_diagnostics, render_srt
 from speech_to_sub.subtitles.validator import validate_srt_text
 from speech_to_sub.utils.cache import (
-    build_settings_fingerprint,
+    build_layout_fingerprint,
+    build_recognition_fingerprint,
     build_source_fingerprint,
     load_sidecar,
+    sidecar_recognition_matches,
     sidecar_matches,
     write_sidecar,
 )
@@ -58,6 +64,15 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE_LOCK_NAME = ".active.lock"
 DEFAULT_WORKSPACE_TTL_SECONDS = 60 * 60
+SUBTITLE_LAYOUT_SIDECAR_KEY = "subtitle_layout"
+_LAYOUT_DIAGNOSTIC_LABELS = {
+    "reconciled_segments": "восстановлены текст и пунктуация сегментов",
+    "alignment_text_segments": "обнаружены расхождения текста и словных меток",
+    "synthetic_timing_segments": "синтезированы временные метки сегментов",
+    "retimed_leading_islands": "перенесены фрагменты с аномальными начальными метками",
+    "adjusted_boundaries": "скорректированы временные границы реплик",
+    "max_boundary_drift_ms": "максимальный сдвиг границы, мс",
+}
 
 EventCallback = Callable[[dict[str, Any]], None]
 LogCallback = Callable[[str], None]
@@ -77,6 +92,15 @@ class _FileProcessingContext:
     emit_event: EventCallback
     log: LogCallback
     cancel_check: CancelCheck | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedRecognition:
+    """Проверенный тяжёлый результат, пригодный для новой SRT-разметки."""
+
+    transcript: Transcript
+    normalized_duration: float
+    recognition_settings: dict[str, Any]
 
 
 def get_preflight_status(settings_values: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -169,21 +193,25 @@ def build_items(
             item["probe"] = probe.to_dict()
             item["selected_stream"] = stream.to_dict()
             item["warning"] = warning
-            cache_settings = _cache_settings_for_lookup(
+            fingerprints = _cache_fingerprints_for_lookup(
                 outputs,
                 settings,
                 stream.ordinal,
                 backend=get_backend(settings.backend),
             )
-            cache_valid = bool(
-                cache_settings and _is_valid_cache(outputs, source, cache_settings)
-            )
+            cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
             if cache_valid and settings.keep_audio and not _has_saved_audio(outputs):
                 item.update(stage="Требуется сохранить аудио")
             elif cache_valid:
                 item.update(state="cached", stage="Кеш", progress=100, cached=True)
             elif outputs.srt_path.exists() and not settings.force:
                 item.update(state="skipped", stage="Существующий SRT", progress=100, skipped=True)
+            elif fingerprints and _load_cached_recognition(
+                outputs,
+                source,
+                fingerprints[0],
+            ):
+                item.update(stage="Пересборка SRT из кеша распознавания")
         except Exception as exc:
             item.update(state="error", stage="Ошибка проверки", progress=100, error=str(exc))
         items.append(item)
@@ -446,7 +474,7 @@ def _process_one_locked(
             log=log,
             cancel_check=cancel_check,
         )
-        existing_result = _reuse_existing_result(
+        existing_result, cached_recognition = _reuse_existing_result(
             context,
             probe=probe,
             stream=stream,
@@ -455,6 +483,19 @@ def _process_one_locked(
         )
         if existing_result is not None:
             return existing_result, backend
+        if cached_recognition is not None:
+            return (
+                _rebuild_srt_from_cached_recognition(
+                    context,
+                    cached_recognition,
+                    probe=probe,
+                    stream=stream,
+                    source=source,
+                    warning=warning,
+                    started_at=started_at,
+                ),
+                backend,
+            )
 
         _emit_file(emit_event, path, index, total, "extracting", "Нормализация аудио", 10)
         _raise_if_cancelled(cancel_check)
@@ -478,41 +519,38 @@ def _process_one_locked(
             backend=backend,
         )
         _emit_file(emit_event, path, index, total, "writing", "Формирование SRT", 88)
-        cues = build_cues(
-            transcript.segments,
-            max_chars_per_line=settings.max_chars_per_line,
-            audio_duration=normalized_duration,
+        srt_text, subtitle_layout = _build_srt_artifacts(
+            transcript,
+            settings,
+            normalized_duration,
+            path=path,
+            log=log,
         )
-        srt_text = render_srt(cues)
-        validate_srt_text(srt_text, duration=normalized_duration)
         finished_at = datetime.now(timezone.utc).isoformat()
         aligner_runtime = _loaded_aligner_runtime(aligner, settings, transcript)
         if settings.aligner != "none" and aligner_runtime is None:
             aligner_runtime = _expected_aligner_runtime(aligner, settings)
-        cache_settings = build_settings_fingerprint(
+        recognition_settings = build_recognition_fingerprint(
             settings,
             stream.ordinal,
             runtime=runtime,
             aligner_runtime=aligner_runtime,
         )
-        sidecar = {
-            "status": "done",
-            "created_at": finished_at,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "source": source,
-            "settings": cache_settings,
-            "probe": probe.to_dict(),
-            "selected_stream": stream.to_dict(),
-            "warning": warning,
-            "normalized_audio_duration": normalized_duration,
-            "transcript": transcript.to_dict(),
-            "outputs": {
-                "srt": str(outputs.srt_path),
-                "sidecar": str(outputs.sidecar_path),
-                "audio": str(outputs.normalized_audio_path) if settings.keep_audio else None,
-            },
-        }
+        sidecar = _build_sidecar_payload(
+            started_at=started_at,
+            finished_at=finished_at,
+            source=source,
+            recognition_settings=recognition_settings,
+            layout_settings=build_layout_fingerprint(settings),
+            probe=probe,
+            stream=stream,
+            warning=warning,
+            normalized_duration=normalized_duration,
+            transcript=transcript,
+            subtitle_layout=subtitle_layout,
+            outputs=outputs,
+            keep_audio=settings.keep_audio,
+        )
         _publish_artifacts(
             outputs,
             srt_text=srt_text,
@@ -579,19 +617,17 @@ def _reuse_existing_result(
     stream: AudioStreamInfo,
     source: dict[str, Any],
     backend: AsrBackend | None,
-) -> FileResult | None:
+) -> tuple[FileResult | None, _CachedRecognition | None]:
     path = context.path
     settings = context.settings
     outputs = context.outputs
-    lookup_settings = _cache_settings_for_lookup(
+    fingerprints = _cache_fingerprints_for_lookup(
         outputs,
         settings,
         stream.ordinal,
         backend=backend if backend is not None else get_backend(settings.backend),
     )
-    cache_valid = bool(
-        lookup_settings and _is_valid_cache(outputs, source, lookup_settings)
-    )
+    cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
     if not settings.force and cache_valid:
         if settings.keep_audio and not _has_saved_audio(outputs):
             _save_cached_audio(
@@ -613,14 +649,17 @@ def _reuse_existing_result(
             context.log,
             f"Файл {context.index}/{context.total}: {path.name} — готовый кеш.",
         )
-        return FileResult(
-            input_path=path,
-            state="cached",
-            srt_path=outputs.srt_path,
-            sidecar_path=outputs.sidecar_path,
-            audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
-            cached=True,
-            probe=probe,
+        return (
+            FileResult(
+                input_path=path,
+                state="cached",
+                srt_path=outputs.srt_path,
+                sidecar_path=outputs.sidecar_path,
+                audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
+                cached=True,
+                probe=probe,
+            ),
+            None,
         )
     if outputs.srt_path.exists() and not settings.force:
         _emit_file(
@@ -637,15 +676,237 @@ def _reuse_existing_result(
             context.log,
             f"Файл {context.index}/{context.total}: {path.name} — SRT безопасно пропущен.",
         )
-        return FileResult(
-            input_path=path,
-            state="skipped",
-            srt_path=outputs.srt_path,
-            sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
-            skipped=True,
-            probe=probe,
+        return (
+            FileResult(
+                input_path=path,
+                state="skipped",
+                srt_path=outputs.srt_path,
+                sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
+                skipped=True,
+                probe=probe,
+            ),
+            None,
         )
-    return None
+    cached_recognition = (
+        _load_cached_recognition(outputs, source, fingerprints[0])
+        if fingerprints is not None
+        else None
+    )
+    return None, cached_recognition
+
+
+def _rebuild_srt_from_cached_recognition(
+    context: _FileProcessingContext,
+    cached: _CachedRecognition,
+    *,
+    probe: MediaProbe,
+    stream: AudioStreamInfo,
+    source: dict[str, Any],
+    warning: str | None,
+    started_at: str,
+) -> FileResult:
+    """Пересобирает только SRT и sidecar из проверенного тяжёлого кеша."""
+    normalized_duration, audio_source = _prepare_reused_audio(
+        context,
+        stream,
+        cached.normalized_duration,
+    )
+    _raise_if_cancelled(context.cancel_check)
+    _emit_file(
+        context.emit_event,
+        context.path,
+        context.index,
+        context.total,
+        "writing",
+        "Пересборка SRT из кеша распознавания",
+        88,
+    )
+    srt_text, subtitle_layout = _build_srt_artifacts(
+        cached.transcript,
+        context.settings,
+        normalized_duration,
+        path=context.path,
+        log=context.log,
+    )
+    sidecar = _build_reused_sidecar(
+        context,
+        cached,
+        started_at=started_at,
+        source=source,
+        probe=probe,
+        stream=stream,
+        warning=warning,
+        normalized_duration=normalized_duration,
+        subtitle_layout=subtitle_layout,
+    )
+    _publish_artifacts(
+        context.outputs,
+        srt_text=srt_text,
+        sidecar=sidecar,
+        audio_source=audio_source,
+    )
+    return _complete_reused_srt(context, probe)
+
+
+def _build_reused_sidecar(
+    context: _FileProcessingContext,
+    cached: _CachedRecognition,
+    *,
+    started_at: str,
+    source: Mapping[str, Any],
+    probe: MediaProbe,
+    stream: AudioStreamInfo,
+    warning: str | None,
+    normalized_duration: float,
+    subtitle_layout: Mapping[str, int],
+) -> dict[str, Any]:
+    finished_at = datetime.now(timezone.utc).isoformat()
+    return _build_sidecar_payload(
+        started_at=started_at,
+        finished_at=finished_at,
+        source=source,
+        recognition_settings=cached.recognition_settings,
+        layout_settings=build_layout_fingerprint(context.settings),
+        probe=probe,
+        stream=stream,
+        warning=warning,
+        normalized_duration=normalized_duration,
+        transcript=cached.transcript,
+        subtitle_layout=subtitle_layout,
+        outputs=context.outputs,
+        keep_audio=context.settings.keep_audio,
+    )
+
+
+def _complete_reused_srt(
+    context: _FileProcessingContext,
+    probe: MediaProbe,
+) -> FileResult:
+    audio_output = (
+        context.outputs.normalized_audio_path if context.settings.keep_audio else None
+    )
+    _emit_file(
+        context.emit_event,
+        context.path,
+        context.index,
+        context.total,
+        "done",
+        "Готово из кеша распознавания",
+        100,
+        outputs=context.outputs,
+        audio_output=audio_output,
+    )
+    _write_log(
+        context.log,
+        f"Файл {context.index}/{context.total}: {context.path.name} — "
+        "SRT пересобран из кеша распознавания.",
+    )
+    return FileResult(
+        input_path=context.path,
+        state="done",
+        srt_path=context.outputs.srt_path,
+        sidecar_path=context.outputs.sidecar_path,
+        audio_path=audio_output,
+        probe=probe,
+    )
+
+
+def _prepare_reused_audio(
+    context: _FileProcessingContext,
+    stream: AudioStreamInfo,
+    cached_duration: float,
+) -> tuple[float, Path | None]:
+    if not context.settings.keep_audio or _has_saved_audio(context.outputs):
+        return cached_duration, None
+    _emit_file(
+        context.emit_event,
+        context.path,
+        context.index,
+        context.total,
+        "extracting",
+        "Сохранение нормализованного аудио",
+        25,
+    )
+    normalize_audio(
+        context.path,
+        context.temporary_audio,
+        stream,
+        ffmpeg_path=context.ffmpeg_path,
+        overwrite=True,
+    )
+    duration = get_media_duration(
+        context.temporary_audio,
+        ffprobe_path=context.ffprobe_path,
+    )
+    _raise_if_cancelled(context.cancel_check)
+    return duration, context.temporary_audio
+
+
+def _build_srt_artifacts(
+    transcript: Transcript,
+    settings: ProcessingSettings,
+    normalized_duration: float,
+    *,
+    path: Path,
+    log: LogCallback,
+) -> tuple[str, dict[str, int]]:
+    build_result = build_cues_with_diagnostics(
+        transcript.segments,
+        max_chars_per_line=settings.max_chars_per_line,
+        line_length_gap=settings.line_length_gap,
+        max_cps=settings.max_cps,
+        audio_duration=normalized_duration,
+    )
+    srt_text = render_srt(build_result.cues)
+    validate_srt_text(
+        srt_text,
+        duration=normalized_duration,
+        max_chars_per_line=settings.max_chars_per_line,
+        line_length_gap=settings.line_length_gap,
+        max_cps=settings.max_cps,
+    )
+    diagnostics = build_result.diagnostics.to_dict()
+    _log_subtitle_layout_diagnostics(path, log, diagnostics)
+    return srt_text, diagnostics
+
+
+def _build_sidecar_payload(
+    *,
+    started_at: str,
+    finished_at: str,
+    source: Mapping[str, Any],
+    recognition_settings: Mapping[str, Any],
+    layout_settings: Mapping[str, Any],
+    probe: MediaProbe,
+    stream: AudioStreamInfo,
+    warning: str | None,
+    normalized_duration: float,
+    transcript: Transcript,
+    subtitle_layout: Mapping[str, int],
+    outputs: OutputPaths,
+    keep_audio: bool,
+) -> dict[str, Any]:
+    return {
+        "sidecar_schema_version": SIDECAR_SCHEMA_VERSION,
+        "status": "done",
+        "created_at": finished_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "source": dict(source),
+        "recognition_settings": dict(recognition_settings),
+        "layout_settings": dict(layout_settings),
+        "probe": probe.to_dict(),
+        "selected_stream": stream.to_dict(),
+        "warning": warning,
+        "normalized_audio_duration": normalized_duration,
+        "transcript": transcript.to_dict(),
+        SUBTITLE_LAYOUT_SIDECAR_KEY: dict(subtitle_layout),
+        "outputs": {
+            "srt": str(outputs.srt_path),
+            "sidecar": str(outputs.sidecar_path),
+            "audio": str(outputs.normalized_audio_path) if keep_audio else None,
+        },
+    }
 
 
 def _save_cached_audio(
@@ -750,7 +1011,47 @@ def _transcribe_with_alignment(
         cancel_check=context.cancel_check,
     )
     _raise_if_cancelled(context.cancel_check)
+    _log_alignment_fallback(context, transcript)
     return transcript, runtime, aligner, backend
+
+
+def _log_alignment_fallback(
+    context: _FileProcessingContext,
+    transcript: Transcript,
+) -> None:
+    """Отмечает безопасный возврат к исходным словным меткам faster-whisper."""
+    if (
+        context.settings.aligner != "qwen3-forced-aligner"
+        or transcript.metadata.get("alignment_status") != "fallback"
+    ):
+        return
+    details = transcript.metadata.get("alignment_fallback")
+    segment_index = details.get("segment_index") if isinstance(details, Mapping) else None
+    segment_label = (
+        f"сегмента {segment_index}"
+        if isinstance(segment_index, int) and not isinstance(segment_index, bool)
+        else "одного из сегментов"
+    )
+    _write_log(
+        context.log,
+        f"{context.path.name}: Qwen3 ForcedAligner не вернул слова для {segment_label}; "
+        "используются исходные временные метки faster-whisper.",
+    )
+
+
+def _log_subtitle_layout_diagnostics(
+    path: Path,
+    log: LogCallback,
+    diagnostics: Mapping[str, int],
+) -> None:
+    """Журналирует только выполненные восстановления и обнаруженный сдвиг."""
+    events = [
+        f"{label}: {diagnostics[key]}"
+        for key, label in _LAYOUT_DIAGNOSTIC_LABELS.items()
+        if diagnostics.get(key, 0) > 0
+    ]
+    if events:
+        _write_log(log, f"{path.name}: разметка SRT — {'; '.join(events)}.")
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -792,32 +1093,61 @@ def _cancel_remaining(
 def _is_valid_cache(
     outputs: OutputPaths,
     source: dict[str, Any],
-    settings: dict[str, Any],
+    *,
+    recognition_settings: dict[str, Any],
+    layout_settings: dict[str, Any],
 ) -> bool:
     if not outputs.srt_path.is_file():
         return False
     sidecar = load_sidecar(outputs.sidecar_path)
-    if not sidecar_matches(sidecar, source, settings):
+    if not sidecar_matches(
+        sidecar,
+        source,
+        recognition_settings,
+        layout_settings,
+    ):
         return False
     duration = _sidecar_audio_duration(sidecar)
     if duration is None:
         return False
     try:
-        validate_srt_text(read_text_utf8(outputs.srt_path), duration=duration)
+        validate_srt_text(
+            read_text_utf8(outputs.srt_path),
+            duration=duration,
+            max_chars_per_line=int(layout_settings["max_chars_per_line"]),
+            line_length_gap=int(layout_settings["line_length_gap"]),
+            max_cps=float(layout_settings["max_cps"]),
+        )
     except Exception:
         return False
     return True
 
 
-def _cache_settings_for_lookup(
+def _is_valid_cache_candidate(
+    outputs: OutputPaths,
+    source: dict[str, Any],
+    fingerprints: tuple[dict[str, Any], dict[str, Any]] | None,
+) -> bool:
+    """Проверяет найденную пару fingerprints как готовый SRT-кеш."""
+    if fingerprints is None:
+        return False
+    return _is_valid_cache(
+        outputs,
+        source,
+        recognition_settings=fingerprints[0],
+        layout_settings=fingerprints[1],
+    )
+
+
+def _cache_fingerprints_for_lookup(
     outputs: OutputPaths,
     settings: ProcessingSettings,
     stream_ordinal: int,
     *,
     backend: AsrBackend | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Строит runtime-aware fingerprint только для существующего кандидата кеша."""
-    if not outputs.srt_path.is_file() or not outputs.sidecar_path.is_file():
+    if not outputs.sidecar_path.is_file():
         return None
     selected_backend = backend if backend is not None else get_backend(settings.backend)
     runtime = _loaded_runtime_signature(selected_backend, settings)
@@ -829,11 +1159,39 @@ def _cache_settings_for_lookup(
     aligner_runtime = _expected_aligner_runtime(aligner, settings)
     if settings.aligner != "none" and aligner_runtime is None:
         return None
-    return build_settings_fingerprint(
-        settings,
-        stream_ordinal,
-        runtime=runtime,
-        aligner_runtime=aligner_runtime,
+    return (
+        build_recognition_fingerprint(
+            settings,
+            stream_ordinal,
+            runtime=runtime,
+            aligner_runtime=aligner_runtime,
+        ),
+        build_layout_fingerprint(settings),
+    )
+
+
+def _load_cached_recognition(
+    outputs: OutputPaths,
+    source: dict[str, Any],
+    recognition_settings: dict[str, Any],
+) -> _CachedRecognition | None:
+    sidecar = load_sidecar(outputs.sidecar_path)
+    if not sidecar_recognition_matches(sidecar, source, recognition_settings):
+        return None
+    duration = _sidecar_audio_duration(sidecar)
+    transcript_raw = sidecar.get("transcript") if sidecar else None
+    if duration is None or not isinstance(transcript_raw, Mapping):
+        return None
+    try:
+        transcript = Transcript.from_mapping(transcript_raw)
+    except ValidationError:
+        return None
+    if abs(transcript.duration - duration) > 0.25:
+        return None
+    return _CachedRecognition(
+        transcript=transcript,
+        normalized_duration=duration,
+        recognition_settings=recognition_settings,
     )
 
 
@@ -1054,8 +1412,30 @@ def _validate_backend_settings(settings: ProcessingSettings) -> None:
 def _validate_output_settings(settings: ProcessingSettings) -> None:
     if settings.audio_stream_index is not None and settings.audio_stream_index < 0:
         raise ValidationError("Индекс аудиопотока не может быть отрицательным.")
-    if settings.max_chars_per_line < 20 or settings.max_chars_per_line > 80:
+    if (
+        isinstance(settings.max_chars_per_line, bool)
+        or not isinstance(settings.max_chars_per_line, int)
+        or settings.max_chars_per_line < 20
+        or settings.max_chars_per_line > 80
+    ):
         raise ValidationError("Лимит строки SRT должен быть от 20 до 80 символов.")
+    if (
+        isinstance(settings.line_length_gap, bool)
+        or not isinstance(settings.line_length_gap, int)
+        or settings.line_length_gap < 0
+        or settings.line_length_gap > MAX_LINE_LENGTH_GAP
+    ):
+        raise ValidationError(
+            f"Допуск длины строки SRT должен быть от 0 до {MAX_LINE_LENGTH_GAP} символов."
+        )
+    if (
+        isinstance(settings.max_cps, bool)
+        or not isinstance(settings.max_cps, (int, float))
+        or not math.isfinite(settings.max_cps)
+        or settings.max_cps < 5
+        or settings.max_cps > 60
+    ):
+        raise ValidationError("Скорость чтения SRT должна быть от 5 до 60 CPS.")
 
 
 def _validate_chunk_settings(settings: ProcessingSettings) -> None:

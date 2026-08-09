@@ -13,6 +13,11 @@ from typing import Any
 
 import psutil
 
+from speech_to_sub.constants import (
+    DEFAULT_LINE_LENGTH_GAP,
+    DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_MAX_CPS,
+)
 from speech_to_sub.subtitles.validator import validate_srt
 
 _WORD_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", flags=re.UNICODE)
@@ -110,8 +115,9 @@ def analyze_srt(
     *,
     audio_duration: float,
     sidecar: Mapping[str, Any] | None = None,
-    max_reading_speed: float = 20.0,
-    max_chars_per_line: int = 42,
+    max_reading_speed: float = DEFAULT_MAX_CPS,
+    max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE,
+    line_length_gap: int = DEFAULT_LINE_LENGTH_GAP,
 ) -> dict[str, int | float]:
     """Проверяет SRT и возвращает структурные long-form метрики."""
     cues = validate_srt(content, audio_duration=audio_duration)
@@ -120,7 +126,10 @@ def analyze_srt(
         current.start < previous.end
         for previous, current in zip(cues, cues[1:])
     )
-    visible_chars = [sum(len(line.strip()) for line in cue.text.splitlines()) for cue in cues]
+    visible_chars = [
+        len(" ".join(line.strip() for line in cue.text.splitlines()))
+        for cue in cues
+    ]
     words = _tokens(" ".join(cue.text for cue in cues))
     repeated_5grams = _repeated_ngram_occurrences(words, 5)
     boundary_repeats = _boundary_repeated_ngrams(sidecar or {}, ngram_size=3)
@@ -136,7 +145,7 @@ def analyze_srt(
         "short_cue_count": sum(duration < 0.8 for duration in cue_durations),
         "long_cue_count": sum(duration > 7.0 for duration in cue_durations),
         "long_line_count": sum(
-            len(line) > max_chars_per_line
+            len(line) > max_chars_per_line + line_length_gap
             for cue in cues
             for line in cue.text.splitlines()
         ),

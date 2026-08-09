@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,14 @@ from speech_to_sub.models import (
 
 
 class _FakeClient:
-    def __init__(self, *, with_words: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        with_words: bool = True,
+        invalid_words_at: int | None = None,
+    ) -> None:
         self.with_words = with_words
+        self.invalid_words_at = invalid_words_at
         self.requests: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.shutdown_calls = 0
 
@@ -48,13 +55,12 @@ class _FakeClient:
         for index, source in enumerate(payload["segments"]):
             words = []
             if self.with_words:
-                words = [
-                    {
-                        "text": source["text"],
-                        "start": source["start"] + 0.1,
-                        "end": source["end"] - 0.1,
-                    }
-                ]
+                start = source["start"] + 0.1
+                end = source["end"] - 0.1
+                if index == self.invalid_words_at:
+                    start = source["end"] + 1.0
+                    end = source["end"] + 2.0
+                words = [{"text": source["text"], "start": start, "end": end}]
             segments.append({"index": index, **source, "words": words})
         return {"segments": segments, "runtime": runtime}
 
@@ -102,6 +108,40 @@ def _transcript() -> Transcript:
             "engine_version": "1.2.3",
             "compute_type": "float16",
             "segment_languages": ("ru", "ru"),
+        },
+    )
+
+
+def _transcript_with_words() -> Transcript:
+    return Transcript(
+        text="первый второй",
+        language="ru",
+        duration=2.0,
+        segments=(
+            TranscriptSegment(
+                0.0,
+                1.0,
+                "первый",
+                (TranscriptWord(0.1, 0.9, " первый", 0.91),),
+                segment_id=0,
+            ),
+            TranscriptSegment(
+                1.0,
+                2.0,
+                "второй",
+                (TranscriptWord(1.1, 1.9, " второй", 0.82),),
+                segment_id=1,
+            ),
+        ),
+        model="asr-model",
+        device="cuda",
+        quantized=False,
+        metadata={
+            "runtime": "faster-whisper",
+            "engine_version": "1.2.3",
+            "compute_type": "float16",
+            "word_timestamps": True,
+            "custom": {"preserve": True},
         },
     )
 
@@ -289,6 +329,59 @@ def test_qwen_aligner_rejects_missing_words(tmp_path: Path) -> None:
         lambda _python, _module: client  # type: ignore[arg-type]
     )
     transcript = _transcript()
+
+    with pytest.raises(AsrModelError, match="не вернул слова"):
+        adapter.align(audio, transcript, settings, 2.0)
+
+
+def test_qwen_aligner_falls_back_to_complete_faster_whisper_words(
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient(invalid_words_at=1)
+    settings = _settings(tmp_path)
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    adapter = QwenForcedAlignerAdapter(
+        lambda _python, _module: client  # type: ignore[arg-type]
+    )
+    transcript = _transcript_with_words()
+    progress: list[int] = []
+
+    aligned = adapter.align(audio, transcript, settings, 2.0, progress.append)
+
+    assert aligned.segments is transcript.segments
+    assert aligned.segments[0].words is transcript.segments[0].words
+    assert aligned.segments[0].words[0].probability == pytest.approx(0.91)
+    assert aligned.metadata["runtime"] == "faster-whisper"
+    assert aligned.metadata["engine_version"] == "1.2.3"
+    assert aligned.metadata["compute_type"] == "float16"
+    assert aligned.metadata["custom"] == {"preserve": True}
+    assert aligned.metadata["alignment_status"] == "fallback"
+    assert aligned.metadata["alignment_fallback"] == {
+        "reason": "empty_aligner_words",
+        "segment_index": 1,
+        "source": "faster-whisper-word-timestamps",
+    }
+    assert aligned.metadata["alignment_runtime"]["backend"] == "qwen3-forced-aligner"
+    assert aligned.metadata["alignment_segment_count"] == 0
+    assert aligned.metadata["alignment_requested_segment_count"] == 2
+    assert adapter.runtime_signature(settings, aligned) == aligned.metadata["alignment_runtime"]
+    assert progress == [0, 5, 50, 95, 100]
+
+
+def test_qwen_aligner_does_not_fallback_for_another_backend(tmp_path: Path) -> None:
+    client = _FakeClient(invalid_words_at=1)
+    settings = _settings(tmp_path, backend="parakeet-tdt-v3")
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    adapter = QwenForcedAlignerAdapter(
+        lambda _python, _module: client  # type: ignore[arg-type]
+    )
+    source = _transcript_with_words()
+    transcript = replace(
+        source,
+        metadata={**source.metadata, "runtime": "parakeet-tdt-v3"},
+    )
 
     with pytest.raises(AsrModelError, match="не вернул слова"):
         adapter.align(audio, transcript, settings, 2.0)

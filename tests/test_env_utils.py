@@ -3,9 +3,14 @@ from __future__ import annotations
 import pytest
 
 from speech_to_sub.constants import (
+    DEFAULT_BACKEND_MODEL_PATHS,
+    DEFAULT_LINE_LENGTH_GAP,
+    DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_MAX_CPS,
     DEFAULT_PARAKEET_MODEL_PATH,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_QWEN_MODEL_PATH,
+    MODELS_DIR,
 )
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
@@ -26,6 +31,9 @@ _SETTING_VARIABLES = (
     "ASR_QUANTIZATION",
     "ASR_ALLOW_CPU_FALLBACK",
     "ASR_KEEP_AUDIO",
+    "ASR_MAX_CHARS_PER_LINE",
+    "ASR_LINE_LENGTH_GAP",
+    "ASR_MAX_CPS",
     "ASR_LONG_FORM_WINDOW_SECONDS",
     "ASR_LONG_FORM_OVERLAP_SECONDS",
     "ASR_VAD_FILTER",
@@ -50,6 +58,9 @@ def test_environment_settings_parse_supported_values(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ASR_QUANTIZATION", "yes")
     monkeypatch.setenv("ASR_ALLOW_CPU_FALLBACK", "да")
     monkeypatch.setenv("ASR_KEEP_AUDIO", "off")
+    monkeypatch.setenv("ASR_MAX_CHARS_PER_LINE", "40")
+    monkeypatch.setenv("ASR_LINE_LENGTH_GAP", "6")
+    monkeypatch.setenv("ASR_MAX_CPS", "16.5")
     monkeypatch.setenv("ASR_LONG_FORM_WINDOW_SECONDS", "240")
     monkeypatch.setenv("ASR_LONG_FORM_OVERLAP_SECONDS", "3")
     monkeypatch.setenv("ASR_VAD_FILTER", "true")
@@ -68,6 +79,9 @@ def test_environment_settings_parse_supported_values(monkeypatch: pytest.MonkeyP
     assert settings.quantization_enabled is True
     assert settings.allow_cpu_fallback is True
     assert settings.keep_audio is False
+    assert settings.max_chars_per_line == 40
+    assert settings.line_length_gap == 6
+    assert settings.max_cps == 16.5
     assert settings.long_form_window_seconds == 240
     assert settings.long_form_overlap_seconds == 3
     assert settings.vad_filter is True
@@ -93,6 +107,16 @@ def test_environment_and_mapping_choose_backend_specific_defaults(
     )
 
 
+def test_default_model_paths_use_portable_repository_directory() -> None:
+    assert DEFAULT_BACKEND_MODEL_PATHS == {
+        "transformers": MODELS_DIR / "whisper-large-v3",
+        "faster-whisper": MODELS_DIR / "whisper-large-v3-ct2",
+        "parakeet-tdt-v3": MODELS_DIR / "parakeet-tdt-0.6b-v3",
+        "qwen3-asr": MODELS_DIR / "Qwen3-ASR-0.6B",
+    }
+    assert DEFAULT_QWEN_ALIGNER_MODEL_PATH == MODELS_DIR / "Qwen3-ForcedAligner-0.6B"
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -104,6 +128,12 @@ def test_environment_and_mapping_choose_backend_specific_defaults(
         ("ASR_QUANTIZATION", "sometimes"),
         ("ASR_ALLOW_CPU_FALLBACK", "2"),
         ("ASR_KEEP_AUDIO", ""),
+        ("ASR_MAX_CHARS_PER_LINE", "0"),
+        ("ASR_LINE_LENGTH_GAP", "-1"),
+        ("ASR_LINE_LENGTH_GAP", "21"),
+        ("ASR_MAX_CPS", "not-a-float"),
+        ("ASR_MAX_CPS", "nan"),
+        ("ASR_MAX_CPS", "0"),
         ("ASR_LONG_FORM_WINDOW_SECONDS", "0"),
         ("ASR_LONG_FORM_OVERLAP_SECONDS", "-1"),
         ("ASR_VAD_FILTER", "maybe"),
@@ -131,3 +161,11 @@ def test_faster_whisper_environment_uses_local_ct2_default(
     settings = settings_from_environment()
 
     assert settings.model_path.name == "whisper-large-v3-ct2"
+
+
+def test_environment_uses_subtitle_layout_defaults() -> None:
+    settings = settings_from_environment()
+
+    assert settings.max_chars_per_line == DEFAULT_MAX_CHARS_PER_LINE
+    assert settings.line_length_gap == DEFAULT_LINE_LENGTH_GAP
+    assert settings.max_cps == DEFAULT_MAX_CPS

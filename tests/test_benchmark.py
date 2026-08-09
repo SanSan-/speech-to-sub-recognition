@@ -91,6 +91,24 @@ def test_analyze_srt_counts_fast_and_short_cue() -> None:
     assert metrics["reading_speed_violations"] == 1
 
 
+def test_analyze_srt_uses_17_cps_and_counts_line_break_as_space() -> None:
+    content = "1\n00:00:00,000 --> 00:00:01,000\n123456789\n12345678\n"
+
+    metrics = analyze_srt(content, audio_duration=1.0)
+
+    assert metrics["reading_speed_violations"] == 1
+
+
+def test_analyze_srt_counts_lines_against_base_plus_gap() -> None:
+    content = "1\n00:00:00,000 --> 00:00:04,000\n1234567890123456789012345678901234567890123\n"
+
+    adaptive_metrics = analyze_srt(content, audio_duration=4.0)
+    strict_metrics = analyze_srt(content, audio_duration=4.0, line_length_gap=0)
+
+    assert adaptive_metrics["long_line_count"] == 0
+    assert strict_metrics["long_line_count"] == 1
+
+
 def test_resource_sampler_counts_worker_process_rss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

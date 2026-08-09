@@ -9,7 +9,7 @@ import pytest
 from filelock import FileLock
 
 from speech_to_sub import service
-from speech_to_sub.exceptions import MediaError
+from speech_to_sub.exceptions import MediaError, ValidationError
 from speech_to_sub.models import (
     AudioStreamInfo,
     MediaProbe,
@@ -19,6 +19,7 @@ from speech_to_sub.models import (
     TranscriptSegment,
     TranscriptWord,
 )
+from speech_to_sub.subtitles.validator import parse_srt
 
 
 TEST_ENGINE_VERSION = "test-engine-1"
@@ -324,18 +325,44 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     assert sidecar["status"] == "done"
     assert sidecar["started_at"] <= sidecar["finished_at"]
     assert sidecar["created_at"] == sidecar["finished_at"]
+    assert sidecar["sidecar_schema_version"] == 2
     assert sidecar["source"]["sha256"]
-    assert sidecar["settings"]["language"] == "ru"
-    assert sidecar["settings"]["runtime"] == {
+    assert "settings" not in sidecar
+    assert sidecar["recognition_settings"]["language"] == "ru"
+    assert sidecar["recognition_settings"]["runtime"] == {
         "backend": "transformers",
         "engine_version": TEST_ENGINE_VERSION,
         "device": "cpu",
         "compute_type": "float32",
         "quantized": False,
     }
+    assert sidecar["layout_settings"] == {
+        "srt_builder_version": "3",
+        "max_chars_per_line": 42,
+        "line_length_gap": 8,
+        "max_cps": 17.0,
+    }
     assert sidecar["normalized_audio_duration"] == 1.5
     assert sidecar["transcript"]["text"] == "Тестовая расшифровка."
     assert sidecar["transcript"]["duration"] == 1.5
+    assert sidecar["transcript"]["segments"][0]["words"] == []
+    assert sidecar["subtitle_layout"] == {
+        "reconciled_segments": 0,
+        "alignment_text_segments": 0,
+        "synthetic_timing_segments": 1,
+        "retimed_leading_islands": 0,
+        "adjusted_boundaries": 0,
+        "max_boundary_drift_ms": 0,
+        "timing_anomaly_adjustments": 0,
+    }
+    assert any(
+        "синтезированы временные метки сегментов: 1" in message
+        for message in logs
+    )
+    assert not any(
+        "фрагменты с аномальными начальными метками" in message
+        for message in logs
+    )
     assert media.read_bytes() == original_media
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
@@ -359,7 +386,201 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     assert normalized_sources == [media.resolve()]
 
 
-def test_process_paths_clamps_final_word_cue_to_audio_duration(
+def test_layout_change_requires_force_and_reuses_recognition_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "layout.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    srt_path = Path(first[0]["srt_output"])
+    original_srt = srt_path.read_bytes()
+    sidecar_path = Path(first[0]["sidecar_output"])
+    first_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    skipped = service.process_paths(
+        [media],
+        {"language": "ru", "line_length_gap": 0},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert skipped[0]["state"] == "skipped"
+    assert srt_path.read_bytes() == original_srt
+    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == first_sidecar
+
+    rebuilt = service.process_paths(
+        [media],
+        {"language": "ru", "line_length_gap": 0, "force": True},
+        *callbacks,
+        backend=backend,
+    )
+    rebuilt_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    assert rebuilt[0]["state"] == "done"
+    assert srt_path.read_bytes() == original_srt
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+    assert rebuilt_sidecar["recognition_settings"] == first_sidecar["recognition_settings"]
+    assert rebuilt_sidecar["layout_settings"]["line_length_gap"] == 0
+
+
+def test_missing_srt_is_rebuilt_from_recognition_cache_without_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "missing-srt.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    srt_path = Path(first[0]["srt_output"])
+    srt_path.unlink()
+    cards = service.build_items([media], {"language": "ru"})
+
+    rebuilt = service.process_paths(
+        [media],
+        {"language": "ru"},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert rebuilt[0]["state"] == "done"
+    assert cards[0]["state"] == "idle"
+    assert cards[0]["stage"] == "Пересборка SRT из кеша распознавания"
+    assert srt_path.is_file()
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+
+
+def test_recognition_setting_change_runs_backend_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "recognition-change.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+    service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+
+    result = service.process_paths(
+        [media],
+        {"language": "ru", "long_form_window_seconds": 240, "force": True},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert result[0]["state"] == "done"
+    assert len(backend.calls) == 2
+    assert normalized_sources == [media.resolve(), media.resolve()]
+
+
+def test_malformed_cached_transcript_falls_back_to_recognition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "malformed-cache.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    Path(first[0]["srt_output"]).unlink()
+    sidecar_path = Path(first[0]["sidecar_output"])
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["transcript"]["duration"] = "1.5"
+    sidecar_path.write_text(
+        json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    result = service.process_paths(
+        [media],
+        {"language": "ru"},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert result[0]["state"] == "done"
+    assert len(backend.calls) == 2
+    assert normalized_sources == [media.resolve(), media.resolve()]
+
+
+def test_source_mismatch_does_not_reuse_recognition_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "source-change.mp4"
+    media.write_bytes(b"source-v1")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    Path(first[0]["srt_output"]).unlink()
+    media.write_bytes(b"source-v2")
+
+    result = service.process_paths(
+        [media],
+        {"language": "ru"},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert result[0]["state"] == "done"
+    assert len(backend.calls) == 2
+    assert normalized_sources == [media.resolve(), media.resolve()]
+
+
+def test_legacy_pipeline7_builder2_sidecar_rebuilds_without_recognition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "legacy-cache.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    Path(first[0]["srt_output"]).unlink()
+    sidecar_path = Path(first[0]["sidecar_output"])
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    recognition = sidecar.pop("recognition_settings")
+    sidecar.pop("sidecar_schema_version")
+    sidecar.pop("layout_settings")
+    sidecar["settings"] = {
+        **recognition,
+        "srt_builder_version": "2",
+        "max_chars_per_line": 42,
+    }
+    sidecar_path.write_text(
+        json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    result = service.process_paths(
+        [media],
+        {"language": "ru"},
+        *callbacks,
+        backend=backend,
+    )
+    migrated = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    assert result[0]["state"] == "done"
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+    assert migrated["sidecar_schema_version"] == 2
+    assert "settings" not in migrated
+
+
+def test_process_paths_extends_final_word_cue_within_audio_duration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,7 +631,32 @@ def test_process_paths_clamps_final_word_cue_to_audio_duration(
 
     assert result[0]["state"] == "done"
     srt_text = Path(result[0]["srt_output"]).read_text(encoding="utf-8")
-    assert "00:00:01,300 --> 00:00:01,500" in srt_text
+    cue, = parse_srt(srt_text)
+    assert cue.end == pytest.approx(1.5)
+    assert cue.end - cue.start >= 0.8
+
+
+def test_layout_diagnostics_log_contains_only_nonzero_events() -> None:
+    messages: list[str] = []
+
+    service._log_subtitle_layout_diagnostics(
+        Path("лекция.mp4"),
+        messages.append,
+        {
+            "reconciled_segments": 2,
+            "alignment_text_segments": 0,
+            "synthetic_timing_segments": 0,
+            "retimed_leading_islands": 1,
+            "adjusted_boundaries": 3,
+            "max_boundary_drift_ms": 120,
+        },
+    )
+
+    assert messages == [
+        "лекция.mp4: разметка SRT — восстановлены текст и пунктуация сегментов: 2; "
+        "перенесены фрагменты с аномальными начальными метками: 1; "
+        "скорректированы временные границы реплик: 3; максимальный сдвиг границы, мс: 120."
+    ]
 
 
 def test_service_runs_exclusive_alignment_as_independent_stage(
@@ -478,7 +724,20 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
             self.calls.append((audio_path, duration))
             if progress_callback:
                 progress_callback(50)
-            return transcript
+            return Transcript(
+                text=transcript.text,
+                language=transcript.language,
+                duration=transcript.duration,
+                segments=transcript.segments,
+                model=transcript.model,
+                device=transcript.device,
+                quantized=transcript.quantized,
+                metadata={
+                    **transcript.metadata,
+                    "alignment_status": "fallback",
+                    "alignment_fallback": {"segment_index": 449},
+                },
+            )
 
         def unload(self) -> None:
             self.unload_calls += 1
@@ -487,6 +746,7 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
     aligner = FakeAligner()
     monkeypatch.setattr(service, "get_aligner", lambda _name: aligner)
 
+    messages: list[str] = []
     result = service.process_paths(
         [media],
         {
@@ -496,7 +756,7 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
             "language": "ru",
         },
         lambda _event: None,
-        lambda _message: None,
+        messages.append,
         backend=backend,
         cancel_check=lambda: False,
     )
@@ -506,6 +766,28 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
     assert aligner.calls[0][1] == pytest.approx(1.5)
     assert aligner.unload_calls == 1
     assert backend.unload_calls == 1
+    assert any(
+        "ForcedAligner не вернул слова для сегмента 449" in message
+        and "faster-whisper" in message
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize(
+    "max_cps",
+    [4.9, 60.1, float("nan"), float("inf"), "17", True],
+)
+def test_service_rejects_invalid_max_cps(max_cps: Any) -> None:
+    settings = ProcessingSettings(max_cps=max_cps)
+    with pytest.raises(ValidationError, match="CPS"):
+        service._validate_output_settings(settings)
+
+
+@pytest.mark.parametrize("line_length_gap", [-1, 21, "8", True])
+def test_service_rejects_invalid_line_length_gap(line_length_gap: Any) -> None:
+    settings = ProcessingSettings(line_length_gap=line_length_gap)
+    with pytest.raises(ValidationError, match="Допуск длины строки"):
+        service._validate_output_settings(settings)
 
 
 def test_cache_uses_loaded_backend_runtime_after_cpu_fallback(

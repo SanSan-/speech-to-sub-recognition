@@ -22,4 +22,5 @@ tests/e2e/.artifacts/
 *.md
 !PRD.md
 !README.md
+!CHANGELOG.md
 sonar-project.properties

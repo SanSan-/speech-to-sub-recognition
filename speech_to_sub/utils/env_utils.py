@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 from pathlib import Path
 
@@ -13,10 +14,14 @@ from speech_to_sub.constants import (
     DEFAULT_AUDIO_LANGUAGE,
     DEFAULT_BEAM_SIZE,
     DEFAULT_LANGUAGE,
+    DEFAULT_LINE_LENGTH_GAP,
     DEFAULT_LONG_FORM_OVERLAP_SECONDS,
     DEFAULT_LONG_FORM_WINDOW_SECONDS,
+    DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_MAX_CPS,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_VAD_MIN_SILENCE_MS,
+    MAX_LINE_LENGTH_GAP,
 )
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
@@ -84,6 +89,16 @@ def settings_from_environment() -> ProcessingSettings:
         quantization_enabled=_read_bool("ASR_QUANTIZATION", True),
         allow_cpu_fallback=_read_bool("ASR_ALLOW_CPU_FALLBACK", False),
         keep_audio=_read_bool("ASR_KEEP_AUDIO", False),
+        max_chars_per_line=_read_positive_int(
+            "ASR_MAX_CHARS_PER_LINE",
+            DEFAULT_MAX_CHARS_PER_LINE,
+        ),
+        line_length_gap=_read_non_negative_int(
+            "ASR_LINE_LENGTH_GAP",
+            DEFAULT_LINE_LENGTH_GAP,
+            maximum=MAX_LINE_LENGTH_GAP,
+        ),
+        max_cps=_read_positive_float("ASR_MAX_CPS", DEFAULT_MAX_CPS),
         long_form_window_seconds=_read_positive_int(
             "ASR_LONG_FORM_WINDOW_SECONDS",
             DEFAULT_LONG_FORM_WINDOW_SECONDS,
@@ -172,7 +187,12 @@ def _read_optional_non_negative_int(name: str) -> int | None:
     return value
 
 
-def _read_non_negative_int(name: str, default: int) -> int:
+def _read_non_negative_int(
+    name: str,
+    default: int,
+    *,
+    maximum: int | None = None,
+) -> int:
     """Читает обязательное неотрицательное целое с безопасной ошибкой конфигурации."""
     raw = os.getenv(name, str(default)).strip()
     try:
@@ -181,9 +201,14 @@ def _read_non_negative_int(name: str, default: int) -> int:
         raise ValidationError(
             f"Переменная {name} должна содержать целое неотрицательное число."
         ) from exc
-    if value < 0:
+    if value < 0 or (maximum is not None and value > maximum):
+        expected = (
+            f"целое число от 0 до {maximum}"
+            if maximum is not None
+            else "целое неотрицательное число"
+        )
         raise ValidationError(
-            f"Переменная {name} должна содержать целое неотрицательное число."
+            f"Переменная {name} должна содержать {expected}."
         )
     return value
 
@@ -193,4 +218,20 @@ def _read_positive_int(name: str, default: int) -> int:
     value = _read_non_negative_int(name, default)
     if value == 0:
         raise ValidationError(f"Переменная {name} должна содержать положительное число.")
+    return value
+
+
+def _read_positive_float(name: str, default: float) -> float:
+    """Читает конечное положительное число с безопасной ошибкой конфигурации."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"Переменная {name} должна содержать положительное число."
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValidationError(
+            f"Переменная {name} должна содержать положительное число."
+        )
     return value

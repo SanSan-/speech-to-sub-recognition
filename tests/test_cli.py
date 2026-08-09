@@ -64,6 +64,12 @@ def test_main_returns_batch_exit_codes(
             "aligner-python.exe",
             "--language",
             "ru",
+            "--max-chars-per-line",
+            "40",
+            "--line-length-gap",
+            "6",
+            "--max-cps",
+            "16.5",
             "--long-form-window-seconds",
             "240",
             "--long-form-overlap-seconds",
@@ -82,6 +88,9 @@ def test_main_returns_batch_exit_codes(
     assert received["settings"]["worker_python_path"] == "backend-python.exe"
     assert received["settings"]["aligner_worker_python_path"] == "aligner-python.exe"
     assert received["settings"]["language"] == "ru"
+    assert received["settings"]["max_chars_per_line"] == 40
+    assert received["settings"]["line_length_gap"] == 6
+    assert received["settings"]["max_cps"] == 16.5
     assert received["settings"]["force"] is True
     assert received["settings"]["long_form_window_seconds"] == 240
     assert received["settings"]["long_form_overlap_seconds"] == 3

@@ -59,7 +59,7 @@ def test_real_local_whisper_creates_valid_srt(tmp_path: Path) -> None:
     assert not sidecar_path.read_bytes().startswith(b"\xef\xbb\xbf")
     validate_srt_text(read_text_utf8(srt_path))
     sidecar = json.loads(read_text_utf8(sidecar_path))
-    assert sidecar["settings"]["runtime"]["backend"] == settings.backend
+    assert sidecar["recognition_settings"]["runtime"]["backend"] == settings.backend
 
 
 def _enabled(name: str) -> bool:

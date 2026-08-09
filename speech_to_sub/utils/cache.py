@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from speech_to_sub.constants import (
     PIPELINE_VERSION,
     QWEN_ALIGNMENT_MAX_SEGMENT_SECONDS,
+    SIDECAR_SCHEMA_VERSION,
     SRT_BUILDER_VERSION,
 )
 from speech_to_sub.models import ProcessingSettings
@@ -24,13 +25,25 @@ def build_source_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
-def build_settings_fingerprint(
+_LEGACY_RECOGNITION_PIPELINE_VERSION = "7"
+_LEGACY_RECOGNITION_BUILDER_VERSION = "2"
+_LAYOUT_SETTING_KEYS = frozenset(
+    {
+        "srt_builder_version",
+        "max_chars_per_line",
+        "line_length_gap",
+        "max_cps",
+    }
+)
+
+
+def build_recognition_fingerprint(
     settings: ProcessingSettings,
     stream_ordinal: int,
     runtime: Mapping[str, Any] | None = None,
     aligner_runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Возвращает значимые для результата параметры."""
+    """Возвращает параметры тяжёлого распознавания и выравнивания."""
     backend_parameters: dict[str, Any]
     if settings.backend in {"faster-whisper", "parakeet-tdt-v3"}:
         backend_parameters = {
@@ -55,7 +68,6 @@ def build_settings_fingerprint(
     )
     return {
         "pipeline_version": PIPELINE_VERSION,
-        "srt_builder_version": SRT_BUILDER_VERSION,
         "model_path": str(settings.model_path.expanduser().resolve()),
         "language": settings.language,
         "audio_language": settings.audio_language,
@@ -79,8 +91,17 @@ def build_settings_fingerprint(
             if settings.aligner == "qwen3-forced-aligner"
             else {},
         },
-        "max_chars_per_line": settings.max_chars_per_line,
         "backend_parameters": backend_parameters,
+    }
+
+
+def build_layout_fingerprint(settings: ProcessingSettings) -> dict[str, Any]:
+    """Возвращает параметры лёгкой SRT-разметки."""
+    return {
+        "srt_builder_version": SRT_BUILDER_VERSION,
+        "max_chars_per_line": settings.max_chars_per_line,
+        "line_length_gap": settings.line_length_gap,
+        "max_cps": settings.max_cps,
     }
 
 
@@ -98,15 +119,76 @@ def load_sidecar(path: Path) -> dict[str, Any] | None:
 def sidecar_matches(
     sidecar: dict[str, Any] | None,
     source: dict[str, Any],
-    settings: dict[str, Any],
+    recognition_settings: dict[str, Any],
+    layout_settings: dict[str, Any],
 ) -> bool:
-    """Проверяет fingerprint sidecar и завершённый статус."""
+    """Проверяет оба отпечатка готового SRT и завершённый статус."""
+    fingerprints = sidecar_fingerprints(sidecar)
     return bool(
         sidecar
         and sidecar.get("status") == "done"
         and sidecar.get("source") == source
-        and sidecar.get("settings") == settings
+        and fingerprints == (recognition_settings, layout_settings)
     )
+
+
+def sidecar_recognition_matches(
+    sidecar: dict[str, Any] | None,
+    source: dict[str, Any],
+    recognition_settings: dict[str, Any],
+) -> bool:
+    """Проверяет пригодность тяжёлого результата для новой SRT-разметки."""
+    fingerprints = sidecar_fingerprints(sidecar)
+    return bool(
+        sidecar
+        and sidecar.get("status") == "done"
+        and sidecar.get("source") == source
+        and fingerprints is not None
+        and fingerprints[0] == recognition_settings
+    )
+
+
+def sidecar_fingerprints(
+    sidecar: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Читает отпечатки sidecar v2 либо разрешённой прежней схемы v1."""
+    if not sidecar:
+        return None
+    schema_version = sidecar.get("sidecar_schema_version")
+    if (
+        isinstance(schema_version, int)
+        and not isinstance(schema_version, bool)
+        and schema_version == SIDECAR_SCHEMA_VERSION
+    ):
+        recognition = sidecar.get("recognition_settings")
+        layout = sidecar.get("layout_settings")
+        if isinstance(recognition, Mapping) and isinstance(layout, Mapping):
+            return dict(recognition), dict(layout)
+        return None
+    if schema_version is not None:
+        return None
+    return _legacy_sidecar_fingerprints(sidecar)
+
+
+def _legacy_sidecar_fingerprints(
+    sidecar: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    settings = sidecar.get("settings")
+    if not isinstance(settings, Mapping):
+        return None
+    if (
+        settings.get("pipeline_version") != _LEGACY_RECOGNITION_PIPELINE_VERSION
+        or settings.get("srt_builder_version")
+        != _LEGACY_RECOGNITION_BUILDER_VERSION
+    ):
+        return None
+    recognition = {
+        key: value for key, value in settings.items() if key not in _LAYOUT_SETTING_KEYS
+    }
+    layout = {
+        key: value for key, value in settings.items() if key in _LAYOUT_SETTING_KEYS
+    }
+    return recognition, layout
 
 
 def write_sidecar(path: Path, payload: dict[str, Any]) -> None:

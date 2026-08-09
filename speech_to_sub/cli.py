@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Отключить 8-битную загрузку, не отключая CUDA.",
     )
     parser.add_argument("--allow-cpu-fallback", action="store_true", default=None)
+    parser.add_argument("--max-chars-per-line", type=int)
+    parser.add_argument("--line-length-gap", type=int)
+    parser.add_argument("--max-cps", type=float)
     parser.add_argument("--long-form-window-seconds", type=int)
     parser.add_argument("--long-form-overlap-seconds", type=int)
     parser.add_argument("--no-vad", dest="vad_filter", action="store_false", default=None)
@@ -133,6 +136,9 @@ def _merge_settings(base: ProcessingSettings, args: argparse.Namespace) -> Proce
         "device",
         "quantization_enabled",
         "allow_cpu_fallback",
+        "max_chars_per_line",
+        "line_length_gap",
+        "max_cps",
         "long_form_window_seconds",
         "long_form_overlap_seconds",
         "vad_filter",

@@ -145,8 +145,8 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.4.0"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.4.0"
+    assert health.json()["version"] == "1.4.2"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.4.2"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -180,7 +180,13 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert backend_paths["faster-whisper"].endswith("whisper-large-v3-ct2")
     assert defaults["long_form_window_seconds"] == 300
     assert defaults["vad_filter"] is True
+    assert defaults["max_chars_per_line"] == 42
+    assert defaults["line_length_gap"] == 8
+    assert defaults["max_cps"] == 17.0
     assert 'id="backend"' in index.text
+    assert 'id="maxCharsPerLine"' in index.text
+    assert 'id="lineLengthGap"' in index.text
+    assert 'id="maxCps"' in index.text
     serialized = json.dumps(
         {"config": config.json(), "health": health.json()},
         ensure_ascii=False,
@@ -398,6 +404,54 @@ def test_web_settings_forward_selected_backend(
     assert response.status_code == 200
     assert fake_service.build_calls[0][1]["backend"] == backend
     assert fake_service.build_calls[0][1]["model_path"].endswith(model_suffix)
+
+
+def test_web_settings_forward_subtitle_layout_limits(fake_service: FakeService) -> None:
+    client = TestClient(web_app.app)
+
+    response = client.post(
+        "/api/refresh",
+        json={
+            "paths": [r"D:\Media\lesson.mp4"],
+            "settings": {
+                "max_chars_per_line": 40,
+                "line_length_gap": 6,
+                "max_cps": 16.5,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = fake_service.build_calls[0][1]
+    assert forwarded["max_chars_per_line"] == 40
+    assert forwarded["line_length_gap"] == 6
+    assert forwarded["max_cps"] == 16.5
+
+
+@pytest.mark.parametrize(
+    "settings",
+    (
+        {"max_chars_per_line": 19},
+        {"line_length_gap": -1},
+        {"line_length_gap": 21},
+        {"line_length_gap": True},
+        {"max_cps": 4.9},
+        {"max_cps": 60.1},
+    ),
+)
+def test_web_settings_reject_invalid_subtitle_layout_limits(
+    fake_service: FakeService,
+    settings: dict[str, float | int],
+) -> None:
+    del fake_service
+    client = TestClient(web_app.app)
+
+    response = client.post(
+        "/api/refresh",
+        json={"paths": [r"D:\Media\lesson.mp4"], "settings": settings},
+    )
+
+    assert response.status_code == 422
 
 
 def test_web_settings_forward_independent_qwen_aligner_without_secret_fields(

@@ -22,7 +22,7 @@
         <div id="picker" class="picker">
           <div class="picker-icon" aria-hidden="true">＋</div>
           <div class="picker-copy">
-            <div class="picker-text">Выберите медиафайлы</div>
+            <div class="picker-text">Выберите медиа</div>
             <div id="pickerHint" class="picker-hint">Файлы остаются на компьютере и не загружаются в браузер</div>
           </div>
           <div class="picker-actions">
@@ -61,181 +61,253 @@
       <section class="panel panel-settings" aria-labelledby="settingsTitle">
         <div class="panel-header">
           <div>
-            <h2 id="settingsTitle" class="panel-title">Локальная модель</h2>
-            <p class="panel-sub">Сеть при запуске инференса не используется</p>
+            <h2 id="settingsTitle" class="panel-title">Настройки обработки</h2>
+            <p class="panel-sub">Сеть при распознавании не используется</p>
           </div>
         </div>
 
         <form id="settingsForm" class="settings-form" autocomplete="off">
-          <div class="field">
-            <label for="modelPath">Путь к модели</label>
-            <input id="modelPath" data-setting="model_path" type="text" spellcheck="false"
-                   placeholder="D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2">
-            <span class="field-hint">Должен указывать на уже загруженный локальный checkpoint.</span>
-          </div>
+          <section class="settings-section settings-primary" aria-labelledby="primarySettingsTitle">
+            <div class="settings-section-heading">
+              <div>
+                <h3 id="primarySettingsTitle" class="settings-section-title">Основные настройки</h3>
+                <p class="settings-section-hint">Движок, модель, язык и аудиодорожка.</p>
+              </div>
+            </div>
+            <div class="settings-section-body">
+              <div class="field">
+                <label for="backend">Движок распознавания</label>
+                <select id="backend" data-setting="backend">
+                  <option value="transformers">Transformers / PyTorch</option>
+                  <option value="faster-whisper">faster-whisper / CTranslate2</option>
+                  <option value="parakeet-tdt-v3">Parakeet TDT v3</option>
+                  <option value="qwen3-asr">Qwen3-ASR 0.6B</option>
+                </select>
+                <span class="field-hint">Путь к модели должен соответствовать выбранной среде исполнения.</span>
+              </div>
 
-          <div class="field">
-            <label for="backend">ASR backend</label>
-            <select id="backend" data-setting="backend">
-              <option value="transformers">Transformers / PyTorch</option>
-              <option value="faster-whisper">faster-whisper / CTranslate2</option>
-              <option value="parakeet-tdt-v3">Parakeet TDT v3</option>
-              <option value="qwen3-asr">Qwen3-ASR 0.6B</option>
-            </select>
-            <span class="field-hint">Путь к модели должен соответствовать выбранному runtime.</span>
-          </div>
+              <div class="field">
+                <label for="modelPath">Путь к модели</label>
+                <input id="modelPath" data-setting="model_path" type="text" spellcheck="false"
+                       placeholder="&lt;local-asr-model-path&gt;">
+                <span class="field-hint">Укажите каталог уже загруженной локальной модели.</span>
+              </div>
 
-          <div class="grid-2">
-            <div class="field">
-              <label for="aligner">Выравнивание слов</label>
-              <select id="aligner" data-setting="aligner">
-                <option value="none">Без дополнительного выравнивания</option>
-                <option value="qwen3-forced-aligner">Qwen3 ForcedAligner 0.6B</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="alignerModelPath">Путь к aligner-модели</label>
-              <input id="alignerModelPath" data-setting="aligner_model_path" type="text"
-                     spellcheck="false" placeholder="Не требуется для none">
-            </div>
-          </div>
+              <div class="grid-2">
+                <div class="field">
+                  <label for="language">Язык распознавания</label>
+                  <select id="language" data-setting="language">
+                    <option value="en">Английский (en)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="device">Устройство</label>
+                  <select id="device" data-setting="device">
+                    <option value="auto">Автоматически</option>
+                    <option value="cuda">CUDA</option>
+                    <option value="cpu">CPU</option>
+                  </select>
+                </div>
+              </div>
 
-          <div class="grid-2">
-            <div class="field">
-              <label for="workerPythonPath">Python ASR worker-а (необязательно)</label>
-              <input id="workerPythonPath" data-setting="worker_python_path" type="text"
-                     spellcheck="false" placeholder="Автоматически по выбранному backend">
-              <span class="field-hint">Отдельный runtime выбранного ASR backend-а.</span>
+              <div class="grid-2">
+                <div class="field">
+                  <label for="audioLanguage">Язык аудиодорожки</label>
+                  <input id="audioLanguage" data-setting="audio_language" type="text" maxlength="32" placeholder="eng">
+                </div>
+                <div class="field">
+                  <label for="audioStreamIndex">Номер аудиопотока</label>
+                  <input id="audioStreamIndex" data-setting="audio_stream_index" type="number" min="0" step="1"
+                         inputmode="numeric" placeholder="авто">
+                </div>
+              </div>
             </div>
-            <div class="field">
-              <label for="alignerWorkerPythonPath">Python aligner worker-а (необязательно)</label>
-              <input id="alignerWorkerPythonPath" data-setting="aligner_worker_python_path"
-                     type="text" spellcheck="false" placeholder="Автоматически для aligner-а">
-              <span class="field-hint">Не зависит от Python выбранного ASR backend-а.</span>
-            </div>
-          </div>
+          </section>
 
-          <div class="field">
-            <label for="outputDir">Каталог результатов (необязательно)</label>
-            <input id="outputDir" data-setting="output_dir" type="text" spellcheck="false"
-                   placeholder="По умолчанию рядом с исходным файлом">
-          </div>
-
-          <div class="grid-2">
-            <div class="field">
-              <label for="language">Язык распознавания</label>
-              <select id="language" data-setting="language">
-                <option value="en">English (en)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="device">Устройство</label>
-              <select id="device" data-setting="device">
-                <option value="auto">auto</option>
-                <option value="cuda">cuda</option>
-                <option value="cpu">cpu</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="grid-2">
-            <div class="field">
-              <label for="audioLanguage">Язык аудиодорожки</label>
-              <input id="audioLanguage" data-setting="audio_language" type="text" maxlength="32" placeholder="eng">
-            </div>
-            <div class="field">
-              <label for="audioStreamIndex">Номер аудиопотока</label>
-              <input id="audioStreamIndex" data-setting="audio_stream_index" type="number" min="0" step="1"
-                     inputmode="numeric" placeholder="авто">
-            </div>
-          </div>
-
-          <div class="grid-2">
-            <div class="field">
-              <label for="longFormWindowSeconds">Long-form окно, сек.</label>
-              <input id="longFormWindowSeconds" data-setting="long_form_window_seconds"
-                     type="number" min="30" max="3600" step="1" inputmode="numeric">
-            </div>
-            <div class="field">
-              <label for="longFormOverlapSeconds">Перекрытие, сек.</label>
-              <input id="longFormOverlapSeconds" data-setting="long_form_overlap_seconds"
-                     type="number" min="0" max="600" step="1" inputmode="numeric">
-            </div>
-          </div>
-
-          <div class="grid-2">
-            <div class="field">
-              <label for="vadMinSilenceMs">VAD: тишина, мс</label>
-              <input id="vadMinSilenceMs" data-setting="vad_min_silence_ms"
-                     type="number" min="100" max="10000" step="50" inputmode="numeric">
-            </div>
-            <div class="field">
-              <label for="beamSize">Beam size</label>
-              <input id="beamSize" data-setting="beam_size"
-                     type="number" min="1" max="20" step="1" inputmode="numeric">
-            </div>
-          </div>
-
-          <div class="settings-group" aria-label="Параметры инференса">
-            <label class="field toggle" for="quantizationEnabled">
+          <details id="alignmentSettings" class="settings-section settings-collapsible">
+            <summary>
               <span>
-                <span class="toggle-title">Квантование модели</span>
-                <span class="field-hint">Использовать поддерживаемый 8-битный режим на CUDA.</span>
+                <span class="settings-section-title">Выравнивание слов</span>
+                <span class="settings-section-hint">Дополнительная модель и отдельная среда Python.</span>
               </span>
-              <input id="quantizationEnabled" data-setting="quantization_enabled" type="checkbox">
-            </label>
+            </summary>
+            <div class="settings-section-body">
+              <div class="grid-2">
+                <div class="field">
+                  <label for="aligner">Способ выравнивания</label>
+                  <select id="aligner" data-setting="aligner">
+                    <option value="none">Без дополнительного выравнивания</option>
+                    <option value="qwen3-forced-aligner">Qwen3 ForcedAligner 0.6B</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="alignerModelPath">Путь к модели выравнивания</label>
+                  <input id="alignerModelPath" data-setting="aligner_model_path" type="text"
+                         spellcheck="false" placeholder="Не требуется без выравнивания">
+                </div>
+              </div>
 
-            <label class="field toggle" for="allowCpuFallback">
-              <span>
-                <span class="toggle-title">Резервный запуск на CPU</span>
-                <span class="field-hint">Разрешить CPU только при ошибке GPU.</span>
-              </span>
-              <input id="allowCpuFallback" data-setting="allow_cpu_fallback" type="checkbox">
-            </label>
+              <div class="field">
+                <label for="alignerWorkerPythonPath">Python процесса выравнивания (необязательно)</label>
+                <input id="alignerWorkerPythonPath" data-setting="aligner_worker_python_path"
+                       type="text" spellcheck="false" placeholder="Выбирается автоматически">
+                <span class="field-hint">Не зависит от Python выбранного движка распознавания.</span>
+              </div>
+            </div>
+          </details>
 
-            <label class="field toggle" for="vadFilter">
+          <details id="srtSettings" class="settings-section settings-collapsible" open>
+            <summary>
               <span>
-                <span class="toggle-title">VAD для long-form</span>
-                <span class="field-hint">Отсекать длинную тишину перед распознаванием окна.</span>
+                <span class="settings-section-title">Разметка SRT</span>
+                <span class="settings-section-hint">Длина строк и скорость чтения.</span>
               </span>
-              <input id="vadFilter" data-setting="vad_filter" type="checkbox">
-            </label>
+            </summary>
+            <div class="settings-section-body">
+              <div class="grid-3">
+                <div class="field">
+                  <label for="maxCharsPerLine">Базовая длина строки SRT</label>
+                  <input id="maxCharsPerLine" data-setting="max_chars_per_line"
+                         type="number" min="20" max="80" step="1" inputmode="numeric">
+                  <span class="field-hint">Предпочтительно не более 42 символов.</span>
+                </div>
+                <div class="field">
+                  <label for="lineLengthGap">Допуск длины строки SRT</label>
+                  <input id="lineLengthGap" data-setting="line_length_gap"
+                         type="number" min="0" max="20" step="1" inputmode="numeric">
+                  <span class="field-hint">По умолчанию 8 дополнительных символов.</span>
+                </div>
+                <div class="field">
+                  <label for="maxCps">Скорость чтения, символов/с</label>
+                  <input id="maxCps" data-setting="max_cps"
+                         type="number" min="5" max="60" step="0.1" inputmode="decimal">
+                  <span class="field-hint">По умолчанию 17 символов в секунду.</span>
+                </div>
+              </div>
+            </div>
+          </details>
 
-            <label class="field toggle" for="conditionOnPreviousText">
+          <details id="longFormSettings" class="settings-section settings-collapsible">
+            <summary>
               <span>
-                <span class="toggle-title">Контекст предыдущего текста</span>
-                <span class="field-hint">Отключайте при циклических повторах и hallucinations.</span>
+                <span class="settings-section-title">Длинные записи</span>
+                <span class="settings-section-hint">Окна, перекрытие, тишина и поиск вариантов.</span>
               </span>
-              <input id="conditionOnPreviousText" data-setting="condition_on_previous_text"
-                     type="checkbox">
-            </label>
-          </div>
+            </summary>
+            <div class="settings-section-body">
+              <div class="grid-2">
+                <div class="field">
+                  <label for="longFormWindowSeconds">Окно длинной записи, сек.</label>
+                  <input id="longFormWindowSeconds" data-setting="long_form_window_seconds"
+                         type="number" min="30" max="3600" step="1" inputmode="numeric">
+                </div>
+                <div class="field">
+                  <label for="longFormOverlapSeconds">Перекрытие окон, сек.</label>
+                  <input id="longFormOverlapSeconds" data-setting="long_form_overlap_seconds"
+                         type="number" min="0" max="600" step="1" inputmode="numeric">
+                </div>
+              </div>
 
-          <div class="settings-group" aria-label="Параметры обработки">
-            <label class="field toggle" for="keepAudio">
-              <span>
-                <span class="toggle-title">Сохранить нормализованный FLAC</span>
-                <span class="field-hint">Оставить подготовленное моно-аудио рядом с результатом.</span>
-              </span>
-              <input id="keepAudio" data-setting="keep_audio" type="checkbox">
-            </label>
+              <div class="grid-2">
+                <div class="field">
+                  <label for="vadMinSilenceMs">Минимальная тишина, мс</label>
+                  <input id="vadMinSilenceMs" data-setting="vad_min_silence_ms"
+                         type="number" min="100" max="10000" step="50" inputmode="numeric">
+                </div>
+                <div class="field">
+                  <label for="beamSize">Ширина поиска вариантов</label>
+                  <input id="beamSize" data-setting="beam_size"
+                         type="number" min="1" max="20" step="1" inputmode="numeric">
+                </div>
+              </div>
 
-            <label class="field toggle" for="recursive">
-              <span>
-                <span class="toggle-title">Рекурсивный обход папки</span>
-                <span class="field-hint">Искать поддерживаемые медиа во вложенных каталогах.</span>
-              </span>
-              <input id="recursive" data-setting="recursive" type="checkbox">
-            </label>
+              <div class="settings-group" aria-label="Обработка длинных записей">
+                <label class="field toggle" for="vadFilter">
+                  <span>
+                    <span class="toggle-title">Фильтр тишины</span>
+                    <span class="field-hint">Отсекать длинную тишину перед распознаванием окна.</span>
+                  </span>
+                  <input id="vadFilter" data-setting="vad_filter" type="checkbox">
+                </label>
 
-            <label class="field toggle danger-toggle" for="force">
+                <label class="field toggle" for="conditionOnPreviousText">
+                  <span>
+                    <span class="toggle-title">Контекст предыдущего текста</span>
+                    <span class="field-hint">Отключайте при циклических повторах и ложных вставках.</span>
+                  </span>
+                  <input id="conditionOnPreviousText" data-setting="condition_on_previous_text"
+                         type="checkbox">
+                </label>
+              </div>
+            </div>
+          </details>
+
+          <details id="advancedSettings" class="settings-section settings-collapsible">
+            <summary>
               <span>
-                <span class="toggle-title">Перезаписать целевые результаты</span>
-                <span class="field-hint">Игнорировать кеш и заменить только вычисленные SRT/JSON/FLAC.</span>
+                <span class="settings-section-title">Дополнительные параметры</span>
+                <span class="settings-section-hint">Среда Python, каталог результата и режимы обработки.</span>
               </span>
-              <input id="force" data-setting="force" type="checkbox">
-            </label>
-          </div>
+            </summary>
+            <div class="settings-section-body">
+              <div class="field">
+                <label for="workerPythonPath">Python процесса распознавания (необязательно)</label>
+                <input id="workerPythonPath" data-setting="worker_python_path" type="text"
+                       spellcheck="false" placeholder="Выбирается автоматически по движку">
+                <span class="field-hint">Отдельная среда исполнения выбранного движка распознавания.</span>
+              </div>
+
+              <div class="field">
+                <label for="outputDir">Каталог результатов (необязательно)</label>
+                <input id="outputDir" data-setting="output_dir" type="text" spellcheck="false"
+                       placeholder="По умолчанию рядом с исходным файлом">
+              </div>
+
+              <div class="settings-group" aria-label="Загрузка модели">
+                <label class="field toggle" for="quantizationEnabled">
+                  <span>
+                    <span class="toggle-title">Квантование модели</span>
+                    <span class="field-hint">Использовать поддерживаемый 8-битный режим на CUDA.</span>
+                  </span>
+                  <input id="quantizationEnabled" data-setting="quantization_enabled" type="checkbox">
+                </label>
+
+                <label class="field toggle" for="allowCpuFallback">
+                  <span>
+                    <span class="toggle-title">Резервный запуск на CPU</span>
+                    <span class="field-hint">Разрешить CPU только при ошибке GPU.</span>
+                  </span>
+                  <input id="allowCpuFallback" data-setting="allow_cpu_fallback" type="checkbox">
+                </label>
+              </div>
+
+              <div class="settings-group" aria-label="Параметры обработки">
+                <label class="field toggle" for="keepAudio">
+                  <span>
+                    <span class="toggle-title">Сохранить нормализованный FLAC</span>
+                    <span class="field-hint">Оставить подготовленное моно-аудио рядом с результатом.</span>
+                  </span>
+                  <input id="keepAudio" data-setting="keep_audio" type="checkbox">
+                </label>
+
+                <label class="field toggle" for="recursive">
+                  <span>
+                    <span class="toggle-title">Рекурсивный обход папки</span>
+                    <span class="field-hint">Искать поддерживаемые медиа во вложенных каталогах.</span>
+                  </span>
+                  <input id="recursive" data-setting="recursive" type="checkbox">
+                </label>
+
+                <label class="field toggle danger-toggle" for="force">
+                  <span>
+                    <span class="toggle-title">Перезаписать целевые результаты</span>
+                    <span class="field-hint">Явно разрешить замену целевых SRT/JSON/FLAC; совместимый кеш распознавания при этом может переиспользоваться.</span>
+                  </span>
+                  <input id="force" data-setting="force" type="checkbox">
+                </label>
+              </div>
+            </div>
+          </details>
         </form>
       </section>
     </main>

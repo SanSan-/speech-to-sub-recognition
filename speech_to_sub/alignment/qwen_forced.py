@@ -6,7 +6,7 @@ import math
 import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,6 +35,16 @@ class _PreparedRequest:
     model_path: Path
     worker_python: Path
     runtime: RuntimeSignature
+
+
+class _EmptyAlignmentWords(AsrModelError):
+    """Ошибка пустых словных меток одного alignment-сегмента."""
+
+    def __init__(self, segment_index: int) -> None:
+        self.segment_index = segment_index
+        super().__init__(
+            f"Qwen3 ForcedAligner не вернул слова для сегмента {segment_index}."
+        )
 
 
 class QwenForcedAlignerAdapter:
@@ -125,14 +135,25 @@ class QwenForcedAlignerAdapter:
             assert runtime is not None
             self._runtime = runtime
             self._load_key = _settings_key(settings)
-            aligned = _normalize_alignment(
-                response,
-                transcript,
-                segments,
-                prepared,
-                runtime,
-                duration,
-            )
+            try:
+                aligned = _normalize_alignment(
+                    response,
+                    transcript,
+                    segments,
+                    prepared,
+                    runtime,
+                    duration,
+                )
+            except _EmptyAlignmentWords as exc:
+                if not _can_fallback_to_source_words(transcript, settings, duration):
+                    raise
+                aligned = _fallback_to_source_words(
+                    transcript,
+                    prepared,
+                    runtime,
+                    prepared_segments=segments,
+                    failed_segment_index=exc.segment_index,
+                )
         _raise_if_cancelled(cancel_check)
         if progress_callback:
             progress_callback(100)
@@ -457,7 +478,7 @@ def _normalize_alignment(
         )
         words = _normalize_words(raw.get("words"), source_segment, duration)
         if not words:
-            raise AsrModelError(f"Qwen3 ForcedAligner не вернул слова для сегмента {index}.")
+            raise _EmptyAlignmentWords(index)
         segments.append(
             TranscriptSegment(
                 words[0].start,
@@ -492,6 +513,97 @@ def _normalize_alignment(
         transcript.quantized,
         metadata,
     )
+
+
+def _can_fallback_to_source_words(
+    transcript: Transcript,
+    settings: ProcessingSettings,
+    duration: float,
+) -> bool:
+    """Разрешает fallback только для полного валидного результата faster-whisper."""
+    if settings.backend != "faster-whisper":
+        return False
+    if transcript.metadata.get("runtime") != "faster-whisper":
+        return False
+    if transcript.metadata.get("word_timestamps") is not True or not transcript.segments:
+        return False
+
+    previous_segment_end = 0.0
+    for segment in transcript.segments:
+        try:
+            start = float(segment.start)
+            end = float(segment.end)
+        except (TypeError, ValueError):
+            return False
+        invalid_segment = (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or start < previous_segment_end - 0.05
+            or end <= start
+            or end > duration + 0.05
+            or not segment.text.strip()
+            or not segment.words
+        )
+        if invalid_segment or not _valid_source_words(segment, start, end):
+            return False
+        previous_segment_end = end
+    return True
+
+
+def _valid_source_words(segment: TranscriptSegment, start: float, end: float) -> bool:
+    """Проверяет словные метки без изменения исходных объектов и probabilities."""
+    previous_end = start
+    for word in segment.words:
+        try:
+            word_start = float(word.start)
+            word_end = float(word.end)
+        except (TypeError, ValueError):
+            return False
+        invalid = (
+            not word.text.strip()
+            or not math.isfinite(word_start)
+            or not math.isfinite(word_end)
+            or word_start < start - 0.05
+            or word_end > end + 0.05
+            or word_start < previous_end - 0.05
+            or word_end <= word_start
+        )
+        if invalid:
+            return False
+        previous_end = word_end
+    return True
+
+
+def _fallback_to_source_words(
+    transcript: Transcript,
+    prepared: _PreparedRequest,
+    runtime: RuntimeSignature,
+    *,
+    prepared_segments: Sequence[Mapping[str, Any]],
+    failed_segment_index: int,
+) -> Transcript:
+    """Возвращает неизменённые ASR-сегменты с диагностикой fallback-а."""
+    metadata = dict(transcript.metadata)
+    metadata.update(
+        {
+            "aligner": QwenForcedAlignerAdapter.aligner_id,
+            "aligner_model": str(prepared.model_path),
+            "alignment_runtime": dict(runtime),
+            "alignment_status": "fallback",
+            "alignment_fallback": {
+                "reason": "empty_aligner_words",
+                "segment_index": failed_segment_index,
+                "source": "faster-whisper-word-timestamps",
+            },
+            "alignment_segment_count": 0,
+            "alignment_requested_segment_count": len(prepared_segments),
+            "alignment_max_segment_seconds": MAX_ALIGNMENT_SEGMENT_SECONDS,
+            "word_timestamps": True,
+            "isolated_alignment_worker": True,
+        }
+    )
+    return cast(Transcript, replace(transcript, metadata=metadata))
 
 
 def _normalize_words(value: Any, segment: TranscriptSegment, duration: float) -> list[TranscriptWord]:

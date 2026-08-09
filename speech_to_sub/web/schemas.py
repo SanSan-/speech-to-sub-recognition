@@ -14,14 +14,17 @@ from speech_to_sub.constants import (
     DEFAULT_BEAM_SIZE,
     DEFAULT_CHUNK_LENGTH_SECONDS,
     DEFAULT_LANGUAGE,
+    DEFAULT_LINE_LENGTH_GAP,
     DEFAULT_LONG_FORM_OVERLAP_SECONDS,
     DEFAULT_LONG_FORM_WINDOW_SECONDS,
     DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_MAX_CPS,
     DEFAULT_MODEL_PATH,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_STRIDE_LENGTH_SECONDS,
     DEFAULT_VAD_MIN_SILENCE_MS,
     MAX_BATCH_PATHS,
+    MAX_LINE_LENGTH_GAP,
 )
 
 
@@ -59,6 +62,13 @@ class ProcessingSettingsPayload(ApiModel):
     output_dir: str | None = Field(default=None, max_length=4096)
     verbose: bool = False
     max_chars_per_line: int = Field(default=DEFAULT_MAX_CHARS_PER_LINE, ge=20, le=80)
+    line_length_gap: int = Field(
+        default=DEFAULT_LINE_LENGTH_GAP,
+        ge=0,
+        le=MAX_LINE_LENGTH_GAP,
+        strict=True,
+    )
+    max_cps: float = Field(default=DEFAULT_MAX_CPS, ge=5, le=60)
     chunk_length_seconds: int = Field(default=DEFAULT_CHUNK_LENGTH_SECONDS, ge=10, le=3600)
     stride_length_seconds: int = Field(default=DEFAULT_STRIDE_LENGTH_SECONDS, ge=0, le=600)
     long_form_window_seconds: int = Field(

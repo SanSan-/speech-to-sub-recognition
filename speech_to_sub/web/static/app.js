@@ -35,7 +35,7 @@ const STREAM_ALLOWED_ORIGINS = Object.freeze([window.location.origin]);
 
 const BUILTIN_DEFAULTS = {
   backend: "faster-whisper",
-  model_path: String.raw`D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2`,
+  model_path: "resources/models/whisper-large-v3-ct2",
   aligner: "none",
   aligner_model_path: null,
   worker_python_path: null,
@@ -46,6 +46,9 @@ const BUILTIN_DEFAULTS = {
   audio_stream_index: null,
   quantization_enabled: true,
   allow_cpu_fallback: false,
+  max_chars_per_line: 42,
+  line_length_gap: 8,
+  max_cps: 17,
   long_form_window_seconds: 300,
   long_form_overlap_seconds: 2,
   vad_filter: true,
@@ -315,7 +318,7 @@ function readSettings() {
     }
     if (input.type === "number") {
       const value = input.value.trim();
-      settings[key] = value === "" ? null : Number.parseInt(value, 10);
+      settings[key] = value === "" ? null : Number(value);
       return;
     }
     const value = input.value.trim();

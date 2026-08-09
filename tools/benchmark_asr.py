@@ -124,12 +124,21 @@ def main(argv: list[str] | None = None) -> int:
         sidecar = json.loads(read_text_utf8(sidecar_path))
         report["srt_path"] = str(srt_path)
         report["sidecar_path"] = str(sidecar_path)
-        report["runtime"] = sidecar.get("settings", {}).get("runtime")
+        recognition_settings = sidecar.get("recognition_settings")
+        if (
+            not isinstance(recognition_settings, dict)
+            and "sidecar_schema_version" not in sidecar
+        ):
+            recognition_settings = sidecar.get("settings", {})
+        if not isinstance(recognition_settings, dict):
+            recognition_settings = {}
+        report["runtime"] = recognition_settings.get("runtime")
         report["metrics"] = analyze_srt(
             read_text_utf8(srt_path),
             audio_duration=float(sidecar.get("audio", {}).get("duration", media_duration)),
             sidecar=sidecar,
             max_chars_per_line=settings.max_chars_per_line,
+            line_length_gap=settings.line_length_gap,
         )
     atomic_write_json(result_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)

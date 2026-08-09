@@ -1,185 +1,383 @@
 # speech-to-sub-recognition
 
-Локальный Python-проект для пакетного извлечения аудио из видео, распознавания речи
-локальной моделью и создания субтитров SRT.
-
-Основной сценарий:
+Локальное приложение для пакетного извлечения аудио из видео, автоматического распознавания
+речи (ASR) и создания субтитров SRT. Штатный сценарий полностью работает на машине
+пользователя: облачные API и автоматическое скачивание моделей не используются.
 
 ```text
-MP4/audio -> ffprobe -> FFmpeg 16 kHz mono FLAC -> local ASR -> optional aligner -> SRT
+видео или аудио -> ffprobe -> FFmpeg, FLAC mono 16 кГц -> локальное распознавание
+                -> необязательное выравнивание -> проверенный SRT
 ```
 
-## Статус проекта
+Текущее состояние и датированные результаты проверок находятся в [STATUS.md](STATUS.md),
+история значимых изменений — в [CHANGELOG.md](CHANGELOG.md), требования — в
+[PRD.md](PRD.md).
+
+## Возможности
+
+- одиночная и пакетная обработка видео- и аудиофайлов;
+- запуск из командной строки и через локальный веб-интерфейс;
+- инвентаризация аудиопотоков через `ffprobe` и явный выбор дорожки;
+- подготовка монофонического FLAC 16 кГц через FFmpeg;
+- локальные движки `faster-whisper`, `transformers`, `parakeet-tdt-v3` и `qwen3-asr`;
+- необязательный модуль `qwen3-forced-aligner` для словного выравнивания;
+- русский, английский и автоматическое определение языка в поддерживающих его движках;
+- последовательная обработка длинных записей без единого массива несжатого аудио всего файла
+  в основном профиле `faster-whisper`;
+- разметка SRT по границам предложений с ограничениями длины строки и скорости чтения;
+- диагностический сопроводительный JSON, проверяемый кеш и безопасная принудительная пересборка;
+- атомарная публикация результатов и межпроцессная блокировка;
+- сохраняемая в SQLite очередь веб-задач, восстановление после перезапуска, отмена и повтор
+  только неуспешных файлов;
+- поток событий сервера (SSE) с продолжением после последнего принятого события.
+
+## Архитектура
+
+Командный и веб-интерфейсы используют общий слой обработки. Конкретные движки распознавания
+и выравнивания подключаются через реестры, поэтому правила выбора аудиопотока, кеширования,
+формирования SRT и публикации файлов не дублируются.
 
 ```text
 .
 ├─ speech_to_sub
-│  ├─ __main__.py                  # CLI
-│  ├─ cli.py                       # аргументы и коды завершения
-│  ├─ service.py                   # общий batch-пайплайн
-│  ├─ asr                          # локальные ASR backend-ы
-│  ├─ alignment                    # optional aligner-ы
-│  ├─ workers                      # протокол изолированных ML-worker-ов
-│  ├─ media                        # ffprobe и FFmpeg
-│  ├─ subtitles                    # SRT builder и validator
-│  ├─ utils                        # env, I/O, кеш, логи, GPU
+│  ├─ __init__.py                  # версия пакета
+│  ├─ __main__.py                  # запуск python -m speech_to_sub
+│  ├─ benchmark.py                 # метрики SRT, памяти и видеопамяти
+│  ├─ cli.py                       # командная строка и коды завершения
+│  ├─ constants.py                 # расширения и значения по умолчанию
+│  ├─ exceptions.py                # доменные исключения
+│  ├─ models.py                    # настройки, потоки, сегменты и результаты
+│  ├─ service.py                   # общий пакетный конвейер
+│  ├─ asr
+│  │  ├─ base.py                   # контракт движка распознавания
+│  │  ├─ checkpoints.py            # проверка локальных моделей
+│  │  ├─ external_worker.py        # клиент протокола изолированных процессов
+│  │  ├─ faster_whisper.py         # основной движок CTranslate2
+│  │  ├─ parakeet_tdt.py           # адаптер Parakeet TDT v3
+│  │  ├─ qwen3.py                  # адаптер Qwen3-ASR
+│  │  ├─ registry.py               # реестр и выгрузка движков
+│  │  └─ transformers_whisper.py   # запасной Whisper через Transformers
+│  ├─ alignment
+│  │  ├─ base.py                   # общий контракт выравнивания
+│  │  ├─ qwen_forced.py            # Qwen3 ForcedAligner и безопасный возврат
+│  │  └─ registry.py               # реестр модулей выравнивания
+│  ├─ workers
+│  │  ├─ common.py                 # общий кадровый протокол NDJSON
+│  │  ├─ parakeet_worker.py        # изолированный процесс Parakeet
+│  │  ├─ qwen_worker.py            # изолированный процесс Qwen3-ASR
+│  │  └─ qwen_aligner_worker.py    # изолированный процесс выравнивания Qwen
+│  ├─ media
+│  │  ├─ audio_windows.py          # оконное декодирование длинного аудио
+│  │  └─ ffmpeg.py                 # ffprobe, выбор потока и нормализация
+│  ├─ subtitles
+│  │  ├─ builder.py                # слова и сегменты -> реплики -> SRT
+│  │  ├─ layout.py                 # согласование текста и временных меток
+│  │  └─ validator.py              # синтаксическая и временная проверка
+│  ├─ utils
+│  │  ├─ cache.py                  # контрольный отпечаток и сопроводительный JSON
+│  │  ├─ env_utils.py              # чтение настроек окружения
+│  │  ├─ io_utils.py               # UTF-8 без BOM и атомарная запись
+│  │  ├─ logging_utils.py          # журналирование
+│  │  └─ model_utils.py            # GPU, CPU, квантование и выгрузка
 │  └─ web
-│     ├─ app.py                    # FastAPI
-│     ├─ jobs.py                   # worker, state и SSE
-│     ├─ picker.py                 # локальные системные диалоги
-│     ├─ schemas.py                # API DTO
-│     └─ static                    # HTML/CSS/JS
-├─ docs                            # исходные исследования
-├─ logs
+│     ├─ __main__.py               # запуск Uvicorn
+│     ├─ app.py                    # маршруты FastAPI и локальная защита
+│     ├─ job_store.py              # сохраняемое SQLite-хранилище
+│     ├─ jobs.py                   # очередь, восстановление, отмена, повтор и SSE
+│     ├─ picker.py                 # системные диалоги выбора файлов
+│     ├─ schemas.py                # модели и проверка запросов API
+│     └─ static
+│        ├─ index.html             # страница пакетной обработки
+│        ├─ app.js                 # состояние интерфейса и поток событий
+│        └─ styles.css             # оформление интерфейса
+├─ .codex
+│  └─ skills/fix-sonar             # проектный цикл анализа SonarQube
+├─ docs
+│  ├─ benchmarks                   # методики и первичные результаты измерений
+│  └─ *.md, *.pdf                  # исходные исследовательские материалы
+├─ requirements-workers
+│  ├─ parakeet.txt                 # зависимости процесса Parakeet
+│  └─ qwen.txt                     # зависимости процессов Qwen
 ├─ resources
-│  ├─ cache
-│  ├─ state                        # SQLite web-задач
-│  ├─ runtimes                     # локальные изолированные venv
-│  └─ work
-├─ requirements-workers            # точные lock-файлы worker runtime
-├─ tests
-├─ setup_workers.ps1
-├─ run_web.ps1
-├─ requirements.txt
-├─ pyproject.toml
-├─ PRD.md
-└─ README.md
+│  ├─ cache                        # служебный кеш
+│  ├─ runtimes                     # локальные изолированные окружения
+│  ├─ state                        # SQLite веб-задач
+│  └─ work                         # временные файлы и рабочие артефакты
+├─ tests                           # модульные, интеграционные и браузерные проверки
+├─ tools
+│  └─ benchmark_asr.py             # воспроизводимый запуск сравнительных измерений
+├─ .env                            # локальные настройки, не публикуются
+├─ .env.example                    # переносимый образец настроек
+├─ CHANGELOG.md                    # история значимых изменений
+├─ CHECKLIST.md                    # незавершённые пункты текущей цели
+├─ PRD.md                          # подробные требования и критерии приёмки
+├─ README.md                       # установка, настройка и использование
+├─ SONAR.md                        # порядок анализа SonarQube
+├─ STATUS.md                       # датированные проверки и известные риски
+├─ package.json                    # браузерные проверки
+├─ playwright.config.mjs           # конфигурация Playwright
+├─ pyproject.toml                  # пакет, pytest и покрытие
+├─ requirements.txt                # закреплённые зависимости основного окружения
+├─ run_web.ps1                     # запуск локального веб-интерфейса
+├─ setup_workers.ps1               # создание изолированных окружений
+└─ sonar-project.properties.example # переносимый образец SonarQube
 ```
 
-Версия проекта — `1.4.0`; CLI и локальный веб-интерфейс используют общий service layer и четыре локальных ASR backend-а:
-faster-whisper, Transformers Whisper, Parakeet TDT v3 и Qwen3-ASR 0.6B. Qwen3 ForcedAligner доступен как optional aligner.
-Сквозной путь проверен на русских и английских MKV/MP4, включая long-form записи.
+Дополнительные сведения:
 
-Веб-задачи, файловые состояния и события сохраняются в SQLite. После рестарта незавершённая
-задача переводится в явный terminal-статус `interrupted`, а успешные результаты остаются
-доступны; поддержаны cancel, retry только неуспешных файлов и SSE reconnect по курсору.
-
-## Основные решения первой версии
-
-- Только локальное распознавание.
-- Четыре ASR backend-а и optional aligner выбираются через общие registry и настройки.
-- `faster-whisper` + CTranslate2 как основной backend; `transformers` + PyTorch как fallback.
-- Parakeet и Qwen работают в изолированных worker-процессах с несовместимыми между собой
-  закреплёнными ML-зависимостями.
-- Long-form окна декодируются через PyAV последовательно, без единого PCM-массива всей записи.
-- FFmpeg и ffprobe как системные зависимости.
-- Один активный ASR worker, чтобы модель не дублировалась в VRAM.
-- Один service layer для CLI и web.
-- SRT строится отдельным компонентом по временным меткам модели.
-- Исходные медиа не изменяются.
-- Существующие результаты не перезаписываются без явного `force`.
-- Набор артефактов защищён межпроцессным lock и публикуется с откатом при частичном сбое.
-- Web-state хранится в SQLite; завершённые записи ограничиваются размером/TTL, а устаревшие
-  `resources/work/job-*` удаляются только при наличии служебного lock-маркера и отсутствии
-  активной блокировки.
+- [CHECKLIST.md](CHECKLIST.md) — ход активной цели;
+- [docs/benchmarks/v1.2](docs/benchmarks/v1.2/README.md) — методика измерений длинных записей;
+- [docs/benchmarks/v1.4](docs/benchmarks/v1.4/README.md) — сравнение локальных движков;
+- [SONAR.md](SONAR.md) — переносимый порядок проверки SonarQube;
+- [docs](docs) — исходные исследования и дополнительные материалы.
 
 ## Локальные модели
 
-Основной CTranslate2 checkpoint:
+Каталог выбранной модели обязателен и проверяется до тяжёлого распознавания. Обычный запуск
+не обращается к сети и не создаёт каталог модели автоматически.
+Если путь не задан явно, CLI и веб-интерфейс используют каталог соответствующей модели
+в `<repo-root>/resources/models`. Модель можно хранить в другом месте, задав `ASR_MODEL_PATH`
+или аргумент `--model-path`.
+
+| Значение `ASR_BACKEND` | Локальная модель | Среда выполнения | Назначение |
+|---|---|---|---|
+| `faster-whisper` | `<local-faster-whisper-model-path>` | основной Python, CTranslate2 | рекомендуемый профиль для длинных записей и русской речи |
+| `transformers` | `<local-transformers-model-path>` | основной Python, PyTorch | запасной профиль совместимости |
+| `parakeet-tdt-v3` | `<local-parakeet-model-path>` | изолированный Python 3.14 | дополнительный локальный движок |
+| `qwen3-asr` | `<local-qwen-asr-model-path>` | изолированный Python 3.11 | дополнительный локальный движок |
+
+Для `ASR_ALIGNER=qwen3-forced-aligner` также нужен каталог
+`<local-qwen-aligner-model-path>`. Распознавание и выравнивание Qwen выполняются в отдельных
+последовательно загружаемых процессах. Для `faster-whisper` дополнительное выравнивание обычно
+не требуется, поскольку он уже возвращает словные временные метки.
+
+Parakeet и Qwen нельзя устанавливать в основное виртуальное окружение: их закреплённые наборы
+зависимостей находятся в `requirements-workers/parakeet.txt` и
+`requirements-workers/qwen.txt`. Подготовка выполняется только явной командой владельца.
+Parakeet использует PyTorch и Transformers из основной среды. Если она находится не в штатной
+`.venv` внутри `<repo-root>`, задайте `SPEECH_TO_SUB_MAIN_SITE_PACKAGES` как путь к её каталогу
+`site-packages`.
+
+## Входные данные
+
+Поддерживаемые видео: `.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`.
+
+Поддерживаемое аудио: `.wav`, `.flac`, `.mp3`, `.m4a`, `.aac`, `.ogg`, `.opus`, `.mka`.
+
+Пути с пробелами и символами Unicode поддерживаются. Для контейнера с несколькими
+аудиопотоками можно указать нулевой порядковый номер. Без явного номера приложение сначала
+ищет единственную дорожку с языком из `ASR_AUDIO_LANGUAGE`, затем использует единственный
+доступный поток. Неоднозначность сопровождается предупреждением.
+
+Исходные медиафайлы не изменяются и не удаляются.
+
+## Выходные данные
+
+Для `<media-directory>\lecture.mp4` и языка `en` по умолчанию создаются:
 
 ```text
-D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2
-```
-
-Он полностью локально сконвертирован из существующего Hugging Face checkpoint и содержит
-`model.bin`, `config.json`, tokenizer, vocabulary и preprocessor config. Обычный запуск не
-обращается к сети. Профили: CUDA `int8_float16`/`float16`, CPU `int8`/`float32`.
-
-Fallback Transformers checkpoint:
-
-```text
-D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3
-```
-
-Каталог содержит Hugging Face checkpoint `WhisperForConditionalGeneration`, tokenizer,
-processor и generation config.
-
-Whisper Large v3 многоязычный. Английский (`en`), русский (`ru`) и автоопределение (`auto`)
-поддерживаются одним локальным backend; отдельный язык аудиодорожки задаётся независимо от
-языка распознавания.
-
-Parakeet TDT v3:
-
-```text
-D:\Projects\-ai\+automatic-speech-recognition\parakeet-tdt-0.6b-v3
-```
-
-Он запускается отдельным Python 3.14 worker с `transformers 5.14.1` и PyTorch/CUDA. Нативные
-token timestamps нормализуются в общий word/segment-контракт; длинные записи обрабатываются
-окнами с overlap.
-
-Qwen3-ASR и ForcedAligner:
-
-```text
-D:\Projects\-ai\+automatic-speech-recognition\Qwen3-ASR-0.6B
-D:\Projects\-ai\+automatic-speech-recognition\Qwen3-ForcedAligner-0.6B
-```
-
-Qwen запускается в изолированном Python 3.11 runtime с `qwen-asr 0.0.6`,
-`transformers 4.57.6` и PyTorch/CUDA. ASR и ForcedAligner работают в отдельных persistent
-worker-процессах и загружаются последовательно. ASR формирует coarse-сегменты с target
-175 секунд и жёсткой границей 180 секунд; самостоятельный ForcedAligner режет аудио по этим
-границам, применяет точные offsets и возвращает нормализованные словные временные метки.
-Aligner можно сочетать с любым backend-ом: длинные сегменты он детерминированно делит на части
-до 180 секунд по словным меткам и паузам, а без них — пропорционально тексту и времени. Все
-backend-ы проверяют локальный путь до тяжёлого инференса и не скачивают модели при обычном запуске.
-
-## Поддерживаемые входы
-
-Видео:
-
-- `.mp4`
-- `.m4v`
-- `.mov`
-- `.mkv`
-- `.webm`
-
-Аудио:
-
-- `.wav`
-- `.flac`
-- `.mp3`
-- `.m4a`
-- `.aac`
-- `.ogg`
-- `.opus`
-- `.mka`
-
-Перед обработкой контейнер проверяется через `ffprobe`. Для файла с несколькими дорожками
-можно задать нулевой порядковый номер аудиопотока; иначе приложение ищет предпочитаемый язык
-из `ASR_AUDIO_LANGUAGE` и показывает предупреждение при неоднозначности.
-
-## Результаты
-
-Для `lecture.mp4` по умолчанию:
-
-```text
-lecture.en.srt
-lecture.en.asr.json
+<media-directory>\lecture.en.srt
+<media-directory>\lecture.en.asr.json
 ```
 
 - `.srt` — проверенные субтитры в UTF-8 без BOM;
-- `.asr.json` — fingerprint источника, выбранный поток, ASR/aligner runtime и параметры,
-  `started_at`, `finished_at` и исходные временные сегменты для диагностики и повторной сборки SRT;
-- нормализованный `.flac` является временным; сохранить его можно отдельной настройкой.
+- `.asr.json` — контрольный отпечаток источника, выбранный поток, движок и параметры,
+  временные сегменты, время начала и окончания обработки, диагностика сдвигов внутренних
+  границ SRT и число узких нормализаций растянутых якорей `timing_anomaly_adjustments`;
+- `.asr.flac` — необязательный нормализованный звук при `ASR_KEEP_AUDIO=1`.
 
-SRT, sidecar и сохраняемый FLAC сначала готовятся во временных соседних файлах, затем
-публикуются одним защищённым commit с восстановлением предыдущей версии при ошибке. Пустой
-или непрошедший проверку SRT не публикуется.
+SRT, сопроводительный JSON и сохраняемый FLAC сначала готовятся во временных соседних файлах.
+Готовый набор публикуется атомарно; при частичном сбое восстанавливается предыдущая согласованная
+версия. Пустой или не прошедший проверку SRT не становится готовым результатом.
 
-Если два выбранных файла дают одинаковый целевой путь, к имени сначала добавляется расширение
-источника, а при повторной коллизии — детерминированный короткий hash абсолютного пути.
+Если разные входы дают один целевой путь, к имени добавляется расширение источника, а при
+повторной коллизии — короткая контрольная сумма абсолютного пути.
 
-## Требования
+## Правила формирования SRT
 
-- Windows с PowerShell.
-- Python 3.14 x64.
-- FFmpeg и ffprobe в `PATH` либо их явные пути в `.env`.
-- Для штатного GPU-режима — совместимая NVIDIA GPU/CUDA.
-- Локальный checkpoint выбранного backend-а.
-- Python 3.11 x64 дополнительно для Qwen3-ASR/ForcedAligner.
+Текст, регистр и пунктуация берутся из `segment.text`, а словные метки используются как
+временные якоря. Диагностический результат распознавания в сопроводительном JSON при разметке
+не изменяется.
 
-Проверка внешних команд:
+Разметка следует фиксированной последовательности: словные якоря → предложения → смысловые
+строки → отдельное назначение времени. До сборки предложений узко нормализуются только
+аномально растянутые якоря; текст, порядок слов и исходный `Transcript` при этом не меняются.
+Смысловые строки выбираются по тексту и ограничениям читаемости, а их временные границы
+планируются уже после этого отдельным этапом.
+
+Разметчик:
+
+- объединяет продолжение фразы через технические границы сегментов распознавания;
+- начинает новое предложение с новой строки либо новой реплики;
+- предпочитает строки не длиннее 42 символов Unicode, но при необходимости сохранить цельную
+  фразу или устранить неудачный короткий остаток допускает до 8 дополнительных символов;
+- запрещает строки длиннее суммы базовой длины и допуска: при значениях по умолчанию это
+  50 символов; значение допуска `0` возвращает строгое ограничение базовой длиной;
+- допускает не более двух строк в реплике;
+- обеспечивает предел 17 отображаемых символов в секунду с учётом пробелов и пунктуации;
+- удерживает длительность реплики в диапазоне 0,8–7,0 секунды без пересечений и выхода за
+  длительность аудио;
+- для физически плотной речи может сдвинуть только внутреннюю границу соседних реплик не более
+  чем на 1,0 секунды относительно неточной словной метки;
+- не сдвигает начало и конец непрерывного речевого блока и не пересекает паузы длительностью
+  0,8 секунды и более;
+- сохраняет в диагностике число таких сдвигов и наибольшую величину;
+- сохраняет число узких нормализаций растянутых словных якорей в поле
+  `timing_anomaly_adjustments`;
+- различает отдельное русское тире и внутрисловный дефис;
+- консервативно обрабатывает короткую начальную аномальную временную метку перед большой паузой.
+
+Базовая длина 42 символа, две строки и 17 символов в секунду следуют
+[руководству Netflix для русских субтитров](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215346638-Russian-Timed-Text-Style-Guide).
+Адаптивный допуск до 8 символов является правилом проекта: он применяется только ради цельной
+фразы или устранения неудачного короткого остатка и не отменяет жёсткий предел 50 символов.
+Для более спокойного темпа можно задать 15 символов в секунду, если длительность записи позволяет
+соблюсти это ограничение.
+
+## Кеш и безопасность данных
+
+Сопроводительный JSON хранит два независимых отпечатка. `recognition_settings`
+описывает тяжёлое распознавание и выравнивание, а `layout_settings` — лёгкую SRT-разметку.
+Полностью готовый кеш требует совпадения обоих отпечатков и валидного SRT.
+
+- совпавшие валидные результаты получают состояние `cached` без загрузки модели;
+- при совпадении `recognition_settings` отсутствующий SRT пересобирается из сохранённого
+  `Transcript` без FFmpeg и повторного запуска модели;
+- изменение только базовой длины строки, адаптивного допуска, CPS или версии сборщика с
+  `--force` пересобирает SRT из того же тяжёлого кеша;
+- существующий SRT без подтверждающего JSON не перезаписывается и получает состояние `skipped`;
+- существующий SRT при несовпавшей разметке также не заменяется без `--force`;
+- `--force` разрешает атомарно заменить только вычисленные целевые файлы, но не требует
+  повторного распознавания при совпавшем тяжёлом отпечатке;
+- изменение источника, аудиопотока, модели, среды, параметров распознавания или выравнивания
+  запрещает переиспользование `Transcript`;
+- повреждённый `Transcript` в JSON не принимается: сервис выполняет обычное распознавание;
+- сопроводительный JSON прежнего совместимого формата переиспользует сохранённый `Transcript`
+  только после проверки тяжёлого отпечатка; неизвестные и несовместимые форматы отклоняются;
+- одна активная задача не допускает дублирования тяжёлой модели в видеопамяти;
+- очистка служебных каталогов не затрагивает пользовательские исходники;
+- веб-сервис принимает только фактические локальные подключения и локальный заголовок `Host`;
+  изменяющие состояние запросы дополнительно проверяют точный `Origin`;
+- удалённый и многопользовательский режимы без аутентификации отсутствуют.
+
+## Настройки окружения
+
+Полный переносимый образец находится в [.env.example](.env.example). Перед запуском его
+копируют в локальный `.env` и заменяют плейсхолдеры реальными путями. `.env` не публикуется.
+
+### Распознавание и модели
+
+| Переменная | Значение по умолчанию или назначение |
+|---|---|
+| `ASR_BACKEND` | `faster-whisper` |
+| `ASR_MODEL_PATH` | локальный путь к выбранной модели; по умолчанию каталог соответствующей модели в `<repo-root>/resources/models` |
+| `ASR_ALIGNER` | `none` или `qwen3-forced-aligner` |
+| `ASR_ALIGNER_MODEL_PATH` | локальный путь к модели выравнивания; по умолчанию соответствующий каталог в `<repo-root>/resources/models` |
+| `ASR_WORKER_PYTHON` | необязательный Python процесса выбранного движка |
+| `ASR_ALIGNER_WORKER_PYTHON` | независимый Python процесса выравнивания |
+| `QWEN_ASR_PYTHON` | среда Qwen по умолчанию |
+| `PARAKEET_ASR_PYTHON` | среда Parakeet по умолчанию |
+| `SPEECH_TO_SUB_MAIN_SITE_PACKAGES` | необязательный путь к `site-packages` основной среды для Parakeet |
+| `ASR_LANGUAGE` | `en`, `ru` или `auto`; по умолчанию `en` |
+| `ASR_AUDIO_LANGUAGE` | предпочитаемый язык дорожки; по умолчанию `eng` |
+| `ASR_AUDIO_STREAM_INDEX` | необязательный нулевой порядковый номер аудиопотока |
+| `ASR_DEVICE` | `auto`, `cuda` или `cpu` |
+| `ASR_QUANTIZATION` | включение поддерживаемой 8-битной конфигурации |
+| `ASR_ALLOW_CPU_FALLBACK` | явное разрешение запасного запуска на процессоре |
+
+### Разметка, длинные записи и вывод
+
+| Переменная | Значение по умолчанию или назначение |
+|---|---|
+| `ASR_MAX_CHARS_PER_LINE` | предпочтительная базовая длина строки, 42 символа |
+| `ASR_LINE_LENGTH_GAP` | адаптивный допуск от 0 до 20 символов, по умолчанию 8; `0` отключает допуск |
+| `ASR_MAX_CPS` | 17 символов в секунду |
+| `ASR_LONG_FORM_WINDOW_SECONDS` | окно `faster-whisper`, 300 секунд |
+| `ASR_LONG_FORM_OVERLAP_SECONDS` | перекрытие окон, 2 секунды |
+| `ASR_VAD_FILTER` | фильтрация тишины включена |
+| `ASR_VAD_MIN_SILENCE_MS` | минимальная тишина, 600 мс |
+| `ASR_BEAM_SIZE` | ширина поиска, 5 |
+| `ASR_CONDITION_ON_PREVIOUS_TEXT` | учитывать предыдущий текст |
+| `ASR_KEEP_AUDIO` | сохранять нормализованный FLAC |
+| `ASR_OUTPUT_DIR` | необязательный каталог результатов |
+| `FFMPEG_PATH`, `FFPROBE_PATH` | команды из `PATH` либо явные локальные пути |
+| `HF_HOME`, `HUGGINGFACE_HUB_CACHE` | необязательные локальные кеши Hugging Face |
+
+### Веб-интерфейс и проверки
+
+| Переменная | Значение по умолчанию или назначение |
+|---|---|
+| `WEB_HOST` | `127.0.0.1`; внешний адрес отклоняется |
+| `WEB_PORT` | `7862` |
+| `WEB_JOB_DB` | `resources\state\jobs.sqlite3` |
+| `RUN_LOCAL_ASR_TEST`, `ASR_TEST_MEDIA`, `ASR_TEST_LANGUAGE` | явная одиночная проверка реальной модели |
+| `RUN_BATCH_ASR_TEST`, `ASR_BATCH_TEST_MEDIA` | явная проверка реального пакета |
+| `RUN_MULTITRACK_ASR_TEST`, `ASR_MULTITRACK_MEDIA` | явная проверка контейнера с несколькими дорожками |
+| `ASR_MULTITRACK_RU_STREAM_INDEX`, `ASR_MULTITRACK_EN_STREAM_INDEX` | номера дорожек такой проверки |
+| `SONAR_HOST_URL`, `SONAR_TOKEN` | локальный SonarQube; токен хранится только вне репозитория |
+
+Параметры длинных записей входят в тяжёлый отпечаток, а параметры разметки — в лёгкий. После
+изменения алгоритма или лимитов существующий SRT не считается совпавшим результатом, но
+совпавшее распознавание может быть безопасно использовано для его пересборки.
+
+## Интерфейсы
+
+### Командная строка
+
+Один файл или каталог передаётся через `--input`. Доступны рекурсивный обход, явный движок,
+модель, язык, аудиопоток, устройство, модуль выравнивания, ограничения SRT, принудительная
+пересборка и подробный журнал.
+
+`--max-chars-per-line` задаёт предпочтительную базовую длину строки, а `--line-length-gap` —
+допустимое адаптивное превышение. По умолчанию используются значения 42 и 8, поэтому жёсткая
+верхняя граница равна 50 символам. Коды завершения:
+
+- `0` — все файлы готовы, взяты из кеша или безопасно пропущены;
+- `1` — ошибка конфигурации или входных данных до запуска пакета;
+- `2` — пакет завершён, но один или несколько файлов имеют состояние `error`.
+
+### Веб-интерфейс
+
+![Локальный веб-интерфейс](resources/assets/web.png)
+
+Кнопки выбора файлов и каталогов открывают системный диалог на той же машине. Большие медиа
+не копируются через браузер и не читаются целиком в его память. Карточка файла показывает
+аудиопотоки, выбранную дорожку, текущую стадию, ход выполнения, результат и ошибку.
+
+SQLite сохраняет состояние задачи и файлов. После перезапуска незавершённая задача получает
+явное состояние `interrupted`; пользователь может повторить только неуспешные элементы.
+Успешные результаты повторно не запускаются. Поток SSE продолжается по курсору без повторной
+доставки уже принятых событий.
+
+## Ограничения
+
+- облачные API, автоматическое скачивание моделей и потоковое распознавание не реализованы;
+- диаризация и идентификация говорящих не реализованы;
+- редактор субтитров и встраивание SRT обратно в контейнер не реализованы;
+- после перезапуска тяжёлое распознавание не продолжается с середины файла;
+- `transformers` может держать полный массив несжатого аудио и не рекомендуется для длинных
+  записей;
+- изолированные процессы Parakeet и Qwen требуют заранее подготовленных сред и локальных моделей;
+- Qwen3 ForcedAligner требует явно определённый язык `en` или `ru`;
+- без размеченных эталонов проект не заявляет значения WER, CER и абсолютной ошибки временных
+  меток;
+- веб-интерфейс не предназначен для удалённого или многопользовательского доступа.
+
+## Локальная установка, запуск и проверка
+
+### Windows PowerShell
+
+Требования:
+
+- Windows и PowerShell;
+- Python 3.14 x64;
+- FFmpeg и `ffprobe` в `PATH` либо их явные пути;
+- локальная модель выбранного движка;
+- совместимая NVIDIA GPU и CUDA для штатного режима на видеокарте;
+- Python 3.11 x64 только для Qwen;
+- Node.js только для браузерных проверок.
+
+Проверка основных внешних команд:
 
 ```powershell
 ffmpeg -version
@@ -187,363 +385,116 @@ ffprobe -version
 py -3.14 --version
 ```
 
-## Установка
+Создание основного окружения:
 
 ```powershell
+Set-Location -LiteralPath "<repo-root>"
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item -LiteralPath .env.example -Destination .env
 ```
 
-`requirements.txt` перенесён из более свежего `ocr-local` и содержит полный закреплённый
-набор PyTorch/CUDA, Transformers, FastAPI и тестовых зависимостей. Для V1.2 добавлены точно
-закреплённые `faster-whisper 1.2.1`, `CTranslate2 4.8.1`, `PyAV 18.0.0` и
-`onnxruntime 1.28.0`; их Windows wheels проверены на Python 3.14.
+В `.env` необходимо заменить как минимум `<local-asr-model-path>`. Для выбранного профиля
+также задаются пути к изолированному Python, модели выравнивания и локальному кешу, если они
+используются. Файл модели должен существовать до запуска.
 
-Parakeet и Qwen нельзя устанавливать в основной venv из-за разных требований к Python,
-Transformers и PyTorch. Их точные зависимости находятся в
-`requirements-workers/parakeet.txt` и `requirements-workers/qwen.txt`, а изолированные
-runtime-ы создаются командой:
+Подготовка обоих изолированных окружений:
 
 ```powershell
 .\setup_workers.ps1
 ```
 
-Можно подготовить только один runtime: `.\setup_workers.ps1 -Parakeet` или
-`.\setup_workers.ps1 -Qwen`. Скрипт использует `resources/runtimes/parakeet` на Python 3.14
-и `resources/runtimes/qwen` на Python 3.11, затем выполняет `pip check`.
-
-Для воспроизводимого browser E2E дополнительно нужен Node.js:
+Только Parakeet или только Qwen:
 
 ```powershell
-npm ci
+.\setup_workers.ps1 -Parakeet
+.\setup_workers.ps1 -Qwen
 ```
 
-Проверка ML-стека:
+Распознавание одного файла основным профилем:
 
 ```powershell
-.\.venv\Scripts\python.exe -B -c "import torch, transformers, faster_whisper, ctranslate2, av; print(torch.__version__, torch.cuda.is_available(), transformers.__version__, faster_whisper.__version__, ctranslate2.__version__, av.__version__)"
-```
-
-## Переменные окружения
-
-Рабочий `.env`:
-
-```env
-ASR_BACKEND=faster-whisper
-ASR_MODEL_PATH=D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2
-ASR_ALIGNER=none
-ASR_ALIGNER_MODEL_PATH=
-ASR_WORKER_PYTHON=
-ASR_ALIGNER_WORKER_PYTHON=resources\runtimes\qwen\Scripts\python.exe
-QWEN_ASR_PYTHON=resources\runtimes\qwen\Scripts\python.exe
-PARAKEET_ASR_PYTHON=resources\runtimes\parakeet\Scripts\python.exe
-ASR_LANGUAGE=en
-ASR_AUDIO_LANGUAGE=eng
-ASR_AUDIO_STREAM_INDEX=
-ASR_DEVICE=auto
-ASR_QUANTIZATION=1
-ASR_ALLOW_CPU_FALLBACK=0
-ASR_KEEP_AUDIO=0
-ASR_LONG_FORM_WINDOW_SECONDS=300
-ASR_LONG_FORM_OVERLAP_SECONDS=2
-ASR_VAD_FILTER=1
-ASR_VAD_MIN_SILENCE_MS=600
-ASR_BEAM_SIZE=5
-ASR_CONDITION_ON_PREVIOUS_TEXT=1
-ASR_OUTPUT_DIR=
-FFMPEG_PATH=ffmpeg
-FFPROBE_PATH=ffprobe
-WEB_HOST=127.0.0.1
-WEB_PORT=7862
-WEB_JOB_DB=resources\state\jobs.sqlite3
-RUN_LOCAL_ASR_TEST=0
-ASR_TEST_MEDIA=
-ASR_TEST_LANGUAGE=en
-RUN_BATCH_ASR_TEST=0
-ASR_BATCH_TEST_MEDIA=
-RUN_MULTITRACK_ASR_TEST=0
-ASR_MULTITRACK_MEDIA=
-ASR_MULTITRACK_RU_STREAM_INDEX=0
-ASR_MULTITRACK_EN_STREAM_INDEX=1
-HF_HOME=D:\Projects\-ai-cache\huggingface
-HUGGINGFACE_HUB_CACHE=D:\Projects\-ai-cache\huggingface\hub
-```
-
-Значения являются локальными настройками. `ASR_ALIGNER` принимает `none` или
-`qwen3-forced-aligner`; второй вариант требует `ASR_ALIGNER_MODEL_PATH` и принимает общий
-ASR transcript любого backend-а. `ASR_WORKER_PYTHON` переопределяет Python worker-а выбранного
-ASR backend-а, а `ASR_ALIGNER_WORKER_PYTHON` независимо задаёт Python aligner worker-а.
-`QWEN_ASR_PYTHON` и `PARAKEET_ASR_PYTHON` остаются backend-специфичными путями по умолчанию.
-
-При `ASR_BACKEND=transformers` укажите
-`ASR_MODEL_PATH=D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3`; для
-Parakeet и Qwen используйте пути checkpoint-ов из раздела «Локальные модели».
-Long-form окно, overlap, VAD, beam и контекст входят в fingerprint faster-whisper-кеша.
-`FFMPEG_PATH` используется для подготовки и декодирования Transformers; faster-whisper
-декодирует подготовленный FLAC через PyAV. `WEB_HOST` принимает только loopback-адрес;
-внешний bind и порт вне диапазона 1–65535 отклоняются. `WEB_JOB_DB` задаёт SQLite-файл
-состояния web-задач. TTL очистки служебных job-workspace сейчас фиксирован кодом и не является
-переменной окружения. Секреты не нужны.
-
-## CLI
-
-Один файл:
-
-```powershell
-python -m speech_to_sub --input "D:\Media\lecture.mp4"
-```
-
-Папка:
-
-```powershell
-python -m speech_to_sub --input "D:\Media\Lectures" --recursive
-```
-
-Явный faster-whisper long-form профиль:
-
-```powershell
-python -m speech_to_sub `
-  --input "D:\Media\lecture.mkv" `
+.\.venv\Scripts\python.exe -m speech_to_sub `
+  --input "<media-file>" `
   --backend faster-whisper `
-  --model-path "D:\Projects\-ai\+automatic-speech-recognition\whisper-large-v3-ct2" `
-  --language auto `
-  --long-form-window-seconds 300 `
-  --long-form-overlap-seconds 2 `
-  --vad-min-silence-ms 600
+  --model-path "<local-faster-whisper-model-path>" `
+  --language auto
 ```
 
-Для диагностики циклических повторов доступны `--no-vad` и
-`--no-condition-on-previous-text`. Backend и модель можно менять в web UI; при выборе
-известного backend путь checkpoint переключается автоматически.
-
-Parakeet TDT v3:
+Рекурсивная обработка каталога:
 
 ```powershell
-python -m speech_to_sub `
-  --input "D:\Media\lecture.mkv" `
-  --backend parakeet-tdt-v3 `
-  --model-path "D:\Projects\-ai\+automatic-speech-recognition\parakeet-tdt-0.6b-v3" `
-  --worker-python-path "resources\runtimes\parakeet\Scripts\python.exe" `
+.\.venv\Scripts\python.exe -m speech_to_sub `
+  --input "<media-directory>" `
+  --recursive `
   --language ru
 ```
 
-Qwen3-ASR с ForcedAligner:
+Qwen3-ASR с выравниванием:
 
 ```powershell
-python -m speech_to_sub `
-  --input "D:\Media\lecture.mkv" `
+.\.venv\Scripts\python.exe -m speech_to_sub `
+  --input "<media-file>" `
   --backend qwen3-asr `
-  --model-path "D:\Projects\-ai\+automatic-speech-recognition\Qwen3-ASR-0.6B" `
+  --model-path "<local-qwen-asr-model-path>" `
   --aligner qwen3-forced-aligner `
-  --aligner-model-path "D:\Projects\-ai\+automatic-speech-recognition\Qwen3-ForcedAligner-0.6B" `
+  --aligner-model-path "<local-qwen-aligner-model-path>" `
   --worker-python-path "resources\runtimes\qwen\Scripts\python.exe" `
   --aligner-worker-python-path "resources\runtimes\qwen\Scripts\python.exe" `
   --language en
 ```
 
-При сочетании Parakeet с Qwen aligner укажите Parakeet Python через `--worker-python-path`,
-а Qwen Python независимо через `--aligner-worker-python-path`.
-
-Явный аудиопоток и CPU fallback:
-
-```powershell
-python -m speech_to_sub `
-  --input "D:\Media\lecture.mp4" `
-  --language en `
-  --audio-stream-index 0 `
-  --allow-cpu-fallback `
-  --verbose
-```
-
-## Веб-интерфейс
-
-![web.png](./resources/assets/web.png)
-
-Запуск:
+Запуск веб-интерфейса:
 
 ```powershell
 .\run_web.ps1
 ```
 
-или:
+После запуска откройте `http://127.0.0.1:7862`. Равнозначный запуск через модуль:
 
 ```powershell
-python -m speech_to_sub.web
+.\.venv\Scripts\python.exe -m speech_to_sub.web
 ```
 
-Адрес по умолчанию: http://127.0.0.1:7862. Разрешены только `127.0.0.0/8`, `localhost` и
-`::1`; удалённый режим без аутентификации намеренно отсутствует.
-
-Интерфейс предназначен для локального рабочего стола. Кнопки выбора открывают системные
-диалоги на машине backend; большие MP4 не копируются через multipart и не читаются целиком
-в память браузера.
-
-Пачка отображает:
-
-- исходный путь и найденные аудиопотоки;
-- выбранную дорожку;
-- стадии probe/extract/ASR/align/write;
-- прогресс и журнал;
-- итоговые SRT/sidecar либо понятную ошибку.
-
-Состояние хранится в `WEB_JOB_DB`. UI восстанавливает persisted queue после reload/restart,
-поддерживает cancel и retry только `error`/`cancelled` элементов. Успешные результаты при
-retry не запускаются повторно. Picker/refresh-запросы сериализуются и отменяют устаревшие
-ответы. SSE reconnect использует `Last-Event-ID`/cursor и не повторяет уже принятые события.
-
-## Тесты
-
-Основной набор не загружает реальную модель:
+Основные проверки без загрузки реальной модели:
 
 ```powershell
 .\.venv\Scripts\python.exe -B -m pytest
-```
-
-Browser E2E с изолированным fake ASR worker:
-
-```powershell
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m pip check
+node --check speech_to_sub\web\static\app.js
+npm ci
 npm test
 ```
 
-Тяжёлый локальный тест включается только явно и пишет результаты во временный каталог pytest:
+Тяжёлая проверка включается только явно и пишет результаты во временный каталог тестов:
 
 ```powershell
 $env:RUN_LOCAL_ASR_TEST = "1"
-$env:ASR_TEST_MEDIA = "D:\Media\short-sample.mp4"
+$env:ASR_TEST_MEDIA = "<media-file>"
 $env:ASR_TEST_LANGUAGE = "en"
 .\.venv\Scripts\python.exe -B -m pytest -m integration
 ```
 
-`ASR_TEST_MEDIA` лучше указывать на короткий репрезентативный фрагмент. Без флага тяжёлый
-тест пропускается и модель не загружается.
-
-Для opt-in проверки реальной пачки `done/done/error` и повторного кеш-прохода:
-
-```powershell
-$env:RUN_BATCH_ASR_TEST = "1"
-$env:ASR_BATCH_TEST_MEDIA = "D:\Media\short-sample.mp4"
-$env:ASR_TEST_LANGUAGE = "en"
-.\.venv\Scripts\python.exe -B -m pytest tests\test_integration_batch_asr.py -m integration
-```
-
-Для opt-in проверки реального контейнера с двумя дорожками:
-
-```powershell
-$env:RUN_MULTITRACK_ASR_TEST = "1"
-$env:ASR_MULTITRACK_MEDIA = "D:\Media\multi-track.mp4"
-$env:ASR_MULTITRACK_RU_STREAM_INDEX = "0"
-$env:ASR_MULTITRACK_EN_STREAM_INDEX = "1"
-.\.venv\Scripts\python.exe -B -m pytest tests\test_integration_multitrack_asr.py -m integration
-```
-
-### SonarQube и coverage
-
-В репозитории хранится безопасный шаблон `sonar-project.properties.example`. Рабочий файл
-локален и не содержит token:
+Для SonarQube скопируйте безопасный шаблон, задайте локальные значения только в окружении и
+запустите проектный сценарий:
 
 ```powershell
 Copy-Item -LiteralPath sonar-project.properties.example -Destination sonar-project.properties
-$env:SONAR_TOKEN = "<локальный-token>"
-```
-
-Рекомендуемый `$fix-sonar` runner сначала запускает pytest-cov, создаёт `coverage.xml`, затем
-выполняет свежий `sonar-scanner`, ждёт завершения CE task и получает issues, SECURITY,
-duplication и coverage через API:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File `
-  .codex\skills\fix-sonar\scripts\sonar_cycle.ps1
-```
-
-Для финальной проверки с нулём Sonar findings:
-
-```powershell
+$env:SONAR_HOST_URL = "<sonar-url>"
+$env:SONAR_TOKEN = "<sonar-token>"
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   .codex\skills\fix-sonar\scripts\sonar_cycle.ps1 -RequireClean
 ```
 
-`SONAR_HOST_URL` и `SONAR_TOKEN` можно задать в локальном `.env`; значения token не попадают
-в properties, логи или `SONAR.md`. `coverage.xml` и `.coverage` являются локальными
-артефактами и не добавляются в репозиторий. В SonarQube импортируется строковое и веточное
-покрытие Python из pytest-cov. Статические HTML/CSS/JavaScript продолжают анализироваться,
-но исключены только из строчной метрики coverage до появления LCOV; основной браузерный
-сценарий проверяется Playwright. `tsconfig.sonar.json` ограничивает семантический анализ
-JavaScript исходниками frontend и не позволяет scanner-у обходить изолированные ML-runtime-ы.
+Токен, рабочий `sonar-project.properties`, `.env`, отчёты покрытия и локальные окружения не
+добавляются в репозиторий. Подробности приведены в [SONAR.md](SONAR.md).
 
-### Подтверждённый прогон макета
+### Linux, macOS и WSL
 
-Для проверки были без изменения исходников созданы короткие аудиофрагменты из указанных
-пользователем файлов:
-
-| Язык | Контейнер | Результат |
-|---|---|---|
-| русский | MKV | валидные SRT и sidecar |
-| русский | MP4 | валидные SRT и sidecar; тег дорожки `eng` не повлиял на явный `language=ru` |
-| английский | MKV | валидные SRT и sidecar |
-| английский | MP4 | валидные SRT и sidecar; `auto` определил `en`, повторный запуск взят из кеша без загрузки весов |
-| русский + английский | multi-track MP4 | обе дорожки распознаны по явным индексам одним загруженным checkpoint |
-
-На проверочной машине использовались Python 3.14, PyTorch 2.11.0/CUDA 12.8,
-Transformers 5.6.2, faster-whisper 1.2.1 и CTranslate2 4.8.1. Числа скорости зависят от GPU
-и длины файла и не являются обещанием
-производительности. Отдельно проверены штатный `run_web.ps1`, health endpoint, SSE/reload,
-ранний `409` для второй задачи и запрет внешнего bind. Исторический быстрый набор V1.1:
-`89 passed, 3 skipped`; финальный быстрый набор V1.4 — `185 passed, 3 skipped`.
-Три opt-in интеграционные проверки завершились как `3 passed`: одиночное медиа, реальная
-пачка `done/done/error` с cache pass и multi-track RU/EN. Live batch
-`done/done/error` завершился как `partial`, а второй проход дал
-`cached/cached/error`. Playwright-сценарий reload/SSE завершился успешно.
-
-### Подтверждённый long-form benchmark V1.2
-
-На четырёх предоставленных RU/EN MP4/MKV faster-whisper получил RTF `0,132–0,219`, не создал
-ни одного граничного дубля и сохранил peak RSS delta в диапазоне `3,42–3,66 ГиБ`, включая
-часовой русский MKV. На одинаковом EN MP4 Transformers получил RTF `1,739` против `0,214`,
-peak RSS delta `9,61` против `3,43 ГиБ` и VRAM delta `8439` против `3788 МиБ`.
-
-Подробная методика, все показатели и JSON-артефакты находятся в
-[docs/benchmarks/v1.2](docs/benchmarks/v1.2/README.md).
-
-### Подтверждённые V1.3 и V1.4
-
-V1.3 проверена unit/TestClient и Playwright-сценарием: SQLite переживает повторное открытие,
-незавершённая задача после рестарта получает `interrupted`, cancel охватывает очередь и
-безопасные точки текущего backend-а, retry строит новую задачу только для неуспешных файлов.
-Source fingerprint сохраняется в файловом snapshot. Очистка затрагивает только устаревшие
-служебные `resources/work/job-*` с lock-маркером; пользовательские исходники не удаляются.
-
-V1.4 подтверждена реальными CUDA RU/EN smoke-прогонами Parakeet и Qwen. После устранения
-граничных дублей Parakeet обработал русское аудио длительностью 375,520 с при RTF `0,073654`
-и английское длительностью 338,152 с при RTF `0,077936`. Самостоятельные Qwen3-ASR и
-ForcedAligner обработали английское аудио длительностью 338,152 с при RTF `0,383180`;
-два ASR-сегмента до 180 секунд дали 832 монотонные словные метки, включая 44 слова после
-300-й секунды. Единый short benchmark содержит
-RU/EN JSON для всех четырёх backend-ов. Метрики охватывают RTF, RSS дерева процессов, VRAM,
-coverage, повторы и структуру SRT. Без эталонных расшифровок WER/CER и абсолютная ошибка
-таймингов не заявляются. Методика и артефакты: [docs/benchmarks/v1.4](docs/benchmarks/v1.4/README.md).
-
-Compatibility spike WhisperX выполнен в изолированном Python 3.11, но production-интеграция
-отложена: основной Python 3.14 не поддерживается, а локального воспроизводимого RU aligner,
-pyannote pipeline и NLTK-ресурсов нет. Решение и условия возврата описаны в
-[whisperx-spike.md](docs/benchmarks/v1.4/whisperx-spike.md); общий alignment registry остаётся
-стабильной точкой расширения.
-
-## Ограничения первой версии
-
-- Облачные API не реализуются.
-- Диаризация не реализована; forced alignment доступен через Qwen3 ForcedAligner.
-- Модель не скачивается автоматически.
-- Веб-интерфейс не предназначен для удалённого или многопользовательского доступа.
-- Незавершённый тяжёлый инференс не продолжается с середины после рестарта: задача становится
-  `interrupted` и может быть явно запущена через retry.
-- Архивная копия исходного аудиобитстрима и mux SRT обратно в видео отложены.
-- Без эталонных расшифровок benchmark не вычисляет WER/CER и абсолютную timestamp MAE.
-- Transformers сохраняет риск единого float32 PCM-массива и на измеренном long-form кейсе
-  работает медленнее реального времени; для длинных файлов используйте faster-whisper.
-- Изолированные worker-ы требуют заранее созданных runtime-ов и локальных checkpoint-ов;
-  автоматическая подготовка при обычном запуске запрещена.
-- Qwen3 ForcedAligner требует определённый язык `en`/`ru`; длинные ASR-сегменты он сам
-  делит на неперекрывающиеся части до 180 секунд.
-
-Полные требования и критерии приёмки находятся в [PRD.md](PRD.md).
+Эти окружения не входят в подтверждённый сценарий проекта. Команды PowerShell, пути
+`resources\runtimes\...` и закреплённые наборы зависимостей для изолированных процессов нельзя
+считать переносимыми на другие ОС без отдельной проверки. Для добавления поддержки требуется
+отдельно подтвердить установку FFmpeg, CUDA или процессорного режима, создание окружений моделей,
+запуск интерфейсов и полный набор тестов.
