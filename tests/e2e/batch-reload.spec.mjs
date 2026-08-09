@@ -76,6 +76,9 @@ test("рабочие панели растягиваются, настройки
   await expect(alignmentSettings).toHaveAttribute("open", "");
   await expect(longFormSettings).toHaveAttribute("open", "");
   await expect(advancedSettings).toHaveAttribute("open", "");
+  await expect(page.locator('label[for="force"] .field-hint')).toContainText(
+    "Обойти кеш готового SRT и распознавания",
+  );
 
   await page.getByLabel("Допуск длины строки SRT").fill("7");
   await page.getByLabel("Окно длинной записи, сек.").fill("420");
@@ -262,7 +265,27 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
     "Ошибка дорожки 03.wav",
   ]);
 
+  await page.locator("#advancedSettings > summary").click();
+  const force = page.getByLabel("Перезаписать целевые результаты");
+  await force.check();
+  await expect
+    .poll(async () => {
+      const settings = (await e2eState(request)).build_settings;
+      return settings.at(-1)?.force;
+    })
+    .toBe(true);
+  await expect(page.locator('.file-card[data-status="cached"]')).toHaveCount(0);
+  const storedBeforeStart = await page.evaluate(
+    (key) => JSON.parse(localStorage.getItem(key) ?? "{}"),
+    SETTINGS_KEY,
+  );
+  expect(storedBeforeStart).not.toHaveProperty("force");
+
   await page.getByRole("button", { name: "Запустить" }).click();
+  await expect(force).not.toBeChecked();
+  await expect
+    .poll(async () => (await e2eState(request)).process_settings[0]?.force)
+    .toBe(true);
   await expect(fileCard(page, "Лекция 01.mp4")).toHaveAttribute("data-status", "done");
   await expect(fileCard(page, "Разбор алгоритма №2.mkv")).toHaveAttribute(
     "data-status",
@@ -283,6 +306,8 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect(fileCard(page, "Разбор алгоритма №2.mkv")).toContainText("42%");
   await expect(language).toHaveValue("ru");
   await expect(device).toHaveValue("cpu");
+  await page.locator("#advancedSettings > summary").click();
+  await expect(force).not.toBeChecked();
   await expect(language).toBeDisabled();
   await expect(device).toBeDisabled();
   await expect(cancel).toBeEnabled();
@@ -345,6 +370,9 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect(fileCard(page, "Разбор алгоритма №2.mkv")).toContainText("42%");
   await expect.poll(async () => (await e2eState(request)).retry_entered).toBe(true);
   expect(await e2eState(request)).toMatchObject({ calls: [PATHS, PATHS.slice(1)] });
+  await expect
+    .poll(async () => (await e2eState(request)).process_settings[1]?.force)
+    .toBe(false);
 
   const release = await request.post("/__e2e__/release");
   expect(release.ok()).toBeTruthy();

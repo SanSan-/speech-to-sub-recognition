@@ -17,6 +17,7 @@ const backendSelect = document.getElementById("backend");
 const modelPathInput = document.getElementById("modelPath");
 const cloudSettings = document.getElementById("cloudSettings");
 const allowCloudProcessingInput = document.getElementById("allowCloudProcessing");
+const forceInput = document.getElementById("force");
 const openAiAvailability = document.getElementById("openAiAvailability");
 const alignerSelect = document.getElementById("aligner");
 const alignerModelPathInput = document.getElementById("alignerModelPath");
@@ -369,12 +370,15 @@ function applySettingValues(values) {
   }
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     const key = input.dataset.setting;
-    if (key !== "allow_cloud_processing" && Object.hasOwn(values, key)) {
+    if (!["allow_cloud_processing", "force"].includes(key) && Object.hasOwn(values, key)) {
       setInputValue(input, values[key]);
     }
   });
   if (allowCloudProcessingInput) {
     allowCloudProcessingInput.checked = false;
+  }
+  if (forceInput) {
+    forceInput.checked = false;
   }
 }
 
@@ -389,6 +393,7 @@ function loadStoredSettings() {
       return null;
     }
     delete parsed.allow_cloud_processing;
+    delete parsed.force;
     return parsed;
   } catch {
     appendLog("Не удалось прочитать сохранённые настройки.");
@@ -420,11 +425,21 @@ function persistSettings() {
     if (window.localStorage) {
       const settings = readSettings();
       delete settings.allow_cloud_processing;
+      delete settings.force;
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     }
   } catch (error) {
     // Ошибка хранилища не должна блокировать локальное распознавание.
   }
+}
+
+function consumeOneShotForce() {
+  const allowed = Boolean(forceInput?.checked);
+  if (forceInput) {
+    forceInput.checked = false;
+  }
+  persistSettings();
+  return allowed;
 }
 
 function applyBackendModelDefault() {
@@ -1189,7 +1204,7 @@ async function transcribe() {
   }
   const cloud = isCloudBackend();
   const requestSettings = readSettings();
-  persistSettings();
+  consumeOneShotForce();
   if (cloud) {
     allowCloudProcessingInput.checked = false;
   }
@@ -1269,6 +1284,7 @@ async function retryFailed() {
   const sourceJobId = state.displayedJobId;
   const cloud = isCloudBackend();
   const cloudAllowed = Boolean(allowCloudProcessingInput.checked);
+  const forceAllowed = consumeOneShotForce();
   if (cloud) {
     allowCloudProcessingInput.checked = false;
   }
@@ -1279,7 +1295,7 @@ async function retryFailed() {
   try {
     const result = await postJson(
       `/api/jobs/${encodeURIComponent(sourceJobId)}/retry`,
-      { allow_cloud_processing: cloudAllowed },
+      { allow_cloud_processing: cloudAllowed, force: forceAllowed },
     );
     state.jobId = result.job_id;
     state.displayedJobId = result.job_id;

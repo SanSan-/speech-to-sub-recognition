@@ -53,6 +53,8 @@ class FakeBatchService:
         self.retry_entered = threading.Event()
         self.released = threading.Event()
         self.calls: list[list[str]] = []
+        self.build_settings: list[dict[str, Any]] = []
+        self.process_settings: list[dict[str, Any]] = []
         self._items = {
             path: self._make_item(path, index)
             for index, path in enumerate(FAKE_PATHS)
@@ -77,8 +79,8 @@ class FakeBatchService:
         paths: list[str],
         settings: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        del settings
         with self._lock:
+            self.build_settings.append(copy.deepcopy(settings))
             return [copy.deepcopy(self._items[path]) for path in paths]
 
     def unload(self) -> None:
@@ -99,6 +101,7 @@ class FakeBatchService:
             raise RuntimeError("E2E ожидает именованный cancel_check")
         with self._lock:
             self.calls.append(list(paths))
+            self.process_settings.append(copy.deepcopy(settings))
             call_number = len(self.calls)
 
         if call_number == 1:
@@ -184,12 +187,16 @@ class FakeBatchService:
     def state(self) -> dict[str, Any]:
         with self._lock:
             calls = copy.deepcopy(self.calls)
+            build_settings = copy.deepcopy(self.build_settings)
+            process_settings = copy.deepcopy(self.process_settings)
         return {
             "entered": self.entered.is_set(),
             "cancel_seen": self.cancel_seen.is_set(),
             "retry_entered": self.retry_entered.is_set(),
             "released": self.released.is_set(),
             "calls": calls,
+            "build_settings": build_settings,
+            "process_settings": process_settings,
         }
 
     def release(self) -> dict[str, bool]:

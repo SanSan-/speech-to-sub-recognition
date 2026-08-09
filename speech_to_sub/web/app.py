@@ -326,6 +326,7 @@ def retry_job(job_id: str, payload: RetryRequest | None = None) -> dict[str, Any
             job_id,
             service_api.process_paths,
             item_builder=service_api.build_items,
+            force=bool(payload and payload.force),
             reservation_token=reservation,
         )
     except JobNotFoundError as exc:

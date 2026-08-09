@@ -432,7 +432,144 @@ def test_cached_job_never_prepares_or_downloads_a_model(
     assert normalized_sources == [media.resolve()]
 
 
-def test_layout_change_requires_force_and_reuses_recognition_cache(
+def test_force_bypasses_card_cache_and_runs_recognition_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "force.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    messages: list[str] = []
+    callbacks = (lambda _event: None, messages.append)
+
+    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    cards = service.build_items([media], {"language": "ru", "force": True})
+    forced = service.process_paths(
+        [media],
+        {"language": "ru", "force": True},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert first[0]["state"] == "done"
+    assert cards[0]["state"] == "idle"
+    assert cards[0]["stage"] == "Полное повторное распознавание"
+    assert cards[0]["cached"] is False
+    assert forced[0]["state"] == "done"
+    assert len(backend.calls) == 2
+    assert normalized_sources == [media.resolve(), media.resolve()]
+    assert any("режим перезаписи обходит кеши результатов" in message for message in messages)
+    assert not any("SRT пересобран из кеша распознавания" in message for message in messages)
+
+
+def test_force_replaces_srt_sidecar_and_saved_audio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "force-artifacts.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+
+    class VersionedBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.audio_versions: list[bytes] = []
+
+        def transcribe(
+            self,
+            audio_path: Path,
+            settings: ProcessingSettings,
+            duration: float,
+            progress_callback: Any = None,
+            cancel_check: Any = None,
+        ) -> Transcript:
+            del cancel_check
+            self.calls.append(audio_path)
+            self.durations.append(duration)
+            self.audio_versions.append(audio_path.read_bytes())
+            text = "Первая версия." if len(self.calls) == 1 else "Вторая версия."
+            if progress_callback:
+                progress_callback(50)
+            return Transcript(
+                text=text,
+                language=settings.language,
+                duration=duration,
+                segments=(TranscriptSegment(0.0, 1.5, text),),
+                model=str(settings.model_path),
+                device="cpu",
+                quantized=False,
+                metadata={
+                    "runtime": self.backend_id,
+                    "engine_version": TEST_ENGINE_VERSION,
+                    "compute_type": "float32",
+                },
+            )
+
+    backend = VersionedBackend()
+    settings = {"language": "ru", "keep_audio": True}
+    callbacks = (lambda _event: None, lambda _message: None)
+    first = service.process_paths([media], settings, *callbacks, backend=backend)
+    srt_path = Path(first[0]["srt_output"])
+    sidecar_path = Path(first[0]["sidecar_output"])
+    audio_path = Path(first[0]["audio_output"])
+
+    def normalize_second_version(
+        source: str | Path,
+        destination: str | Path,
+        stream: AudioStreamInfo,
+        ffmpeg_path: str | Path = "ffmpeg",
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        del stream, ffmpeg_path
+        assert overwrite is True
+        source_path = Path(source)
+        destination_path = Path(destination)
+        normalized_sources.append(source_path)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_path.write_bytes(b"normalized-audio-v2")
+        return destination_path
+
+    monkeypatch.setattr(service, "normalize_audio", normalize_second_version)
+    forced = service.process_paths(
+        [media],
+        {**settings, "force": True},
+        *callbacks,
+        backend=backend,
+    )
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    assert forced[0]["state"] == "done"
+    assert "Вторая версия." in srt_path.read_text(encoding="utf-8")
+    assert "Первая версия." not in srt_path.read_text(encoding="utf-8")
+    assert sidecar["transcript"]["text"] == "Вторая версия."
+    assert audio_path.read_bytes() == b"normalized-audio-v2"
+    assert backend.audio_versions == [b"normalized-audio", b"normalized-audio-v2"]
+    assert normalized_sources == [media.resolve(), media.resolve()]
+
+
+@pytest.mark.parametrize("invalid_force", ["true", 1])
+def test_force_requires_a_boolean_in_service_entrypoints(
+    tmp_path: Path,
+    invalid_force: Any,
+) -> None:
+    media = tmp_path / "force-type.mp4"
+    media.write_bytes(b"source")
+    settings = {"force": invalid_force}
+
+    with pytest.raises(ValidationError, match="force должна быть логической"):
+        service.build_items([media], settings)
+    with pytest.raises(ValidationError, match="force должна быть логической"):
+        service.process_paths(
+            [media],
+            settings,
+            lambda _event: None,
+            lambda _message: None,
+        )
+
+
+def test_layout_change_requires_force_and_runs_recognition_again(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -469,8 +606,8 @@ def test_layout_change_requires_force_and_reuses_recognition_cache(
 
     assert rebuilt[0]["state"] == "done"
     assert srt_path.read_bytes() == original_srt
-    assert len(backend.calls) == 1
-    assert normalized_sources == [media.resolve()]
+    assert len(backend.calls) == 2
+    assert normalized_sources == [media.resolve(), media.resolve()]
     assert rebuilt_sidecar["recognition_settings"] == first_sidecar["recognition_settings"]
     assert rebuilt_sidecar["layout_settings"]["line_length_gap"] == 0
 
@@ -793,14 +930,23 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
     monkeypatch.setattr(service, "get_aligner", lambda _name: aligner)
 
     messages: list[str] = []
+    settings = {
+        "backend": "faster-whisper",
+        "aligner": "qwen3-forced-aligner",
+        "aligner_model_path": str(tmp_path / "aligner"),
+        "language": "ru",
+    }
     result = service.process_paths(
         [media],
-        {
-            "backend": "faster-whisper",
-            "aligner": "qwen3-forced-aligner",
-            "aligner_model_path": str(tmp_path / "aligner"),
-            "language": "ru",
-        },
+        settings,
+        lambda _event: None,
+        messages.append,
+        backend=backend,
+        cancel_check=lambda: False,
+    )
+    forced = service.process_paths(
+        [media],
+        {**settings, "force": True},
         lambda _event: None,
         messages.append,
         backend=backend,
@@ -808,10 +954,13 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
     )
 
     assert result[0]["state"] == "done"
-    assert len(aligner.calls) == 1
+    assert forced[0]["state"] == "done"
+    assert len(backend.calls) == 2
+    assert len(aligner.calls) == 2
     assert aligner.calls[0][1] == pytest.approx(1.5)
-    assert aligner.unload_calls == 1
-    assert backend.unload_calls == 1
+    assert aligner.calls[1][1] == pytest.approx(1.5)
+    assert aligner.unload_calls == 2
+    assert backend.unload_calls == 2
     assert any(
         "ForcedAligner не вернул слова для сегмента 449" in message
         and "faster-whisper" in message

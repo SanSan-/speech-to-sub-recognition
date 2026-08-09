@@ -145,8 +145,8 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.5.0"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.0"
+    assert health.json()["version"] == "1.5.1"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.1"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -596,6 +596,44 @@ def test_web_transcribe_smoke_accepts_every_registered_backend(
     assert snapshot["status"] == "ok"
     assert snapshot["settings"]["backend"] == backend
     assert fake_service.build_calls[0][1]["backend"] == backend
+
+
+def test_web_transcribe_forwards_force_to_the_background_job(
+    tmp_path: Path,
+    fake_service: FakeService,
+) -> None:
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/transcribe",
+        json={
+            "paths": [str(tmp_path / "force.mp4")],
+            "settings": {"force": True},
+        },
+    )
+
+    assert response.status_code == 200
+    job = web_app.job_registry.get(response.json()["job_id"])
+    assert job.finished.wait(timeout=3)
+    assert fake_service.build_calls[0][1]["force"] is True
+    assert job.snapshot(active=False)["settings"]["force"] is True
+
+
+@pytest.mark.parametrize("invalid_force", ["true", 1])
+def test_web_rejects_non_boolean_force(
+    fake_service: FakeService,
+    invalid_force: Any,
+) -> None:
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/transcribe",
+        json={
+            "paths": [r"D:\Media\force.mp4"],
+            "settings": {"force": invalid_force},
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.build_calls == []
 
 
 def test_web_settings_reject_unknown_backend(fake_service: FakeService) -> None:

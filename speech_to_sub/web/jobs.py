@@ -433,6 +433,7 @@ class JobRegistry:
         processor: ProcessPaths,
         *,
         item_builder: BuildItems | None = None,
+        force: bool = False,
         reservation_token: str | None = None,
     ) -> BatchJob:
         """Создаёт новую задачу только для неуспешных элементов исходной."""
@@ -448,6 +449,8 @@ class JobRegistry:
             raise JobStateError("В задаче нет файлов для повторного запуска.")
         paths = [str(item["path"]) for item in failed_items]
         settings = copy.deepcopy(snapshot.get("settings") or {})
+        if "force" in settings or force:
+            settings["force"] = force
         retry_items = _refresh_retry_items(
             failed_items,
             paths,

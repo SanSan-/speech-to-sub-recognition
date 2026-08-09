@@ -88,7 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--keep-audio", action="store_true", default=None)
-    parser.add_argument("--force", action="store_true", default=None)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=None,
+        help=(
+            "Обойти кеш готового SRT и распознавания, заново выполнить распознавание и "
+            "выбранное выравнивание, затем атомарно заменить целевые результаты."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", default=None)
     return parser
 

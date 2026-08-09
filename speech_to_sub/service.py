@@ -168,6 +168,7 @@ def build_items(
 ) -> list[dict[str, Any]]:
     """Строит карточки web UI без загрузки ASR-модели."""
     settings = ProcessingSettings.from_mapping(settings_values)
+    _validate_force_setting(settings)
     media_paths = discover_media((Path(value) for value in paths), settings.recursive)
     common_root = _common_input_root(media_paths)
     output_map = _build_output_map(media_paths, settings, common_root)
@@ -201,29 +202,55 @@ def build_items(
             item["probe"] = probe.to_dict()
             item["selected_stream"] = stream.to_dict()
             item["warning"] = warning
-            fingerprints = _cache_fingerprints_for_lookup(
-                outputs,
-                settings,
-                stream.ordinal,
-                backend=get_backend(settings.backend),
+            _classify_item_from_outputs(
+                item,
+                outputs=outputs,
+                settings=settings,
+                source=source,
+                stream=stream,
             )
-            cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
-            if cache_valid and settings.keep_audio and not _has_saved_audio(outputs):
-                item.update(stage="Требуется сохранить аудио")
-            elif cache_valid:
-                item.update(state="cached", stage="Кеш", progress=100, cached=True)
-            elif outputs.srt_path.exists() and not settings.force:
-                item.update(state="skipped", stage="Существующий SRT", progress=100, skipped=True)
-            elif fingerprints and _load_cached_recognition(
-                outputs,
-                source,
-                fingerprints[0],
-            ):
-                item.update(stage="Пересборка SRT из кеша распознавания")
         except Exception as exc:
             item.update(state="error", stage="Ошибка проверки", progress=100, error=str(exc))
         items.append(item)
     return items
+
+
+def _classify_item_from_outputs(
+    item: dict[str, Any],
+    *,
+    outputs: OutputPaths,
+    settings: ProcessingSettings,
+    source: dict[str, Any],
+    stream: AudioStreamInfo,
+) -> None:
+    """Определяет состояние карточки по флагу перезаписи и кешу результатов."""
+    if settings.force:
+        item.update(stage="Полное повторное распознавание")
+        return
+    fingerprints = _cache_fingerprints_for_lookup(
+        outputs,
+        settings,
+        stream.ordinal,
+        backend=get_backend(settings.backend),
+    )
+    cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
+    if cache_valid and settings.keep_audio and not _has_saved_audio(outputs):
+        item.update(stage="Требуется сохранить аудио")
+    elif cache_valid:
+        item.update(state="cached", stage="Кеш", progress=100, cached=True)
+    elif outputs.srt_path.exists():
+        item.update(
+            state="skipped",
+            stage="Существующий SRT",
+            progress=100,
+            skipped=True,
+        )
+    elif fingerprints and _load_cached_recognition(
+        outputs,
+        source,
+        fingerprints[0],
+    ):
+        item.update(stage="Пересборка SRT из кеша распознавания")
 
 
 def process_paths(
@@ -633,6 +660,13 @@ def _reuse_existing_result(
     path = context.path
     settings = context.settings
     outputs = context.outputs
+    if settings.force:
+        _write_log(
+            context.log,
+            f"Файл {context.index}/{context.total}: {path.name} — "
+            "режим перезаписи обходит кеши результатов; выполняется полное распознавание.",
+        )
+        return None, None
     fingerprints = _cache_fingerprints_for_lookup(
         outputs,
         settings,
@@ -640,7 +674,7 @@ def _reuse_existing_result(
         backend=backend if backend is not None else get_backend(settings.backend),
     )
     cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
-    if not settings.force and cache_valid:
+    if cache_valid:
         if settings.keep_audio and not _has_saved_audio(outputs):
             _save_cached_audio(
                 context,
@@ -673,7 +707,7 @@ def _reuse_existing_result(
             ),
             None,
         )
-    if outputs.srt_path.exists() and not settings.force:
+    if outputs.srt_path.exists():
         _emit_file(
             context.emit_event,
             path,
@@ -1490,11 +1524,17 @@ def _backup_path(target: Path, token: str) -> Path:
 
 
 def _validate_settings(settings: ProcessingSettings) -> None:
+    _validate_force_setting(settings)
     _validate_backend_settings(settings)
     _validate_output_settings(settings)
     _validate_chunk_settings(settings)
     _validate_long_form_settings(settings)
     _validate_decoding_settings(settings)
+
+
+def _validate_force_setting(settings: ProcessingSettings) -> None:
+    if not isinstance(settings.force, bool):
+        raise ValidationError("Настройка force должна быть логической.")
 
 
 def _validate_backend_settings(settings: ProcessingSettings) -> None:

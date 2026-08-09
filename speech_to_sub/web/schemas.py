@@ -61,7 +61,7 @@ class ProcessingSettingsPayload(ApiModel):
     allow_cloud_processing: bool = Field(default=False, strict=True)
     openai_model: Literal["whisper-1"] = DEFAULT_OPENAI_MODEL
     keep_audio: bool = False
-    force: bool = False
+    force: bool = Field(default=False, strict=True)
     recursive: bool = False
     output_dir: str | None = Field(default=None, max_length=4096)
     verbose: bool = False
@@ -179,9 +179,10 @@ class TranscribeRequest(ApiModel):
 
 
 class RetryRequest(ApiModel):
-    """Явное разрешение повторной отправки аудио во внешний сервис."""
+    """Одноразовые разрешения повторной обработки."""
 
     allow_cloud_processing: bool = Field(default=False, strict=True)
+    force: bool = Field(default=False, strict=True)
 
 
 def _validate_paths(values: list[str]) -> list[str]:
