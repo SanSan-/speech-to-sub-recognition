@@ -6,10 +6,12 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, TypedDict
 
 from speech_to_sub.constants import (
+    CLOUD_ASR_BACKENDS,
     DEFAULT_ASR_BACKEND,
-    DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_ALIGNER,
     DEFAULT_AUDIO_LANGUAGE,
+    DEFAULT_BACKEND_MODEL_PATHS,
+    DEFAULT_BEAM_SIZE,
     DEFAULT_CHUNK_LENGTH_SECONDS,
     DEFAULT_LANGUAGE,
     DEFAULT_LINE_LENGTH_GAP,
@@ -18,10 +20,10 @@ from speech_to_sub.constants import (
     DEFAULT_MAX_CHARS_PER_LINE,
     DEFAULT_MAX_CPS,
     DEFAULT_MODEL_PATH,
+    DEFAULT_OPENAI_MODEL,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_STRIDE_LENGTH_SECONDS,
     DEFAULT_VAD_MIN_SILENCE_MS,
-    DEFAULT_BEAM_SIZE,
 )
 from speech_to_sub.exceptions import ValidationError
 
@@ -31,7 +33,7 @@ class RuntimeSignature(TypedDict):
 
     backend: str
     engine_version: str
-    device: Literal["cpu", "cuda"]
+    device: Literal["cpu", "cuda", "cloud"]
     compute_type: str
     quantized: bool
 
@@ -218,6 +220,9 @@ class ProcessingSettings:
 
     backend: str = DEFAULT_ASR_BACKEND
     model_path: Path = field(default_factory=lambda: DEFAULT_MODEL_PATH)
+    auto_download_model: bool = True
+    allow_cloud_processing: bool = False
+    openai_model: str = DEFAULT_OPENAI_MODEL
     aligner: str = DEFAULT_ALIGNER
     aligner_model_path: Path | None = None
     worker_python_path: Path | None = None
@@ -253,6 +258,7 @@ class ProcessingSettings:
         data = dict(values)
         _normalize_choice_field(data, "backend")
         _normalize_model_path(data)
+        _normalize_choice_field(data, "openai_model")
         _normalize_choice_field(data, "aligner")
         _normalize_aligner_model_path(data)
         for key in ("worker_python_path", "aligner_worker_python_path", "output_dir"):
@@ -291,12 +297,16 @@ def _normalize_model_path(data: dict[str, Any]) -> None:
     if "backend" not in data:
         data.pop("model_path", None)
         return
+    backend = data["backend"]
+    if backend in CLOUD_ASR_BACKENDS:
+        data["model_path"] = DEFAULT_MODEL_PATH
+        return
     try:
-        data["model_path"] = DEFAULT_BACKEND_MODEL_PATHS[data["backend"]]
+        data["model_path"] = DEFAULT_BACKEND_MODEL_PATHS[backend]
     except KeyError as exc:
-        variants = ", ".join(DEFAULT_BACKEND_MODEL_PATHS)
+        variants = ", ".join((*DEFAULT_BACKEND_MODEL_PATHS, *CLOUD_ASR_BACKENDS))
         raise ValidationError(
-            f"Неизвестный ASR backend '{data['backend']}'. Поддерживаются: {variants}."
+            f"Неизвестный ASR backend '{backend}'. Поддерживаются: {variants}."
         ) from exc
 
 

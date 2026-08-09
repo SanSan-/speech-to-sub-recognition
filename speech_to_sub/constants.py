@@ -20,6 +20,18 @@ DEFAULT_BACKEND_MODEL_PATHS = {
     "parakeet-tdt-v3": DEFAULT_PARAKEET_MODEL_PATH,
     "qwen3-asr": DEFAULT_QWEN_MODEL_PATH,
 }
+DEFAULT_BACKEND_MODEL_REPOSITORIES = {
+    "transformers": "openai/whisper-large-v3",
+    "faster-whisper": "Systran/faster-whisper-large-v3",
+    "parakeet-tdt-v3": "nvidia/parakeet-tdt-0.6b-v3",
+    "qwen3-asr": "Qwen/Qwen3-ASR-0.6B",
+}
+DEFAULT_ALIGNER_MODEL_REPOSITORIES = {
+    "qwen3-forced-aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+}
+CLOUD_ASR_BACKENDS = frozenset({"openai-api"})
+DEFAULT_OPENAI_MODEL = "whisper-1"
+SUPPORTED_OPENAI_MODELS = frozenset({DEFAULT_OPENAI_MODEL})
 DEFAULT_ASR_BACKEND = "faster-whisper"
 DEFAULT_ALIGNER = "none"
 DEFAULT_MODEL_PATH = DEFAULT_FASTER_WHISPER_MODEL_PATH

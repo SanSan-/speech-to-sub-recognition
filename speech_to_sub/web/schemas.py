@@ -20,6 +20,7 @@ from speech_to_sub.constants import (
     DEFAULT_MAX_CHARS_PER_LINE,
     DEFAULT_MAX_CPS,
     DEFAULT_MODEL_PATH,
+    DEFAULT_OPENAI_MODEL,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_STRIDE_LENGTH_SECONDS,
     DEFAULT_VAD_MIN_SILENCE_MS,
@@ -55,7 +56,10 @@ class ProcessingSettingsPayload(ApiModel):
     audio_stream_index: int | None = Field(default=None, ge=0)
     device: Literal["auto", "cuda", "cpu"] = "auto"
     quantization_enabled: bool = True
+    auto_download_model: bool = True
     allow_cpu_fallback: bool = False
+    allow_cloud_processing: bool = Field(default=False, strict=True)
+    openai_model: Literal["whisper-1"] = DEFAULT_OPENAI_MODEL
     keep_audio: bool = False
     force: bool = False
     recursive: bool = False
@@ -123,7 +127,10 @@ class ProcessingSettingsPayload(ApiModel):
     @model_validator(mode="after")
     def validate_audio_windows(self) -> ProcessingSettingsPayload:
         """Проверяет, что перекрытие короче основного окна ASR."""
-        if "model_path" not in self.model_fields_set:
+        if (
+            "model_path" not in self.model_fields_set
+            and self.backend in DEFAULT_BACKEND_MODEL_PATHS
+        ):
             self.model_path = str(DEFAULT_BACKEND_MODEL_PATHS[self.backend])
         if (
             self.aligner == "qwen3-forced-aligner"
@@ -169,6 +176,12 @@ class TranscribeRequest(ApiModel):
     @classmethod
     def validate_paths(cls, values: list[str]) -> list[str]:
         return _validate_paths(values)
+
+
+class RetryRequest(ApiModel):
+    """Явное разрешение повторной отправки аудио во внешний сервис."""
+
+    allow_cloud_processing: bool = Field(default=False, strict=True)
 
 
 def _validate_paths(values: list[str]) -> list[str]:

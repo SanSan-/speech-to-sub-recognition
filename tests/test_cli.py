@@ -78,6 +78,7 @@ def test_main_returns_batch_exit_codes(
             "--beam-size",
             "3",
             "--no-condition-on-previous-text",
+            "--no-auto-download-model",
             "--force",
         ]
     )
@@ -97,6 +98,7 @@ def test_main_returns_batch_exit_codes(
     assert received["settings"]["vad_filter"] is False
     assert received["settings"]["beam_size"] == 3
     assert received["settings"]["condition_on_previous_text"] is False
+    assert received["settings"]["auto_download_model"] is False
 
 
 @pytest.mark.parametrize(
@@ -153,6 +155,41 @@ def test_cli_backend_and_aligner_select_matching_local_defaults(
     ) == 0
     assert Path(received["model_path"]) == DEFAULT_QWEN_MODEL_PATH
     assert Path(received["aligner_model_path"]) == DEFAULT_QWEN_ALIGNER_MODEL_PATH
+
+
+def test_cli_selects_openai_with_explicit_cloud_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_cli_dependencies(monkeypatch)
+    monkeypatch.delenv("ASR_MODEL_PATH", raising=False)
+    received: dict[str, Any] = {}
+
+    def fake_process(
+        _paths: list[Path],
+        settings: dict[str, Any],
+        emit_event: Callable[[dict[str, Any]], None],
+        log: Callable[[str], None],
+    ) -> list[dict[str, str]]:
+        del emit_event, log
+        received.update(settings)
+        return [{"state": "done"}]
+
+    monkeypatch.setattr(cli, "process_paths", fake_process)
+
+    assert cli.main(
+        [
+            "--input",
+            "sample.mp4",
+            "--backend",
+            "openai-api",
+            "--allow-cloud-processing",
+            "--openai-model",
+            "whisper-1",
+        ]
+    ) == 0
+    assert received["backend"] == "openai-api"
+    assert received["allow_cloud_processing"] is True
+    assert received["openai_model"] == "whisper-1"
 
 
 def test_parser_returns_configuration_code_for_invalid_invocation(

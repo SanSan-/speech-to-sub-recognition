@@ -260,6 +260,45 @@ def test_cache_fingerprints_separate_recognition_and_layout_settings(tmp_path: P
     assert build_source_fingerprint(source_path)["sha256"] != source["sha256"]
 
 
+def test_cloud_fingerprint_excludes_local_runtime_options_and_permission(
+    tmp_path: Path,
+) -> None:
+    settings = ProcessingSettings(
+        backend="openai-api",
+        model_path=tmp_path / "ignored-local-model",
+        allow_cloud_processing=True,
+        openai_model="whisper-1",
+        device="cuda",
+        quantization_enabled=True,
+    )
+    runtime = {
+        "backend": "openai-api",
+        "engine_version": "2.14.0",
+        "device": "cloud",
+        "compute_type": "remote:whisper-1",
+        "quantized": False,
+    }
+
+    fingerprint = build_recognition_fingerprint(settings, 0, runtime=runtime)
+
+    assert fingerprint["openai_model"] == "whisper-1"
+    assert "model_path" not in fingerprint
+    assert "requested_device" not in fingerprint
+    assert "requested_quantization_enabled" not in fingerprint
+    assert build_recognition_fingerprint(
+        replace(
+            settings,
+            model_path=tmp_path / "other",
+            allow_cloud_processing=False,
+            auto_download_model=False,
+            device="cpu",
+            quantization_enabled=False,
+        ),
+        0,
+        runtime=runtime,
+    ) == fingerprint
+
+
 def test_sidecar_round_trip_and_match_validation(tmp_path: Path) -> None:
     sidecar_path = tmp_path / "sample.asr.json"
     source = {"sha256": "source-hash"}

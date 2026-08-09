@@ -17,8 +17,8 @@ def test_unknown_backend_without_explicit_model_is_domain_error() -> None:
         ProcessingSettings.from_mapping({"backend": "unknown"})
 
 
-def test_package_version_matches_v142_milestone() -> None:
-    assert __version__ == "1.4.2"
+def test_package_version_matches_v150_milestone() -> None:
+    assert __version__ == "1.5.0"
 
 
 def test_processing_settings_round_trip_subtitle_layout_limits() -> None:
@@ -31,6 +31,23 @@ def test_processing_settings_round_trip_subtitle_layout_limits() -> None:
     assert settings.max_cps == 16.5
     assert settings.to_dict()["line_length_gap"] == 6
     assert settings.to_dict()["max_cps"] == 16.5
+
+
+def test_cloud_settings_round_trip_with_ignored_compatibility_model_path() -> None:
+    settings = ProcessingSettings.from_mapping(
+        {
+            "backend": "OPENAI-API",
+            "allow_cloud_processing": True,
+            "openai_model": "WHISPER-1",
+            "auto_download_model": False,
+        }
+    )
+
+    assert settings.backend == "openai-api"
+    assert settings.allow_cloud_processing is True
+    assert settings.openai_model == "whisper-1"
+    assert settings.auto_download_model is False
+    assert settings.to_dict()["model_path"]
 
 
 def test_transcript_round_trip_from_sidecar_mapping() -> None:

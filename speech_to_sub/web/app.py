@@ -48,6 +48,7 @@ from speech_to_sub.web.schemas import (
     PickRequest,
     ProcessingSettingsPayload,
     RefreshRequest,
+    RetryRequest,
     TranscribeRequest,
 )
 
@@ -194,11 +195,14 @@ def health() -> dict[str, Any]:
 def ui_config() -> dict[str, Any]:
     """Возвращает несекретные значения и варианты интерфейса."""
     settings, settings_error = _environment_settings()
+    defaults = settings.model_dump(mode="json")
+    defaults["allow_cloud_processing"] = False
     backend_labels = {
         "transformers": "Transformers / PyTorch",
         "faster-whisper": "faster-whisper / CTranslate2",
         "parakeet-tdt-v3": "Parakeet TDT v3",
         "qwen3-asr": "Qwen3-ASR 0.6B",
+        "openai-api": "OpenAI API / whisper-1",
     }
     backend_model_paths = {
         "transformers": str(DEFAULT_TRANSFORMERS_MODEL_PATH),
@@ -207,7 +211,8 @@ def ui_config() -> dict[str, Any]:
         "qwen3-asr": str(DEFAULT_QWEN_MODEL_PATH),
     }
     payload: dict[str, Any] = {
-        "defaults": settings.model_dump(mode="json"),
+        "defaults": defaults,
+        "openai_configured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
         "backends": [
             {
                 "value": name,
@@ -296,10 +301,22 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 
 @app.post(
     "/api/jobs/{job_id}/retry",
-    responses={404: _JOB_NOT_FOUND_RESPONSE, 409: _JOB_CONFLICT_RESPONSE},
+    responses={
+        400: _BAD_REQUEST_RESPONSE,
+        404: _JOB_NOT_FOUND_RESPONSE,
+        409: _JOB_CONFLICT_RESPONSE,
+    },
 )
-def retry_job(job_id: str) -> dict[str, Any]:
+def retry_job(job_id: str, payload: RetryRequest | None = None) -> dict[str, Any]:
     """Запускает заново только failed/cancelled/interrupted элементы."""
+    try:
+        snapshot = job_registry.snapshot(job_id, include_events=False)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=JOB_NOT_FOUND_DETAIL) from exc
+    _require_cloud_consent(
+        snapshot.get("settings"),
+        allowed=bool(payload and payload.allow_cloud_processing),
+    )
     try:
         reservation = job_registry.reserve_start()
     except JobBusyError as exc:
@@ -358,6 +375,10 @@ def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
     """Запускает единственную фоновую пакетную задачу."""
     source_paths = _normalize_source_paths(payload.paths)
     settings = payload.settings.model_dump(mode="json")
+    _require_cloud_consent(
+        settings,
+        allowed=payload.settings.allow_cloud_processing,
+    )
     try:
         reservation = job_registry.reserve_start()
     except JobBusyError as exc:
@@ -408,7 +429,7 @@ def stream(
     responses={409: _JOB_CONFLICT_RESPONSE, 500: _INTERNAL_ERROR_RESPONSE},
 )
 def unload_models() -> dict[str, str]:
-    """Выгружает локальную модель, если пакетный worker свободен."""
+    """Освобождает модели или облачный клиент, если обработчик свободен."""
     try:
         reservation = job_registry.reserve_unload()
     except JobBusyError as exc:
@@ -424,7 +445,7 @@ def unload_models() -> dict[str, str]:
             ) from exc
     finally:
         job_registry.release_reservation(reservation)
-    return {"status": "ok", "message": "Локальная модель выгружена."}
+    return {"status": "ok", "message": "Ресурсы распознавания освобождены."}
 
 
 def _build_items(paths: list[str], settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -525,6 +546,18 @@ def _environment_settings() -> tuple[ProcessingSettingsPayload, str | None]:
         fallback = ProcessingSettings()
         warning = "Локальные настройки окружения некорректны."
         return ProcessingSettingsPayload.model_validate(fallback.to_dict()), warning
+
+
+def _require_cloud_consent(settings: object, *, allowed: bool) -> None:
+    """Не допускает отправку аудио в облако без нового явного согласия."""
+    if not isinstance(settings, Mapping):
+        return
+    backend = str(settings.get("backend") or "").strip().casefold()
+    if backend == "openai-api" and not allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Для отправки аудио в OpenAI требуется явное согласие.",
+        )
 
 
 def _parse_event_id(value: str | None) -> int:

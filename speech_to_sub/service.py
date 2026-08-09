@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
@@ -21,8 +21,12 @@ from speech_to_sub.alignment.registry import aligner_names, get_aligner
 from speech_to_sub.asr.base import AsrBackend
 from speech_to_sub.asr.registry import activate_backend, backend_names, get_backend
 from speech_to_sub.constants import (
+    CLOUD_ASR_BACKENDS,
+    DEFAULT_ALIGNER_MODEL_REPOSITORIES,
+    DEFAULT_BACKEND_MODEL_REPOSITORIES,
     MAX_LINE_LENGTH_GAP,
     SIDECAR_SCHEMA_VERSION,
+    SUPPORTED_OPENAI_MODELS,
     WORK_DIR,
 )
 from speech_to_sub.exceptions import ProcessingCancelled, SpeechToSubError, ValidationError
@@ -53,6 +57,10 @@ from speech_to_sub.utils.cache import (
     write_sidecar,
 )
 from speech_to_sub.utils.env_utils import get_command_path
+from speech_to_sub.utils.huggingface import (
+    ModelDownloadProgress,
+    ensure_huggingface_model,
+)
 from speech_to_sub.utils.io_utils import (
     atomic_copy_file,
     atomic_write_text_utf8,
@@ -511,8 +519,12 @@ def _process_one_locked(
             ffprobe_path=ffprobe_path,
         )
         _raise_if_cancelled(cancel_check)
-        _emit_file(emit_event, path, index, total, "transcribing", "Локальная ASR", 20)
-        _write_log(log, f"Файл {index}/{total}: {path.name} — локальное распознавание.")
+        recognition_stage = _recognition_stage(settings)
+        _emit_file(emit_event, path, index, total, "transcribing", recognition_stage, 20)
+        _write_log(
+            log,
+            f"Файл {index}/{total}: {path.name} — {recognition_stage.casefold()}.",
+        )
         transcript, runtime, aligner, backend = _transcribe_with_alignment(
             context,
             normalized_duration,
@@ -947,6 +959,7 @@ def _transcribe_with_alignment(
 ) -> tuple[Transcript, RuntimeSignature, AlignmentAdapter, AsrBackend]:
     settings = context.settings
     if backend is None:
+        _ensure_models_for_inference(context)
         backend = activate_backend(settings.backend)
     aligner = get_aligner(settings.aligner)
     if aligner.requires_exclusive_runtime:
@@ -961,7 +974,7 @@ def _transcribe_with_alignment(
             context.index,
             context.total,
             "transcribing",
-            "Локальная ASR",
+            _recognition_stage(settings),
             mapped,
         )
 
@@ -1013,6 +1026,87 @@ def _transcribe_with_alignment(
     _raise_if_cancelled(context.cancel_check)
     _log_alignment_fallback(context, transcript)
     return transcript, runtime, aligner, backend
+
+
+def _ensure_models_for_inference(context: _FileProcessingContext) -> None:
+    """Проверяет модели только после промаха кеша и при необходимости докачивает их."""
+    settings = context.settings
+    repository = DEFAULT_BACKEND_MODEL_REPOSITORIES.get(settings.backend)
+    if repository is not None:
+        _ensure_model(
+            context,
+            repository=repository,
+            target=settings.model_path,
+            backend_id=settings.backend,
+            label="модель распознавания",
+        )
+    aligner_repository = DEFAULT_ALIGNER_MODEL_REPOSITORIES.get(settings.aligner)
+    if aligner_repository is not None and settings.aligner_model_path is not None:
+        _ensure_model(
+            context,
+            repository=aligner_repository,
+            target=settings.aligner_model_path,
+            backend_id=settings.aligner,
+            label="модель выравнивания",
+        )
+
+
+def _ensure_model(
+    context: _FileProcessingContext,
+    *,
+    repository: str,
+    target: Path,
+    backend_id: str,
+    label: str,
+) -> None:
+    download_started = False
+
+    def report(progress: ModelDownloadProgress) -> None:
+        nonlocal download_started
+        _raise_if_cancelled(context.cancel_check)
+        if progress.stage == "local-check":
+            stage = f"Проверка: {label}"
+        elif progress.stage in {"metadata", "download"}:
+            stage = f"Загрузка: {label}"
+            if not download_started:
+                _write_log(
+                    context.log,
+                    f"{context.path.name}: {label} отсутствует или неполна; "
+                    f"начата докачка в {target}.",
+                )
+                download_started = True
+        elif progress.stage == "ready" and download_started:
+            stage = f"Загружена: {label}"
+            _write_log(
+                context.log,
+                f"{context.path.name}: {label} загружена и проверена.",
+            )
+        else:
+            return
+        _emit_file(
+            context.emit_event,
+            context.path,
+            context.index,
+            context.total,
+            "downloading",
+            stage,
+            18,
+        )
+
+    ensure_huggingface_model(
+        repository,
+        target,
+        backend_id,
+        allow_download=context.settings.auto_download_model,
+        token=os.getenv("HF_TOKEN", "").strip() or None,
+        progress_callback=report,
+    )
+
+
+def _recognition_stage(settings: ProcessingSettings) -> str:
+    if settings.backend in CLOUD_ASR_BACKENDS:
+        return "Облачное распознавание"
+    return "Локальное распознавание"
 
 
 def _log_alignment_fallback(
@@ -1273,21 +1367,26 @@ def _normalize_runtime_signature(value: Any) -> RuntimeSignature | None:
     if (
         not backend
         or not engine_version
-        or device not in {"cpu", "cuda"}
+        or device not in {"cpu", "cuda", "cloud"}
         or not compute_type
         or not isinstance(quantized, bool)
     ):
         return None
-    return {
-        "backend": backend,
-        "engine_version": engine_version,
-        "device": "cuda" if device == "cuda" else "cpu",
-        "compute_type": compute_type,
-        "quantized": quantized,
-    }
+    return cast(
+        RuntimeSignature,
+        {
+            "backend": backend,
+            "engine_version": engine_version,
+            "device": device,
+            "compute_type": compute_type,
+            "quantized": quantized,
+        },
+    )
 
 
 def _legacy_compute_type(device: str, quantized: bool) -> str:
+    if device.casefold() == "cloud":
+        return "api"
     if quantized:
         return "int8"
     return "float16" if device.casefold() == "cuda" else "float32"
@@ -1407,6 +1506,17 @@ def _validate_backend_settings(settings: ProcessingSettings) -> None:
         raise ValidationError(f"Aligner должен иметь одно из значений: {variants}.")
     if settings.language.casefold() not in {"en", "ru", "auto"}:
         raise ValidationError("Язык должен быть en, ru или auto.")
+    if not isinstance(settings.auto_download_model, bool):
+        raise ValidationError("Настройка докачивания модели должна быть логической.")
+    if not isinstance(settings.allow_cloud_processing, bool):
+        raise ValidationError("Разрешение облачной обработки должно быть логическим.")
+    if settings.openai_model not in SUPPORTED_OPENAI_MODELS:
+        variants = ", ".join(sorted(SUPPORTED_OPENAI_MODELS))
+        raise ValidationError(f"Модель OpenAI должна иметь одно из значений: {variants}.")
+    if settings.backend in CLOUD_ASR_BACKENDS and not settings.allow_cloud_processing:
+        raise ValidationError(
+            "Облачная обработка требует явного разрешения allow_cloud_processing."
+        )
 
 
 def _validate_output_settings(settings: ProcessingSettings) -> None:

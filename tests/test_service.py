@@ -386,6 +386,52 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     assert normalized_sources == [media.resolve()]
 
 
+def test_cached_job_never_prepares_or_downloads_a_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "cached.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    backend.backend_id = "faster-whisper"
+    settings = {
+        "backend": "faster-whisper",
+        "model_path": str(tmp_path / "missing-model"),
+        "language": "ru",
+    }
+
+    first = service.process_paths(
+        [media],
+        settings,
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    monkeypatch.setattr(service, "get_backend", lambda _name: backend)
+    monkeypatch.setattr(
+        service,
+        "ensure_huggingface_model",
+        lambda *_args, **_kwargs: pytest.fail("Кеш не должен обращаться к Hub"),
+    )
+    monkeypatch.setattr(
+        service,
+        "activate_backend",
+        lambda _name: pytest.fail("Кеш не должен активировать движок"),
+    )
+
+    second = service.process_paths(
+        [media],
+        settings,
+        lambda _event: None,
+        lambda _message: None,
+    )
+
+    assert first[0]["state"] == "done"
+    assert second[0]["state"] == "cached"
+    assert normalized_sources == [media.resolve()]
+
+
 def test_layout_change_requires_force_and_reuses_recognition_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -790,6 +836,42 @@ def test_service_rejects_invalid_line_length_gap(line_length_gap: Any) -> None:
         service._validate_output_settings(settings)
 
 
+def test_cloud_processing_requires_explicit_permission_and_whisper_model() -> None:
+    permission_missing = ProcessingSettings(backend="openai-api")
+    with pytest.raises(ValidationError, match="явного разрешения"):
+        service._validate_backend_settings(permission_missing)
+    unsupported_model = ProcessingSettings(
+        backend="openai-api",
+        allow_cloud_processing=True,
+        openai_model="gpt-4o-transcribe",
+    )
+    with pytest.raises(ValidationError, match="Модель OpenAI"):
+        service._validate_backend_settings(unsupported_model)
+
+    service._validate_backend_settings(
+        ProcessingSettings(
+            backend="openai-api",
+            allow_cloud_processing=True,
+            openai_model="whisper-1",
+        )
+    )
+
+
+def test_runtime_signature_accepts_cloud_device() -> None:
+    runtime = service._normalize_runtime_signature(
+        {
+            "backend": "openai-api",
+            "engine_version": "2.14.0",
+            "device": "cloud",
+            "compute_type": "remote:whisper-1",
+            "quantized": False,
+        }
+    )
+
+    assert runtime is not None
+    assert runtime["device"] == "cloud"
+
+
 def test_cache_uses_loaded_backend_runtime_after_cpu_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -860,6 +942,11 @@ def test_process_paths_activates_selected_registry_backend(
         return backend
 
     monkeypatch.setattr(service, "activate_backend", activate)
+    monkeypatch.setattr(
+        service,
+        "ensure_huggingface_model",
+        lambda _repository, target, _backend_id, **_kwargs: Path(target),
+    )
 
     results = service.process_paths(
         [media],
@@ -871,6 +958,67 @@ def test_process_paths_activates_selected_registry_backend(
     assert results[0]["state"] == "done"
     assert selected == ["faster-whisper"]
     assert len(backend.calls) == 1
+
+
+def test_cache_miss_prepares_model_in_the_configured_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "download.mp4"
+    media.write_bytes(b"source")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    backend.backend_id = "faster-whisper"
+    monkeypatch.setattr(service, "get_backend", lambda _name: backend)
+    monkeypatch.setattr(service, "activate_backend", lambda _name: backend)
+    monkeypatch.setenv("HF_TOKEN", "unit-test-hf-token")
+    calls: list[dict[str, Any]] = []
+
+    def ensure_model(
+        repository: str,
+        target: Path,
+        backend_id: str,
+        **kwargs: Any,
+    ) -> Path:
+        calls.append(
+            {
+                "repository": repository,
+                "target": target,
+                "backend_id": backend_id,
+                **kwargs,
+            }
+        )
+        callback = kwargs["progress_callback"]
+        for stage in ("local-check", "metadata", "download", "ready"):
+            callback(service.ModelDownloadProgress(stage, stage))
+        return Path(target)
+
+    monkeypatch.setattr(service, "ensure_huggingface_model", ensure_model)
+    events: list[dict[str, Any]] = []
+    messages: list[str] = []
+    model_path = tmp_path / "models" / "whisper-large-v3-ct2"
+
+    results = service.process_paths(
+        [media],
+        {
+            "backend": "faster-whisper",
+            "model_path": str(model_path),
+            "language": "ru",
+        },
+        events.append,
+        messages.append,
+    )
+
+    assert results[0]["state"] == "done"
+    assert len(calls) == 1
+    assert calls[0]["repository"] == "Systran/faster-whisper-large-v3"
+    assert calls[0]["target"] == model_path
+    assert calls[0]["backend_id"] == "faster-whisper"
+    assert calls[0]["allow_download"] is True
+    assert calls[0]["token"] == "unit-test-hf-token"
+    assert any(event.get("stage") == "Загрузка: модель распознавания" for event in events)
+    assert any(event.get("state") == "downloading" for event in events)
+    assert "unit-test-hf-token" not in "\n".join(messages)
 
 
 def test_existing_srt_is_skipped_unless_force_is_enabled(

@@ -15,6 +15,9 @@ const statusSummary = document.getElementById("statusSummary");
 const settingsForm = document.getElementById("settingsForm");
 const backendSelect = document.getElementById("backend");
 const modelPathInput = document.getElementById("modelPath");
+const cloudSettings = document.getElementById("cloudSettings");
+const allowCloudProcessingInput = document.getElementById("allowCloudProcessing");
+const openAiAvailability = document.getElementById("openAiAvailability");
 const alignerSelect = document.getElementById("aligner");
 const alignerModelPathInput = document.getElementById("alignerModelPath");
 const deviceSelect = document.getElementById("device");
@@ -22,10 +25,21 @@ const languageSelect = document.getElementById("language");
 const logConsole = document.getElementById("logConsole");
 const terminalStatus = document.getElementById("terminalStatus");
 const clearLogs = document.getElementById("clearLogs");
+const brandSubtitle = document.getElementById("brandSubtitle");
+const settingsModeHint = document.getElementById("settingsModeHint");
+const localAsrControls = Array.from(document.querySelectorAll("[data-local-asr-only]"));
 
 const SETTINGS_STORAGE_KEY = "speechToSubSettingsV1";
 const BROWSER_LOG_LIMIT = 500;
-const ACTIVE_STATES = new Set(["queued", "probing", "extracting", "transcribing", "aligning", "writing"]);
+const ACTIVE_STATES = new Set([
+  "queued",
+  "probing",
+  "extracting",
+  "downloading",
+  "transcribing",
+  "aligning",
+  "writing",
+]);
 const CANCELLED_STATES = new Set(["cancelled", "interrupted"]);
 const RETRYABLE_STATES = new Set(["error", ...CANCELLED_STATES]);
 const FINAL_STATES = new Set(["cached", "skipped", "done", "error", ...CANCELLED_STATES]);
@@ -45,7 +59,10 @@ const BUILTIN_DEFAULTS = {
   audio_language: "eng",
   audio_stream_index: null,
   quantization_enabled: true,
+  auto_download_model: true,
   allow_cpu_fallback: false,
+  allow_cloud_processing: false,
+  openai_model: "whisper-1",
   max_chars_per_line: 42,
   line_length_gap: 8,
   max_cps: 17,
@@ -64,6 +81,7 @@ const statusLabels = {
   queued: "в очереди",
   probing: "проверка медиа",
   extracting: "извлечение аудио",
+  downloading: "загрузка модели",
   transcribing: "распознавание",
   aligning: "выравнивание слов",
   writing: "запись результата",
@@ -79,6 +97,7 @@ const defaultProgress = {
   queued: 0,
   probing: 5,
   extracting: 15,
+  downloading: 18,
   transcribing: 25,
   aligning: 86,
   writing: 92,
@@ -122,6 +141,67 @@ const state = {
   logLines: [],
 };
 
+function isCloudBackend() {
+  return backendSelect.value === "openai-api";
+}
+
+function updatePickerHint() {
+  if (!pickerHint) {
+    return;
+  }
+  const extensions = Array.isArray(state.uiConfig?.supported_extensions)
+    ? state.uiConfig.supported_extensions.map((extension) => String(extension).toUpperCase()).join(", ")
+    : "";
+  if (isCloudBackend()) {
+    pickerHint.textContent = extensions
+      ? `Медиа для OpenAI: ${extensions}`
+      : "Выбранные медиа будут переданы в OpenAI при запуске";
+    pickerHint.title = "Передача начинается только после отдельного явного согласия.";
+    return;
+  }
+  pickerHint.textContent = extensions ? `Локальные файлы: ${extensions}` : "Файлы остаются на компьютере";
+  pickerHint.title = "Файлы остаются на компьютере и не загружаются в браузер.";
+}
+
+function updateBackendMode(options = {}) {
+  const cloud = isCloudBackend();
+  if (options.resetConsent && allowCloudProcessingInput) {
+    allowCloudProcessingInput.checked = false;
+  }
+  if (cloudSettings) {
+    cloudSettings.hidden = !cloud;
+    cloudSettings.querySelectorAll("[data-setting]").forEach((input) => {
+      input.disabled = state.isBusy || !cloud;
+    });
+  }
+  localAsrControls.forEach((control) => {
+    control.hidden = cloud;
+    control.querySelectorAll("[data-setting]").forEach((input) => {
+      input.disabled = state.isBusy || cloud;
+    });
+  });
+  brandSubtitle.textContent = cloud
+    ? "Облачное пакетное распознавание речи в SRT"
+    : "Локальное пакетное распознавание речи в SRT";
+  settingsModeHint.textContent = cloud
+    ? "Аудио передаётся в OpenAI только после явного согласия"
+    : "Сеть при распознавании не используется";
+  unloadBtn.textContent = cloud ? "Сбросить подключение" : "Выгрузить";
+  unloadBtn.title = cloud
+    ? "Закрыть клиент OpenAI и удалить ключ из памяти процесса"
+    : "Выгрузить локальную модель из памяти";
+  if (openAiAvailability) {
+    openAiAvailability.textContent = state.uiConfig?.openai_configured
+      ? "Ключ API настроен в окружении."
+      : "Ключ API не найден в окружении.";
+  }
+  updatePickerHint();
+  const hasSelection = state.items.length > 0 || state.sourcePaths.length > 0;
+  const cloudAllowed = !cloud || Boolean(allowCloudProcessingInput?.checked);
+  transcribeBtn.disabled = state.isBusy || !hasSelection || !cloudAllowed;
+  retryBtn.disabled = state.isBusy || !state.canRetry || !state.displayedJobId || !cloudAllowed;
+}
+
 function appendLog(message) {
   if (message === undefined || message === null) {
     return;
@@ -163,6 +243,7 @@ function setBusy(isBusy) {
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     input.disabled = isBusy;
   });
+  updateBackendMode();
   if (!isBusy) {
     transcribeBtn.textContent = "Запустить";
   }
@@ -288,10 +369,13 @@ function applySettingValues(values) {
   }
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     const key = input.dataset.setting;
-    if (Object.hasOwn(values, key)) {
+    if (key !== "allow_cloud_processing" && Object.hasOwn(values, key)) {
       setInputValue(input, values[key]);
     }
   });
+  if (allowCloudProcessingInput) {
+    allowCloudProcessingInput.checked = false;
+  }
 }
 
 function loadStoredSettings() {
@@ -301,7 +385,11 @@ function loadStoredSettings() {
       return null;
     }
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : null;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    delete parsed.allow_cloud_processing;
+    return parsed;
   } catch {
     appendLog("Не удалось прочитать сохранённые настройки.");
     return null;
@@ -330,7 +418,9 @@ function readSettings() {
 function persistSettings() {
   try {
     if (window.localStorage) {
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(readSettings()));
+      const settings = readSettings();
+      delete settings.allow_cloud_processing;
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     }
   } catch (error) {
     // Ошибка хранилища не должна блокировать локальное распознавание.
@@ -716,7 +806,7 @@ function updateSummary() {
     return result;
   }, {});
   const ready = (counts.done || 0) + (counts.cached || 0);
-  const active = ["probing", "extracting", "transcribing", "writing"]
+  const active = ["probing", "extracting", "downloading", "transcribing", "writing"]
     .reduce((sum, key) => sum + (counts[key] || 0), 0);
   const parts = [`${total} файлов`];
   if (counts.queued) {
@@ -931,6 +1021,7 @@ async function loadActiveJob(options = {}) {
   if (result.settings && typeof result.settings === "object") {
     applySettingValues(result.settings);
     persistSettings();
+    updateBackendMode({ resetConsent: true });
   }
   if (result.active) {
     state.jobId = result.job_id;
@@ -1091,7 +1182,17 @@ async function transcribe() {
   if ((state.items.length === 0 && state.sourcePaths.length === 0) || state.isBusy) {
     return;
   }
+  if (isCloudBackend() && !allowCloudProcessingInput.checked) {
+    appendLog("Перед запуском облачного распознавания подтвердите передачу аудио в OpenAI.");
+    updateBackendMode();
+    return;
+  }
+  const cloud = isCloudBackend();
+  const requestSettings = readSettings();
   persistSettings();
+  if (cloud) {
+    allowCloudProcessingInput.checked = false;
+  }
   state.jobTotal = state.items.length;
   state.jobDone = 0;
   state.eventCursor = 0;
@@ -1110,7 +1211,7 @@ async function transcribe() {
     const paths = state.sourcePaths.length > 0
       ? [...state.sourcePaths]
       : state.items.map((item) => item.path);
-    const result = await postJson("/api/transcribe", { paths, settings: readSettings() });
+    const result = await postJson("/api/transcribe", { paths, settings: requestSettings });
     state.jobId = result.job_id;
     state.displayedJobId = result.job_id;
     setBusy(true);
@@ -1120,7 +1221,7 @@ async function transcribe() {
     } else {
       state.jobTotal = asFiniteNumber(result.total, state.jobTotal);
     }
-    appendLog("Запущено локальное распознавание.");
+    appendLog(cloud ? "Запущено облачное распознавание." : "Запущено локальное распознавание.");
     updateJobProgress();
     listenJob(result.job_id, 0);
   } catch (error) {
@@ -1160,7 +1261,17 @@ async function retryFailed() {
   if (state.isBusy || !state.canRetry || !state.displayedJobId) {
     return;
   }
+  if (isCloudBackend() && !allowCloudProcessingInput.checked) {
+    appendLog("Перед повторным облачным запуском заново подтвердите передачу аудио в OpenAI.");
+    updateBackendMode();
+    return;
+  }
   const sourceJobId = state.displayedJobId;
+  const cloud = isCloudBackend();
+  const cloudAllowed = Boolean(allowCloudProcessingInput.checked);
+  if (cloud) {
+    allowCloudProcessingInput.checked = false;
+  }
   state.canRetry = false;
   state.cancelRequested = false;
   setTerminalState("running");
@@ -1168,7 +1279,7 @@ async function retryFailed() {
   try {
     const result = await postJson(
       `/api/jobs/${encodeURIComponent(sourceJobId)}/retry`,
-      {},
+      { allow_cloud_processing: cloudAllowed },
     );
     state.jobId = result.job_id;
     state.displayedJobId = result.job_id;
@@ -1220,11 +1331,7 @@ async function loadUiConfig() {
   }
   applyBackendModelDefault();
   enforceAlignerCompatibility();
-  if (pickerHint && Array.isArray(config.supported_extensions) && config.supported_extensions.length > 0) {
-    const extensions = config.supported_extensions.map((extension) => String(extension).toUpperCase()).join(", ");
-    pickerHint.textContent = `Локальные файлы: ${extensions}`;
-    pickerHint.title = "Файлы остаются на компьютере и не загружаются в браузер.";
-  }
+  updateBackendMode({ resetConsent: true });
   if (config.settings_warning) {
     appendLog(`Предупреждение настроек: ${config.settings_warning}`);
   }
@@ -1293,8 +1400,12 @@ clearLogs.addEventListener("click", () => {
 backendSelect.addEventListener("change", () => {
   applyBackendModelDefault();
   enforceAlignerCompatibility();
+  updateBackendMode({ resetConsent: true });
 });
 alignerSelect.addEventListener("change", enforceBackendCompatibilityForAligner);
+allowCloudProcessingInput.addEventListener("change", () => {
+  updateBackendMode();
+});
 
 const refreshDebounced = debounce(() => {
   refreshItems({ silent: true }).catch((error) => {

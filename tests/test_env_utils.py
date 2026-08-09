@@ -20,6 +20,9 @@ from speech_to_sub.utils.env_utils import settings_from_environment
 _SETTING_VARIABLES = (
     "ASR_BACKEND",
     "ASR_MODEL_PATH",
+    "ASR_AUTO_DOWNLOAD_MODEL",
+    "ASR_ALLOW_CLOUD_PROCESSING",
+    "OPENAI_TRANSCRIPTION_MODEL",
     "ASR_ALIGNER",
     "ASR_ALIGNER_MODEL_PATH",
     "ASR_WORKER_PYTHON",
@@ -57,6 +60,9 @@ def test_environment_settings_parse_supported_values(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ASR_AUDIO_STREAM_INDEX", "2")
     monkeypatch.setenv("ASR_QUANTIZATION", "yes")
     monkeypatch.setenv("ASR_ALLOW_CPU_FALLBACK", "да")
+    monkeypatch.setenv("ASR_AUTO_DOWNLOAD_MODEL", "false")
+    monkeypatch.setenv("ASR_ALLOW_CLOUD_PROCESSING", "true")
+    monkeypatch.setenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
     monkeypatch.setenv("ASR_KEEP_AUDIO", "off")
     monkeypatch.setenv("ASR_MAX_CHARS_PER_LINE", "40")
     monkeypatch.setenv("ASR_LINE_LENGTH_GAP", "6")
@@ -78,6 +84,9 @@ def test_environment_settings_parse_supported_values(monkeypatch: pytest.MonkeyP
     assert settings.audio_stream_index == 2
     assert settings.quantization_enabled is True
     assert settings.allow_cpu_fallback is True
+    assert settings.auto_download_model is False
+    assert settings.allow_cloud_processing is True
+    assert settings.openai_model == "whisper-1"
     assert settings.keep_audio is False
     assert settings.max_chars_per_line == 40
     assert settings.line_length_gap == 6
@@ -117,6 +126,20 @@ def test_default_model_paths_use_portable_repository_directory() -> None:
     assert DEFAULT_QWEN_ALIGNER_MODEL_PATH == MODELS_DIR / "Qwen3-ForcedAligner-0.6B"
 
 
+def test_openai_environment_keeps_local_path_as_ignored_compatibility_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ASR_BACKEND", "openai-api")
+    monkeypatch.setenv("ASR_ALLOW_CLOUD_PROCESSING", "1")
+
+    settings = settings_from_environment()
+
+    assert settings.backend == "openai-api"
+    assert settings.allow_cloud_processing is True
+    assert settings.openai_model == "whisper-1"
+    assert settings.model_path == DEFAULT_BACKEND_MODEL_PATHS["faster-whisper"]
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -127,6 +150,9 @@ def test_default_model_paths_use_portable_repository_directory() -> None:
         ("ASR_AUDIO_STREAM_INDEX", "-1"),
         ("ASR_QUANTIZATION", "sometimes"),
         ("ASR_ALLOW_CPU_FALLBACK", "2"),
+        ("ASR_AUTO_DOWNLOAD_MODEL", "2"),
+        ("ASR_ALLOW_CLOUD_PROCESSING", "maybe"),
+        ("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
         ("ASR_KEEP_AUDIO", ""),
         ("ASR_MAX_CHARS_PER_LINE", "0"),
         ("ASR_LINE_LENGTH_GAP", "-1"),

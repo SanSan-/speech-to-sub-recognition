@@ -14,7 +14,7 @@
         <div class="brand-mark" aria-hidden="true">ASR</div>
         <div>
           <h1 class="brand-title">Speech to Sub</h1>
-          <p class="brand-sub">Локальное пакетное распознавание речи в SRT</p>
+          <p id="brandSubtitle" class="brand-sub">Локальное пакетное распознавание речи в SRT</p>
         </div>
       </div>
 
@@ -62,7 +62,7 @@
         <div class="panel-header">
           <div>
             <h2 id="settingsTitle" class="panel-title">Настройки обработки</h2>
-            <p class="panel-sub">Сеть при распознавании не используется</p>
+            <p id="settingsModeHint" class="panel-sub">Сеть при распознавании не используется</p>
           </div>
         </div>
 
@@ -82,15 +82,34 @@
                   <option value="faster-whisper">faster-whisper / CTranslate2</option>
                   <option value="parakeet-tdt-v3">Parakeet TDT v3</option>
                   <option value="qwen3-asr">Qwen3-ASR 0.6B</option>
+                  <option value="openai-api">OpenAI API / whisper-1</option>
                 </select>
-                <span class="field-hint">Путь к модели должен соответствовать выбранной среде исполнения.</span>
+                <span class="field-hint">Локальные движки работают на компьютере; облачный режим передаёт аудио в OpenAI.</span>
               </div>
 
-              <div class="field">
+              <div id="cloudSettings" class="settings-group" hidden>
+                <div class="field">
+                  <label for="openAiModel">Модель OpenAI</label>
+                  <select id="openAiModel" data-setting="openai_model">
+                    <option value="whisper-1">whisper-1</option>
+                  </select>
+                  <span id="openAiAvailability" class="field-hint">Проверяется настройка ключа API.</span>
+                </div>
+
+                <label class="field toggle danger-toggle" for="allowCloudProcessing">
+                  <span>
+                    <span class="toggle-title">Разрешить передачу аудио в OpenAI</span>
+                    <span class="field-hint">Согласие действует только для одного запуска и не сохраняется в браузере.</span>
+                  </span>
+                  <input id="allowCloudProcessing" data-setting="allow_cloud_processing" type="checkbox">
+                </label>
+              </div>
+
+              <div id="localModelSettings" class="field" data-local-asr-only>
                 <label for="modelPath">Путь к модели</label>
                 <input id="modelPath" data-setting="model_path" type="text" spellcheck="false"
                        placeholder="&lt;local-asr-model-path&gt;">
-                <span class="field-hint">Укажите каталог уже загруженной локальной модели.</span>
+                <span class="field-hint">Полная модель используется без сети; отсутствующая модель загружается в этот каталог при запуске.</span>
               </div>
 
               <div class="grid-2">
@@ -100,7 +119,7 @@
                     <option value="en">Английский (en)</option>
                   </select>
                 </div>
-                <div class="field">
+                <div id="deviceSettings" class="field" data-local-asr-only>
                   <label for="device">Устройство</label>
                   <select id="device" data-setting="device">
                     <option value="auto">Автоматически</option>
@@ -250,7 +269,7 @@
               </span>
             </summary>
             <div class="settings-section-body">
-              <div class="field">
+              <div class="field" data-local-asr-only>
                 <label for="workerPythonPath">Python процесса распознавания (необязательно)</label>
                 <input id="workerPythonPath" data-setting="worker_python_path" type="text"
                        spellcheck="false" placeholder="Выбирается автоматически по движку">
@@ -264,7 +283,15 @@
               </div>
 
               <div class="settings-group" aria-label="Загрузка модели">
-                <label class="field toggle" for="quantizationEnabled">
+                <label class="field toggle" for="autoDownloadModel" data-local-asr-only>
+                  <span>
+                    <span class="toggle-title">Автоматически загрузить модель</span>
+                    <span class="field-hint">Если каталога модели ещё нет, сначала проверяется свободное место.</span>
+                  </span>
+                  <input id="autoDownloadModel" data-setting="auto_download_model" type="checkbox">
+                </label>
+
+                <label class="field toggle" for="quantizationEnabled" data-local-asr-only>
                   <span>
                     <span class="toggle-title">Квантование модели</span>
                     <span class="field-hint">Использовать поддерживаемый 8-битный режим на CUDA.</span>
@@ -272,7 +299,7 @@
                   <input id="quantizationEnabled" data-setting="quantization_enabled" type="checkbox">
                 </label>
 
-                <label class="field toggle" for="allowCpuFallback">
+                <label class="field toggle" for="allowCpuFallback" data-local-asr-only>
                   <span>
                     <span class="toggle-title">Резервный запуск на CPU</span>
                     <span class="field-hint">Разрешить CPU только при ошибке GPU.</span>

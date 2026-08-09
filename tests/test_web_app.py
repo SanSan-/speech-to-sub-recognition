@@ -145,8 +145,8 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.4.2"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.4.2"
+    assert health.json()["version"] == "1.5.0"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.0"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -157,6 +157,7 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
         "faster-whisper",
         "parakeet-tdt-v3",
         "qwen3-asr",
+        "openai-api",
     }
     assert {item["value"] for item in config.json()["aligners"]} == {
         "none",
@@ -172,12 +173,18 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
         "faster-whisper",
         "parakeet-tdt-v3",
         "qwen3-asr",
+        "openai-api",
     }
     backend_paths = {
         item["value"]: item["model_path"] for item in config.json()["backends"]
     }
     assert backend_paths["transformers"].endswith("whisper-large-v3")
     assert backend_paths["faster-whisper"].endswith("whisper-large-v3-ct2")
+    assert backend_paths["openai-api"] == ""
+    assert defaults["auto_download_model"] is True
+    assert defaults["allow_cloud_processing"] is False
+    assert defaults["openai_model"] == "whisper-1"
+    assert isinstance(config.json()["openai_configured"], bool)
     assert defaults["long_form_window_seconds"] == 300
     assert defaults["vad_filter"] is True
     assert defaults["max_chars_per_line"] == 42
@@ -187,6 +194,7 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert 'id="maxCharsPerLine"' in index.text
     assert 'id="lineLengthGap"' in index.text
     assert 'id="maxCps"' in index.text
+    assert 'id="allowCloudProcessing"' in index.text
     serialized = json.dumps(
         {"config": config.json(), "health": health.json()},
         ensure_ascii=False,
@@ -371,6 +379,85 @@ def test_settings_reject_unknown_secret_field(fake_service: FakeService) -> None
         json={
             "paths": [r"D:\Media\lesson.mp4"],
             "settings": {"openai_api_key": "не-должен-приниматься"},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_ui_config_reports_only_openai_key_availability(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_service: FakeService,
+) -> None:
+    del fake_service
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-secret-marker")
+    client = TestClient(web_app.app)
+
+    payload = client.get("/api/ui-config").json()
+
+    assert payload["openai_configured"] is True
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "unit-test-secret-marker" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+
+
+def test_cloud_transcription_requires_fresh_consent_and_forwards_no_key(
+    tmp_path: Path,
+    fake_service: FakeService,
+) -> None:
+    client = TestClient(web_app.app)
+    path = str(tmp_path / "облачное распознавание.mp4")
+    settings = {
+        "backend": "openai-api",
+        "openai_model": "whisper-1",
+    }
+
+    rejected = client.post(
+        "/api/transcribe",
+        json={"paths": [path], "settings": settings},
+    )
+    invalid_consent = client.post(
+        "/api/transcribe",
+        json={
+            "paths": [path],
+            "settings": {**settings, "allow_cloud_processing": "true"},
+        },
+    )
+    accepted = client.post(
+        "/api/transcribe",
+        json={
+            "paths": [path],
+            "settings": {**settings, "allow_cloud_processing": True},
+        },
+    )
+
+    assert rejected.status_code == 400
+    assert "явное согласие" in rejected.json()["detail"]
+    assert invalid_consent.status_code == 422
+    assert accepted.status_code == 200
+    job = web_app.job_registry.get(accepted.json()["job_id"])
+    assert job.finished.wait(timeout=3)
+    forwarded = fake_service.build_calls[0][1]
+    assert forwarded["backend"] == "openai-api"
+    assert forwarded["allow_cloud_processing"] is True
+    assert forwarded["openai_model"] == "whisper-1"
+    serialized = json.dumps(forwarded, ensure_ascii=False).casefold()
+    assert "api_key" not in serialized
+    assert "token" not in serialized
+
+
+def test_web_rejects_unapproved_openai_model(fake_service: FakeService) -> None:
+    del fake_service
+    client = TestClient(web_app.app)
+
+    response = client.post(
+        "/api/refresh",
+        json={
+            "paths": [r"D:\Media\lesson.mp4"],
+            "settings": {
+                "backend": "openai-api",
+                "openai_model": "gpt-4o-transcribe",
+            },
         },
     )
 
@@ -942,6 +1029,50 @@ def test_jobs_api_cancel_and_retry_only_unsuccessful_items(
     assert client.get("/api/jobs/missing-job").status_code == 404
     assert client.post("/api/jobs/missing-job/cancel").status_code == 404
     assert client.post("/api/jobs/missing-job/retry").status_code == 404
+
+
+def test_cloud_retry_requires_new_consent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def processor(selected_paths, settings, emit_event, log):
+        nonlocal calls
+        del settings, emit_event, log
+        calls += 1
+        state = "error" if calls == 1 else "done"
+        return [{"path": path, "state": state} for path in selected_paths]
+
+    service = FakeService(processor)
+    monkeypatch.setattr(web_app, "service_api", service)
+    client = TestClient(web_app.app)
+    started = client.post(
+        "/api/transcribe",
+        json={
+            "paths": [str(tmp_path / "повтор.mp4")],
+            "settings": {
+                "backend": "openai-api",
+                "openai_model": "whisper-1",
+                "allow_cloud_processing": True,
+            },
+        },
+    )
+    assert started.status_code == 200
+    source_job = web_app.job_registry.get(started.json()["job_id"])
+    assert source_job.finished.wait(timeout=3)
+
+    rejected = client.post(f"/api/jobs/{source_job.job_id}/retry")
+    accepted = client.post(
+        f"/api/jobs/{source_job.job_id}/retry",
+        json={"allow_cloud_processing": True},
+    )
+
+    assert rejected.status_code == 400
+    assert accepted.status_code == 200
+    retry_job = web_app.job_registry.get(accepted.json()["job_id"])
+    assert retry_job.finished.wait(timeout=3)
+    assert calls == 2
 
 
 def test_job_registry_is_bounded_and_prunes_terminal_snapshot_by_ttl() -> None:

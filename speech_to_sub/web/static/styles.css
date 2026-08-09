@@ -16,7 +16,7 @@
   --danger: #cb4242;
   --shadow: 0 24px 70px rgba(17, 34, 45, 0.14);
   --shadow-soft: 0 14px 32px rgba(17, 34, 45, 0.11);
-  --workspace-height: clamp(430px, calc(100vh - 430px), 620px);
+  --workspace-min-height: 430px;
 }
 
 * {
@@ -75,12 +75,14 @@ select {
   gap: 16px;
   width: min(1380px, 100%);
   min-height: 100vh;
+  min-height: 100dvh;
   margin: 0 auto;
   padding: 20px 28px 24px;
 }
 
 .topbar {
   display: grid;
+  flex: 0 0 auto;
   grid-template-columns: minmax(260px, 0.7fr) minmax(520px, 1.3fr);
   gap: 22px;
   padding: 20px;
@@ -294,9 +296,10 @@ select {
 .main-grid {
   display: grid;
   grid-template-columns: minmax(360px, 1.14fr) minmax(340px, 0.86fr);
-  align-items: start;
-  flex: 0 0 auto;
+  align-items: stretch;
+  flex: 1 1 var(--workspace-min-height);
   gap: 20px;
+  min-height: var(--workspace-min-height);
 }
 
 .panel {
@@ -322,13 +325,13 @@ select {
 .panel-settings {
   display: flex;
   flex-direction: column;
-  height: var(--workspace-height);
   min-height: 0;
   overflow: hidden;
 }
 
 .panel-logs {
   --delay: 0.12s;
+  flex: 0 0 auto;
   min-height: 0;
   margin-top: 0;
   padding: 14px 18px 16px;
@@ -883,6 +886,8 @@ input[type="checkbox"] {
   .main-grid {
     grid-template-columns: 1fr;
     align-items: stretch;
+    flex: 0 0 auto;
+    min-height: 0;
   }
 
   .panel-files,

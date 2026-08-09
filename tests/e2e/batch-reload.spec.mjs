@@ -23,7 +23,41 @@ async function e2eState(request) {
   return response.json();
 }
 
-test("рабочие панели ограничены, настройки сгруппированы и мобильный поток свободен", async ({ page }) => {
+async function measureDesktopLayout(page) {
+  return page.evaluate(() => {
+    const app = document.querySelector(".app");
+    const main = document.querySelector(".main-grid");
+    const files = document.querySelector(".panel-files");
+    const settings = document.querySelector(".panel-settings");
+    const fileList = document.querySelector("#fileList");
+    const settingsForm = document.querySelector("#settingsForm");
+    const logs = document.querySelector(".panel-logs");
+    const actions = document.querySelector(".job-actions");
+    const appRect = app.getBoundingClientRect();
+    const mainRect = main.getBoundingClientRect();
+    const filesRect = files.getBoundingClientRect();
+    const settingsRect = settings.getBoundingClientRect();
+    const logsRect = logs.getBoundingClientRect();
+    const actionsRect = actions.getBoundingClientRect();
+    return {
+      appHeight: appRect.height,
+      workspaceHeight: mainRect.height,
+      equalPanelHeight: Math.abs(filesRect.height - settingsRect.height) < 1,
+      fileOverflow: getComputedStyle(fileList).overflowY,
+      settingsOverflow: getComputedStyle(settingsForm).overflowY,
+      fileScrollable: fileList.scrollHeight > fileList.clientHeight,
+      settingsScrollable: settingsForm.scrollHeight > settingsForm.clientHeight,
+      logsFollowMain: main.nextElementSibling === logs && logsRect.top >= mainRect.bottom,
+      logsGap: Math.round(logsRect.top - mainRect.bottom),
+      bottomGap: Math.round(window.innerHeight - logsRect.bottom),
+      logsVisible: logsRect.bottom <= window.innerHeight,
+      actionsVisible: actionsRect.top >= 0 && actionsRect.bottom <= window.innerHeight,
+      pageFitsViewport: document.documentElement.scrollHeight <= window.innerHeight + 1,
+    };
+  });
+}
+
+test("рабочие панели растягиваются, настройки сгруппированы и мобильный поток свободен", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
 
@@ -66,31 +100,7 @@ test("рабочие панели ограничены, настройки сг�
     }
   });
 
-  const desktopLayout = await page.evaluate(() => {
-    const main = document.querySelector(".main-grid");
-    const files = document.querySelector(".panel-files");
-    const settings = document.querySelector(".panel-settings");
-    const fileList = document.querySelector("#fileList");
-    const settingsForm = document.querySelector("#settingsForm");
-    const logs = document.querySelector(".panel-logs");
-    const actions = document.querySelector(".job-actions");
-    const mainRect = main.getBoundingClientRect();
-    const filesRect = files.getBoundingClientRect();
-    const settingsRect = settings.getBoundingClientRect();
-    const logsRect = logs.getBoundingClientRect();
-    const actionsRect = actions.getBoundingClientRect();
-    return {
-      equalPanelHeight: Math.abs(filesRect.height - settingsRect.height) < 1,
-      fileOverflow: getComputedStyle(fileList).overflowY,
-      settingsOverflow: getComputedStyle(settingsForm).overflowY,
-      fileScrollable: fileList.scrollHeight > fileList.clientHeight,
-      settingsScrollable: settingsForm.scrollHeight > settingsForm.clientHeight,
-      logsFollowMain: main.nextElementSibling === logs && logsRect.top >= mainRect.bottom,
-      logsGap: Math.round(logsRect.top - mainRect.bottom),
-      logsVisible: logsRect.bottom <= window.innerHeight,
-      actionsVisible: actionsRect.top >= 0 && actionsRect.bottom <= window.innerHeight,
-    };
-  });
+  const desktopLayout = await measureDesktopLayout(page);
   expect(desktopLayout).toMatchObject({
     equalPanelHeight: true,
     fileOverflow: "auto",
@@ -101,10 +111,33 @@ test("рабочие панели ограничены, настройки сг�
     logsVisible: true,
     actionsVisible: true,
   });
+  expect(desktopLayout.workspaceHeight).toBeGreaterThanOrEqual(430);
   expect(desktopLayout.logsGap).toBeLessThanOrEqual(20);
   await expect(page.locator("body")).not.toContainText("ASR backend");
   await expect(page.locator("body")).not.toContainText("Beam size");
   await expect(page.locator("body")).not.toContainText("Long-form");
+
+  const tallLayouts = [];
+  for (const height of [1200, 1600]) {
+    await page.setViewportSize({ width: 1440, height });
+    const layout = await measureDesktopLayout(page);
+    expect(layout).toMatchObject({
+      appHeight: height,
+      equalPanelHeight: true,
+      fileOverflow: "auto",
+      settingsOverflow: "auto",
+      logsFollowMain: true,
+      logsVisible: true,
+      actionsVisible: true,
+      pageFitsViewport: true,
+    });
+    expect(layout.workspaceHeight).toBeGreaterThanOrEqual(430);
+    expect(layout.logsGap).toBeLessThanOrEqual(20);
+    expect(layout.bottomGap).toBeGreaterThanOrEqual(23);
+    expect(layout.bottomGap).toBeLessThanOrEqual(25);
+    tallLayouts.push(layout);
+  }
+  expect(tallLayouts[1].workspaceHeight - tallLayouts[0].workspaceHeight).toBeGreaterThan(390);
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
@@ -135,6 +168,40 @@ test("рабочие панели ограничены, настройки сг�
     settingsFitsContent: true,
     ordinaryFlow: true,
   });
+});
+
+test("облачный режим требует несохраняемого согласия и скрывает локальные параметры", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Файлы" }).click();
+
+  const backend = page.locator("#backend");
+  const consent = page.getByLabel("Разрешить передачу аудио в OpenAI");
+  const start = page.getByRole("button", { name: "Запустить" });
+  await backend.selectOption("openai-api");
+
+  await expect(page.locator("#brandSubtitle")).toHaveText("Облачное пакетное распознавание речи в SRT");
+  await expect(page.locator("#settingsModeHint")).toContainText("Аудио передаётся в OpenAI");
+  await expect(page.locator("#cloudSettings")).toBeVisible();
+  await expect(page.locator("#openAiModel")).toHaveValue("whisper-1");
+  await expect(page.locator("#openAiModel option")).toHaveCount(1);
+  await expect(page.locator("#localModelSettings")).toBeHidden();
+  await expect(page.locator("#modelPath")).toBeDisabled();
+  await expect(page.locator("#deviceSettings")).toBeHidden();
+  await expect(page.locator("#workerPythonPath")).toBeDisabled();
+  await expect(page.locator("#quantizationEnabled")).toBeDisabled();
+  await expect(page.locator("#autoDownloadModel")).toBeDisabled();
+  await expect(consent).not.toBeChecked();
+  await expect(start).toBeDisabled();
+
+  await consent.check();
+  await expect(start).toBeEnabled();
+  const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "{}"), SETTINGS_KEY);
+  expect(stored).not.toHaveProperty("allow_cloud_processing");
+
+  await backend.selectOption("faster-whisper");
+  await backend.selectOption("openai-api");
+  await expect(consent).not.toBeChecked();
+  await expect(start).toBeDisabled();
 });
 
 test("SQLite сохраняет batch при reload, cancel и retry", async ({ page, request }) => {

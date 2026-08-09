@@ -8,10 +8,11 @@ from pathlib import Path
 from speech_to_sub.asr.registry import backend_names
 from speech_to_sub.alignment.registry import aligner_names
 from speech_to_sub.constants import (
+    CLOUD_ASR_BACKENDS,
     DEFAULT_ASR_BACKEND,
-    DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_ALIGNER,
     DEFAULT_AUDIO_LANGUAGE,
+    DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_BEAM_SIZE,
     DEFAULT_LANGUAGE,
     DEFAULT_LINE_LENGTH_GAP,
@@ -19,9 +20,12 @@ from speech_to_sub.constants import (
     DEFAULT_LONG_FORM_WINDOW_SECONDS,
     DEFAULT_MAX_CHARS_PER_LINE,
     DEFAULT_MAX_CPS,
+    DEFAULT_MODEL_PATH,
+    DEFAULT_OPENAI_MODEL,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_VAD_MIN_SILENCE_MS,
     MAX_LINE_LENGTH_GAP,
+    SUPPORTED_OPENAI_MODELS,
 )
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
@@ -65,6 +69,13 @@ def settings_from_environment() -> ProcessingSettings:
     return ProcessingSettings(
         backend=backend,
         model_path=Path(os.getenv("ASR_MODEL_PATH", str(default_model_path))),
+        auto_download_model=_read_bool("ASR_AUTO_DOWNLOAD_MODEL", True),
+        allow_cloud_processing=_read_bool("ASR_ALLOW_CLOUD_PROCESSING", False),
+        openai_model=_read_choice(
+            "OPENAI_TRANSCRIPTION_MODEL",
+            DEFAULT_OPENAI_MODEL,
+            SUPPORTED_OPENAI_MODELS,
+        ),
         aligner=aligner,
         aligner_model_path=aligner_model_path,
         worker_python_path=Path(worker_python_raw) if worker_python_raw else None,
@@ -123,6 +134,8 @@ def settings_from_environment() -> ProcessingSettings:
 
 def _default_model_path(backend: str) -> Path:
     """Возвращает локальный checkpoint выбранного backend-а."""
+    if backend in CLOUD_ASR_BACKENDS:
+        return DEFAULT_MODEL_PATH
     return DEFAULT_BACKEND_MODEL_PATHS[backend]
 
 

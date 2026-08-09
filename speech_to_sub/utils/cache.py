@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from speech_to_sub.constants import (
+    CLOUD_ASR_BACKENDS,
     PIPELINE_VERSION,
     QWEN_ALIGNMENT_MAX_SEGMENT_SECONDS,
     SIDECAR_SCHEMA_VERSION,
@@ -66,14 +67,11 @@ def build_recognition_fingerprint(
         if settings.aligner_model_path
         else None
     )
-    return {
+    fingerprint = {
         "pipeline_version": PIPELINE_VERSION,
-        "model_path": str(settings.model_path.expanduser().resolve()),
         "language": settings.language,
         "audio_language": settings.audio_language,
         "audio_stream_index": stream_ordinal,
-        "requested_device": settings.device,
-        "requested_quantization_enabled": settings.quantization_enabled,
         "runtime": dict(
             runtime
             or {
@@ -93,6 +91,17 @@ def build_recognition_fingerprint(
         },
         "backend_parameters": backend_parameters,
     }
+    if settings.backend in CLOUD_ASR_BACKENDS:
+        fingerprint["openai_model"] = settings.openai_model
+    else:
+        fingerprint.update(
+            {
+                "model_path": str(settings.model_path.expanduser().resolve()),
+                "requested_device": settings.device,
+                "requested_quantization_enabled": settings.quantization_enabled,
+            }
+        )
+    return fingerprint
 
 
 def build_layout_fingerprint(settings: ProcessingSettings) -> dict[str, Any]:

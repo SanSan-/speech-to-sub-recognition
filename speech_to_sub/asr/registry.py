@@ -18,6 +18,7 @@ _FACTORIES: dict[str, FactoryReference] = {
     "faster-whisper": "speech_to_sub.asr.faster_whisper:FasterWhisperBackend",
     "parakeet-tdt-v3": "speech_to_sub.asr.parakeet_tdt:ParakeetTdtBackend",
     "qwen3-asr": "speech_to_sub.asr.qwen3:Qwen3AsrBackend",
+    "openai-api": "speech_to_sub.asr.openai_api:OpenAiApiBackend",
 }
 _INSTANCES: dict[str, AsrBackend] = {}
 _ACTIVE_BACKEND_ID: str | None = None

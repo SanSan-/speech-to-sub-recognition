@@ -12,6 +12,7 @@ from speech_to_sub.alignment.registry import aligner_names
 from speech_to_sub.constants import (
     DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
+    SUPPORTED_OPENAI_MODELS,
 )
 from speech_to_sub.exceptions import SpeechToSubError, ValidationError
 from speech_to_sub.models import ProcessingSettings
@@ -31,10 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     """Создаёт CLI parser."""
     parser = _CliArgumentParser(
         prog="speech-to-sub",
-        description="Локальное пакетное распознавание речи и создание SRT.",
+        description="Пакетное распознавание речи и создание SRT.",
     )
     parser.add_argument("--input", nargs="+", required=True, type=Path, help="Файл или папка.")
-    parser.add_argument("--backend", choices=backend_names(), help="Локальный ASR backend.")
+    parser.add_argument("--backend", choices=backend_names(), help="Движок распознавания.")
     parser.add_argument("--aligner", choices=aligner_names(), help="Optional aligner слов.")
     parser.add_argument("--aligner-model-path", type=Path)
     parser.add_argument("--worker-python-path", type=Path)
@@ -45,6 +46,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-language")
     parser.add_argument("--audio-stream-index", type=int)
     parser.add_argument("--model-path", type=Path)
+    parser.add_argument(
+        "--no-auto-download-model",
+        dest="auto_download_model",
+        action="store_false",
+        default=None,
+        help="Запретить докачивание неполной локальной модели.",
+    )
+    parser.add_argument(
+        "--allow-cloud-processing",
+        action="store_true",
+        default=None,
+        help="Разрешить передачу аудио выбранному облачному сервису.",
+    )
+    parser.add_argument(
+        "--openai-model",
+        choices=tuple(sorted(SUPPORTED_OPENAI_MODELS)),
+        help="Модель распознавания OpenAI API.",
+    )
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"))
     parser.add_argument(
         "--no-quantization",
@@ -133,6 +152,9 @@ def _merge_settings(base: ProcessingSettings, args: argparse.Namespace) -> Proce
         "audio_language",
         "audio_stream_index",
         "model_path",
+        "auto_download_model",
+        "allow_cloud_processing",
+        "openai_model",
         "device",
         "quantization_enabled",
         "allow_cpu_fallback",
@@ -152,7 +174,11 @@ def _merge_settings(base: ProcessingSettings, args: argparse.Namespace) -> Proce
         value = getattr(args, name, None)
         if value is not None:
             changes[name] = value
-    if args.backend is not None and args.model_path is None and not os.getenv("ASR_MODEL_PATH"):
+    if (
+        args.backend in DEFAULT_BACKEND_MODEL_PATHS
+        and args.model_path is None
+        and not os.getenv("ASR_MODEL_PATH")
+    ):
         changes["model_path"] = DEFAULT_BACKEND_MODEL_PATHS[args.backend]
     if args.aligner is not None and args.aligner_model_path is None:
         if args.aligner == "qwen3-forced-aligner" and not os.getenv(

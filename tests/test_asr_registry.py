@@ -120,3 +120,9 @@ def test_default_faster_whisper_factory_is_a_lazy_import_reference() -> None:
     reference = registry._FACTORIES.get("faster-whisper")
 
     assert reference == "speech_to_sub.asr.faster_whisper:FasterWhisperBackend"
+
+
+def test_default_openai_factory_is_a_lazy_import_reference() -> None:
+    reference = registry._FACTORIES.get("openai-api")
+
+    assert reference == "speech_to_sub.asr.openai_api:OpenAiApiBackend"
