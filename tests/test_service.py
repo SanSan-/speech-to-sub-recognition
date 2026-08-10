@@ -337,7 +337,7 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
         "quantized": False,
     }
     assert sidecar["layout_settings"] == {
-        "srt_builder_version": "3",
+        "srt_builder_version": "4",
         "max_chars_per_line": 42,
         "line_length_gap": 8,
         "max_cps": 17.0,
@@ -354,14 +354,18 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
         "adjusted_boundaries": 0,
         "max_boundary_drift_ms": 0,
         "timing_anomaly_adjustments": 0,
+        "reading_speed_target_exceeded_cues": 0,
+        "max_actual_cps": 16.976556,
+        "duration_target_exceeded_cues": 0,
+        "max_actual_duration_ms": 1237,
+        "line_length_target_exceeded_lines": 0,
+        "max_actual_line_length": 21,
     }
     assert any(
-        "синтезированы временные метки сегментов: 1" in message
-        for message in logs
+        "синтезированы временные метки сегментов: 1" in message for message in logs
     )
     assert not any(
-        "фрагменты с аномальными начальными метками" in message
-        for message in logs
+        "фрагменты с аномальными начальными метками" in message for message in logs
     )
     assert media.read_bytes() == original_media
     assert len(backend.calls) == 1
@@ -382,6 +386,173 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     )
     assert cached[0]["state"] == "cached"
     assert cached[0]["cached"] is True
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+
+
+def test_fast_speech_is_published_and_reused_as_structural_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RapidBackend(FakeBackend):
+        def transcribe(
+            self,
+            audio_path: Path,
+            settings: ProcessingSettings,
+            duration: float,
+            progress_callback: Any = None,
+            cancel_check: Any = None,
+        ) -> Transcript:
+            del progress_callback, cancel_check
+            self.calls.append(audio_path)
+            self.durations.append(duration)
+            text = (
+                "Очень много текста произнесено почти мгновенно, но готовые "
+                "субтитры всё равно должны быть опубликованы."
+            )
+            return Transcript(
+                text=text,
+                language=settings.language,
+                duration=duration,
+                segments=(TranscriptSegment(0.0, 0.05, text),),
+                model=str(settings.model_path),
+                device="cpu",
+                quantized=False,
+                metadata={
+                    "runtime": self.backend_id,
+                    "engine_version": TEST_ENGINE_VERSION,
+                    "compute_type": "float32",
+                },
+            )
+
+    media = tmp_path / "быстрая-речь.mp4"
+    media.write_bytes(b"media")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    backend = RapidBackend()
+
+    first = service.process_paths(
+        [media],
+        {"language": "ru"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    sidecar = json.loads(Path(first[0]["sidecar_output"]).read_text(encoding="utf-8"))
+
+    assert first[0]["state"] == "done"
+    assert sidecar["subtitle_layout"]["reading_speed_target_exceeded_cues"] > 0
+    assert parse_srt(Path(first[0]["srt_output"]).read_text(encoding="utf-8"))
+
+    second = service.process_paths(
+        [media],
+        {"language": "ru"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert second[0]["state"] == "cached"
+    assert len(backend.calls) == 1
+
+
+def test_service_uses_transcript_text_when_backend_returns_no_segments() -> None:
+    text = "Текст распознавания сохранён без сегментов."
+    transcript = Transcript(
+        text=text,
+        language="ru",
+        duration=1.0,
+        segments=(),
+        model="test",
+        device="cpu",
+        quantized=False,
+    )
+
+    srt_text, diagnostics = service._build_srt_artifacts(
+        transcript,
+        ProcessingSettings(language="ru"),
+        1.0,
+        path=Path("без-сегментов.mp4"),
+        log=lambda _message: None,
+    )
+
+    assert [cue.text for cue in parse_srt(srt_text)] == [text]
+    assert diagnostics["synthetic_timing_segments"] == 1
+
+
+def test_service_uses_transcript_text_when_segments_have_no_content() -> None:
+    text = "Непустой текст распознавания."
+    transcript = Transcript(
+        text=text,
+        language="ru",
+        duration=1.0,
+        segments=(TranscriptSegment(0.0, 1.0, "   "),),
+        model="test",
+        device="cpu",
+        quantized=False,
+    )
+
+    srt_text, diagnostics = service._build_srt_artifacts(
+        transcript,
+        ProcessingSettings(language="ru"),
+        1.0,
+        path=Path("пустые-сегменты.mp4"),
+        log=lambda _message: None,
+    )
+
+    assert [cue.text for cue in parse_srt(srt_text)] == [text]
+    assert diagnostics["synthetic_timing_segments"] == 1
+
+
+def test_transcript_without_segments_rebuilds_missing_srt_from_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TextOnlyBackend(FakeBackend):
+        def transcribe(
+            self,
+            audio_path: Path,
+            settings: ProcessingSettings,
+            duration: float,
+            progress_callback: Any = None,
+            cancel_check: Any = None,
+        ) -> Transcript:
+            del progress_callback, cancel_check
+            self.calls.append(audio_path)
+            self.durations.append(duration)
+            return Transcript(
+                text="Готовая расшифровка без посегментных меток.",
+                language=settings.language,
+                duration=duration,
+                segments=(),
+                model=str(settings.model_path),
+                device="cpu",
+                quantized=False,
+                metadata={
+                    "runtime": self.backend_id,
+                    "engine_version": TEST_ENGINE_VERSION,
+                    "compute_type": "float32",
+                },
+            )
+
+    media = tmp_path / "без-сегментов.mp4"
+    media.write_bytes(b"media")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = TextOnlyBackend()
+    callbacks = (lambda _event: None, lambda _message: None)
+
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
+    Path(first[0]["srt_output"]).unlink()
+    rebuilt = service.process_paths(
+        [media],
+        {"language": "ru"},
+        *callbacks,
+        backend=backend,
+    )
+
+    assert rebuilt[0]["state"] == "done"
+    assert Path(rebuilt[0]["srt_output"]).is_file()
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
 
@@ -443,7 +614,9 @@ def test_force_bypasses_card_cache_and_runs_recognition_again(
     messages: list[str] = []
     callbacks = (lambda _event: None, messages.append)
 
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     cards = service.build_items([media], {"language": "ru", "force": True})
     forced = service.process_paths(
         [media],
@@ -459,8 +632,12 @@ def test_force_bypasses_card_cache_and_runs_recognition_again(
     assert forced[0]["state"] == "done"
     assert len(backend.calls) == 2
     assert normalized_sources == [media.resolve(), media.resolve()]
-    assert any("режим перезаписи обходит кеши результатов" in message for message in messages)
-    assert not any("SRT пересобран из кеша распознавания" in message for message in messages)
+    assert any(
+        "режим перезаписи обходит кеши результатов" in message for message in messages
+    )
+    assert not any(
+        "SRT пересобран из кеша распознавания" in message for message in messages
+    )
 
 
 def test_force_replaces_srt_sidecar_and_saved_audio(
@@ -579,7 +756,9 @@ def test_layout_change_requires_force_and_runs_recognition_again(
     backend = FakeBackend()
     callbacks = (lambda _event: None, lambda _message: None)
 
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     srt_path = Path(first[0]["srt_output"])
     original_srt = srt_path.read_bytes()
     sidecar_path = Path(first[0]["sidecar_output"])
@@ -608,7 +787,9 @@ def test_layout_change_requires_force_and_runs_recognition_again(
     assert srt_path.read_bytes() == original_srt
     assert len(backend.calls) == 2
     assert normalized_sources == [media.resolve(), media.resolve()]
-    assert rebuilt_sidecar["recognition_settings"] == first_sidecar["recognition_settings"]
+    assert (
+        rebuilt_sidecar["recognition_settings"] == first_sidecar["recognition_settings"]
+    )
     assert rebuilt_sidecar["layout_settings"]["line_length_gap"] == 0
 
 
@@ -621,7 +802,9 @@ def test_missing_srt_is_rebuilt_from_recognition_cache_without_force(
     normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
     backend = FakeBackend()
     callbacks = (lambda _event: None, lambda _message: None)
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     srt_path = Path(first[0]["srt_output"])
     srt_path.unlink()
     cards = service.build_items([media], {"language": "ru"})
@@ -673,7 +856,9 @@ def test_malformed_cached_transcript_falls_back_to_recognition(
     normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
     backend = FakeBackend()
     callbacks = (lambda _event: None, lambda _message: None)
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     Path(first[0]["srt_output"]).unlink()
     sidecar_path = Path(first[0]["sidecar_output"])
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -705,7 +890,9 @@ def test_source_mismatch_does_not_reuse_recognition_cache(
     normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
     backend = FakeBackend()
     callbacks = (lambda _event: None, lambda _message: None)
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     Path(first[0]["srt_output"]).unlink()
     media.write_bytes(b"source-v2")
 
@@ -730,7 +917,9 @@ def test_legacy_pipeline7_builder2_sidecar_rebuilds_without_recognition(
     normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
     backend = FakeBackend()
     callbacks = (lambda _event: None, lambda _message: None)
-    first = service.process_paths([media], {"language": "ru"}, *callbacks, backend=backend)
+    first = service.process_paths(
+        [media], {"language": "ru"}, *callbacks, backend=backend
+    )
     Path(first[0]["srt_output"]).unlink()
     sidecar_path = Path(first[0]["sidecar_output"])
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -814,7 +1003,7 @@ def test_process_paths_extends_final_word_cue_within_audio_duration(
 
     assert result[0]["state"] == "done"
     srt_text = Path(result[0]["srt_output"]).read_text(encoding="utf-8")
-    cue, = parse_srt(srt_text)
+    (cue,) = parse_srt(srt_text)
     assert cue.end == pytest.approx(1.5)
     assert cue.end - cue.start >= 0.8
 
@@ -1165,7 +1354,9 @@ def test_cache_miss_prepares_model_in_the_configured_directory(
     assert calls[0]["backend_id"] == "faster-whisper"
     assert calls[0]["allow_download"] is True
     assert calls[0]["token"] == "unit-test-hf-token"
-    assert any(event.get("stage") == "Загрузка: модель распознавания" for event in events)
+    assert any(
+        event.get("stage") == "Загрузка: модель распознавания" for event in events
+    )
     assert any(event.get("state") == "downloading" for event in events)
     assert "unit-test-hf-token" not in "\n".join(messages)
 
@@ -1336,8 +1527,7 @@ def test_process_paths_cancels_remaining_files_after_safe_boundary(
     assert normalized_sources == [first.resolve()]
     assert not (tmp_path / "02-second.ru.srt").exists()
     assert any(
-        event.get("path") == str(second.resolve())
-        and event.get("state") == "cancelled"
+        event.get("path") == str(second.resolve()) and event.get("state") == "cancelled"
         for event in events
     )
 
@@ -1388,7 +1578,10 @@ def test_same_filename_without_common_root_gets_path_hash_suffix(
 
     output_names = [Path(item["srt_output"]).name for item in results]
     assert len(set(output_names)) == 2
-    assert all(name.startswith("sample.mp4.") and name.endswith(".en.srt") for name in output_names)
+    assert all(
+        name.startswith("sample.mp4.") and name.endswith(".en.srt")
+        for name in output_names
+    )
     assert all(Path(item["srt_output"]).is_file() for item in results)
 
 

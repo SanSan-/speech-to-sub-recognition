@@ -44,6 +44,7 @@ from speech_to_sub.models import (
     ProcessingSettings,
     RuntimeSignature,
     Transcript,
+    TranscriptSegment,
 )
 from speech_to_sub.subtitles.builder import build_cues_with_diagnostics, render_srt
 from speech_to_sub.subtitles.validator import validate_srt_text
@@ -80,6 +81,7 @@ _LAYOUT_DIAGNOSTIC_LABELS = {
     "retimed_leading_islands": "перенесены фрагменты с аномальными начальными метками",
     "adjusted_boundaries": "скорректированы временные границы реплик",
     "max_boundary_drift_ms": "максимальный сдвиг границы, мс",
+    "timing_anomaly_adjustments": "исправлены аномальные временные якоря",
 }
 
 EventCallback = Callable[[dict[str, Any]], None]
@@ -804,7 +806,7 @@ def _build_reused_sidecar(
     stream: AudioStreamInfo,
     warning: str | None,
     normalized_duration: float,
-    subtitle_layout: Mapping[str, int],
+    subtitle_layout: Mapping[str, int | float],
 ) -> dict[str, Any]:
     finished_at = datetime.now(timezone.utc).isoformat()
     return _build_sidecar_payload(
@@ -895,9 +897,22 @@ def _build_srt_artifacts(
     *,
     path: Path,
     log: LogCallback,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, int | float]]:
+    segments = transcript.segments
+    has_segment_content = any(
+        segment.text.strip() or any(word.text.strip() for word in segment.words)
+        for segment in segments
+    )
+    if not has_segment_content and transcript.text.strip():
+        segments = (
+            TranscriptSegment(
+                start=0.0,
+                end=normalized_duration,
+                text=transcript.text,
+            ),
+        )
     build_result = build_cues_with_diagnostics(
-        transcript.segments,
+        segments,
         max_chars_per_line=settings.max_chars_per_line,
         line_length_gap=settings.line_length_gap,
         max_cps=settings.max_cps,
@@ -907,9 +922,12 @@ def _build_srt_artifacts(
     validate_srt_text(
         srt_text,
         duration=normalized_duration,
-        max_chars_per_line=settings.max_chars_per_line,
+        max_chars_per_line=(
+            settings.max_chars_per_line
+            if build_result.diagnostics.line_length_target_exceeded_lines == 0
+            else None
+        ),
         line_length_gap=settings.line_length_gap,
-        max_cps=settings.max_cps,
     )
     diagnostics = build_result.diagnostics.to_dict()
     _log_subtitle_layout_diagnostics(path, log, diagnostics)
@@ -928,7 +946,7 @@ def _build_sidecar_payload(
     warning: str | None,
     normalized_duration: float,
     transcript: Transcript,
-    subtitle_layout: Mapping[str, int],
+    subtitle_layout: Mapping[str, int | float],
     outputs: OutputPaths,
     keep_audio: bool,
 ) -> dict[str, Any]:
@@ -1170,7 +1188,7 @@ def _log_alignment_fallback(
 def _log_subtitle_layout_diagnostics(
     path: Path,
     log: LogCallback,
-    diagnostics: Mapping[str, int],
+    diagnostics: Mapping[str, int | float],
 ) -> None:
     """Журналирует только выполненные восстановления и обнаруженный сдвиг."""
     events = [
@@ -1178,6 +1196,24 @@ def _log_subtitle_layout_diagnostics(
         for key, label in _LAYOUT_DIAGNOSTIC_LABELS.items()
         if diagnostics.get(key, 0) > 0
     ]
+    if diagnostics.get("reading_speed_target_exceeded_cues", 0) > 0:
+        events.append(
+            "превышен ориентир скорости чтения: "
+            f"{diagnostics['reading_speed_target_exceeded_cues']}, "
+            f"максимум {diagnostics.get('max_actual_cps', 0):g} CPS"
+        )
+    if diagnostics.get("duration_target_exceeded_cues", 0) > 0:
+        events.append(
+            "превышен ориентир длительности: "
+            f"{diagnostics['duration_target_exceeded_cues']}, "
+            f"максимум {diagnostics.get('max_actual_duration_ms', 0):g} мс"
+        )
+    if diagnostics.get("line_length_target_exceeded_lines", 0) > 0:
+        events.append(
+            "превышен ориентир длины строки: "
+            f"{diagnostics['line_length_target_exceeded_lines']}, "
+            f"максимум {diagnostics.get('max_actual_line_length', 0):g} символов"
+        )
     if events:
         _write_log(log, f"{path.name}: разметка SRT — {'; '.join(events)}.")
 
@@ -1242,13 +1278,26 @@ def _is_valid_cache(
         validate_srt_text(
             read_text_utf8(outputs.srt_path),
             duration=duration,
-            max_chars_per_line=int(layout_settings["max_chars_per_line"]),
+            max_chars_per_line=_cached_line_length_target(sidecar, layout_settings),
             line_length_gap=int(layout_settings["line_length_gap"]),
-            max_cps=float(layout_settings["max_cps"]),
         )
     except Exception:
         return False
     return True
+
+
+def _cached_line_length_target(
+    sidecar: Mapping[str, Any] | None,
+    layout_settings: Mapping[str, Any],
+) -> int | None:
+    """Возвращает строгую ширину только для результата без адаптивного превышения."""
+    if isinstance(sidecar, Mapping):
+        diagnostics = sidecar.get(SUBTITLE_LAYOUT_SIDECAR_KEY)
+        if isinstance(diagnostics, Mapping):
+            exceeded = diagnostics.get("line_length_target_exceeded_lines", 0)
+            if isinstance(exceeded, (int, float)) and exceeded > 0:
+                return None
+    return int(layout_settings["max_chars_per_line"])
 
 
 def _is_valid_cache_candidate(

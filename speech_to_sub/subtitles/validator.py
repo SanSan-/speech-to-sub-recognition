@@ -46,7 +46,10 @@ def validate_cues(
         )
         previous_end = cue.end
 
-    if audio_duration is not None and cues[-1].end > audio_duration + duration_tolerance:
+    if (
+        audio_duration is not None
+        and cues[-1].end > audio_duration + duration_tolerance + 1e-9
+    ):
         raise ValidationError("Последняя реплика выходит за длительность аудио")
 
 
@@ -73,7 +76,9 @@ def _validate_cue(
     max_cps: float | None,
 ) -> None:
     if cue.index != expected_index:
-        raise ValidationError("Нумерация SRT должна быть последовательной и начинаться с единицы")
+        raise ValidationError(
+            "Нумерация SRT должна быть последовательной и начинаться с единицы"
+        )
     _validate_cue_text(
         cue,
         max_chars_per_line=max_chars_per_line,
@@ -94,7 +99,9 @@ def _validate_cue_text(
         raise ValidationError(f"Реплика {cue.index} не содержит текста")
     lines = cue.text.splitlines()
     if len(lines) not in (1, 2) or any(not line.strip() for line in lines):
-        raise ValidationError(f"Реплика {cue.index} должна содержать одну или две непустые строки")
+        raise ValidationError(
+            f"Реплика {cue.index} должна содержать одну или две непустые строки"
+        )
     if max_lines is not None and len(lines) > max_lines:
         raise ValidationError(f"Реплика {cue.index} превышает лимит количества строк")
     if max_chars_per_line is not None and any(
@@ -110,14 +117,21 @@ def _validate_cue_timing(
     max_cps: float | None,
 ) -> None:
     if not math.isfinite(cue.start) or not math.isfinite(cue.end):
-        raise ValidationError(f"Реплика {cue.index} содержит неконечную временную метку")
+        raise ValidationError(
+            f"Реплика {cue.index} содержит неконечную временную метку"
+        )
     if cue.start < 0 or cue.end <= cue.start:
         raise ValidationError(f"Реплика {cue.index} содержит некорректный интервал")
     if cue.start < previous_end:
         raise ValidationError(f"Реплика {cue.index} пересекается с предыдущей")
     if max_cps is not None:
         actual_cps = visible_character_count(cue.text) / (cue.end - cue.start)
-        if actual_cps > max_cps + 1e-9:
+        if actual_cps > max_cps and not math.isclose(
+            actual_cps,
+            max_cps,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
             raise ValidationError(
                 f"Реплика {cue.index} превышает лимит CPS: {actual_cps:.2f} > {max_cps:g}"
             )
@@ -165,10 +179,14 @@ def parse_srt(content: str) -> tuple[Cue, ...]:
         try:
             index = int(lines[0])
         except ValueError as error:
-            raise ValidationError(f"Некорректный номер блока SRT: {lines[0]!r}") from error
+            raise ValidationError(
+                f"Некорректный номер блока SRT: {lines[0]!r}"
+            ) from error
         timing_match = _TIMING_LINE_RE.fullmatch(lines[1])
         if timing_match is None:
-            raise ValidationError(f"Некорректная строка тайминга в блоке {block_number}")
+            raise ValidationError(
+                f"Некорректная строка тайминга в блоке {block_number}"
+            )
         cues.append(
             Cue(
                 index=index,
@@ -228,9 +246,10 @@ def _parse_timestamp(value: str) -> float:
     match = _TIMESTAMP_RE.fullmatch(value)
     if match is None:
         raise ValidationError(f"Некорректная временная метка SRT: {value!r}")
-    return (
-        int(match.group("hours")) * 3600
-        + int(match.group("minutes")) * 60
-        + int(match.group("seconds"))
-        + int(match.group("milliseconds")) / 1000
+    total_milliseconds = (
+        int(match.group("hours")) * 3_600_000
+        + int(match.group("minutes")) * 60_000
+        + int(match.group("seconds")) * 1000
+        + int(match.group("milliseconds"))
     )
+    return total_milliseconds / 1000

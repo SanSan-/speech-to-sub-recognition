@@ -164,7 +164,7 @@ def test_cache_fingerprints_separate_recognition_and_layout_settings(tmp_path: P
     assert recognition["pipeline_version"] == "7"
     assert "srt_builder_version" not in recognition
     assert layout == {
-        "srt_builder_version": "3",
+        "srt_builder_version": "4",
         "max_chars_per_line": 42,
         "line_length_gap": 8,
         "max_cps": 17.0,

@@ -36,7 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", nargs="+", required=True, type=Path, help="Файл или папка.")
     parser.add_argument("--backend", choices=backend_names(), help="Движок распознавания.")
-    parser.add_argument("--aligner", choices=aligner_names(), help="Optional aligner слов.")
+    parser.add_argument(
+        "--aligner",
+        choices=aligner_names(),
+        help="Необязательное выравнивание слов.",
+    )
     parser.add_argument("--aligner-model-path", type=Path)
     parser.add_argument("--worker-python-path", type=Path)
     parser.add_argument("--aligner-worker-python-path", type=Path)

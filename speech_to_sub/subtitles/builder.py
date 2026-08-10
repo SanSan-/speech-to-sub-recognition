@@ -25,6 +25,8 @@ from speech_to_sub.subtitles.layout import (
 
 _TIMING_MARGIN = 0.002
 _MAX_BOUNDARY_DRIFT = 1.0
+_MIN_RENDERED_CUE_DURATION = 0.001
+_SENTENCE_PAIR_MAX_GAP = 0.5
 _GOOD_BOUNDARY_PUNCTUATION = (",", ";", ":", "—")
 _COORDINATING_STARTS = frozenset({"а", "да", "и", "или", "либо", "но"})
 _WEAK_END_WORDS = frozenset(
@@ -95,6 +97,14 @@ class _ScheduledTiming:
     timing_anomaly_adjustments: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CueGroupingState:
+    groups: tuple[tuple[TimedLine, ...], ...]
+    orphan_penalty: int
+    sentence_boundary_penalty: int
+    single_position_penalty: int
+
+
 def build_cues(
     segments: Sequence[TranscriptSegment],
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE,
@@ -145,10 +155,8 @@ def build_cues_with_diagnostics(
         pause_threshold,
         audio_duration,
     )
-    for segment in segments:
-        _validate_interval(segment.start, segment.end, "сегмента")
-
-    prepared = prepare_timed_words(segments)
+    normalized_segments = _normalize_input_segments(segments, audio_duration)
+    prepared = prepare_timed_words(normalized_segments)
     if not prepared.words:
         raise ValidationError("Невозможно построить SRT: распознанный текст пуст")
 
@@ -161,7 +169,6 @@ def build_cues_with_diagnostics(
     )
     layout_words = _expand_oversized_words(
         normalized_words,
-        hard_chars_per_line,
         hard_chars_per_line,
     )
     sentences = build_timed_sentences(layout_words, pause_threshold)
@@ -179,9 +186,11 @@ def build_cues_with_diagnostics(
         pause_threshold=pause_threshold,
         audio_duration=audio_duration,
     )
-    cues = tuple(
-        Cue(index=index, start=cue.start, end=cue.end, text=cue.text)
-        for index, cue in enumerate(timing.cues, start=1)
+    cues = _canonicalize_cues(
+        tuple(
+            Cue(index=index, start=cue.start, end=cue.end, text=cue.text)
+            for index, cue in enumerate(timing.cues, start=1)
+        )
     )
     diagnostics = replace(
         prepared.diagnostics,
@@ -189,6 +198,12 @@ def build_cues_with_diagnostics(
         max_boundary_drift_ms=timing.max_boundary_drift_ms,
         timing_anomaly_adjustments=(
             anchor_adjustments + timing.timing_anomaly_adjustments
+        ),
+        **_presentation_diagnostics(
+            cues,
+            hard_chars_per_line=hard_chars_per_line,
+            max_cps=max_cps,
+            max_duration=max_duration,
         ),
     )
     return CueBuildResult(cues=cues, diagnostics=diagnostics)
@@ -207,7 +222,7 @@ def build_srt(
     audio_duration: float | None = None,
 ) -> str:
     """Строит и проверяет готовый текст SRT в памяти."""
-    cues = build_cues(
+    result = build_cues_with_diagnostics(
         segments,
         max_chars_per_line=max_chars_per_line,
         max_lines=max_lines,
@@ -221,34 +236,80 @@ def build_srt(
     from speech_to_sub.subtitles.validator import validate_cues
 
     validate_cues(
-        cues,
+        result.cues,
         audio_duration=audio_duration,
-        max_chars_per_line=max_chars_per_line,
+        max_chars_per_line=(
+            max_chars_per_line
+            if result.diagnostics.line_length_target_exceeded_lines == 0
+            else None
+        ),
         max_lines=max_lines,
         line_length_gap=line_length_gap,
-        max_cps=max_cps,
+        max_cps=None,
     )
-    return render_srt(cues)
+    return render_srt(result.cues)
 
 
 def render_srt(cues: Sequence[Cue]) -> str:
     """Форматирует cues как SRT с LF и завершающей пустой строкой."""
+    timestamps = _quantize_cue_timestamps(cues)
     blocks = [
-        f"{cue.index}\n{format_timestamp(cue.start)} --> {format_timestamp(cue.end)}\n{cue.text}"
-        for cue in cues
+        f"{cue.index}\n{_format_milliseconds(start)} --> "
+        f"{_format_milliseconds(end)}\n{cue.text}"
+        for cue, (start, end) in zip(cues, timestamps, strict=True)
     ]
     return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
 def format_timestamp(seconds: float) -> str:
     """Форматирует секунды как HH:MM:SS,mmm с округлением до миллисекунд."""
+    return _format_milliseconds(_rounded_milliseconds(seconds))
+
+
+def _rounded_milliseconds(seconds: float) -> int:
     if not math.isfinite(seconds) or seconds < 0:
-        raise ValidationError("Временная метка SRT должна быть конечной и неотрицательной")
-    total_milliseconds = int(round(seconds * 1000))
+        raise ValidationError(
+            "Временная метка SRT должна быть конечной и неотрицательной"
+        )
+    integral_seconds = math.floor(seconds)
+    milliseconds = int(round((seconds - integral_seconds) * 1000))
+    if milliseconds == 1000:
+        integral_seconds += 1
+        milliseconds = 0
+    return integral_seconds * 1000 + milliseconds
+
+
+def _format_milliseconds(total_milliseconds: int) -> str:
     hours, remainder = divmod(total_milliseconds, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     whole_seconds, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def _quantize_cue_timestamps(
+    cues: Sequence[Cue],
+) -> tuple[tuple[int, int], ...]:
+    """Квантует общую шкалу, сохраняя положительность и непересечение в SRT."""
+    result: list[tuple[int, int]] = []
+    previous_end = 0
+    for cue in cues:
+        start = max(previous_end, _rounded_milliseconds(cue.start))
+        end = max(start + 1, _rounded_milliseconds(cue.end))
+        result.append((start, end))
+        previous_end = end
+    return tuple(result)
+
+
+def _canonicalize_cues(cues: Sequence[Cue]) -> tuple[Cue, ...]:
+    """Возвращает те же реплики на точной миллисекундной шкале SRT."""
+    return tuple(
+        replace(cue, start=start / 1000, end=end / 1000)
+        for cue, (start, end) in zip(
+            cues,
+            _quantize_cue_timestamps(cues),
+            strict=True,
+        )
+    )
 
 
 def _pack_timed_sentences(
@@ -327,7 +388,9 @@ def _extend_text_partitions(
         following = words[end] if end < len(words) else None
         candidate = _advance_text_partition(state, line, following, max_chars_per_line)
         current = states[end]
-        if current is None or _text_partition_rank(candidate) < _text_partition_rank(current):
+        if current is None or _text_partition_rank(candidate) < _text_partition_rank(
+            current
+        ):
             states[end] = candidate
 
 
@@ -339,7 +402,8 @@ def _text_candidate_line(
     sentence_end: bool,
 ) -> TimedLine | None:
     text = _join_word_texts(words)
-    if len(text) > hard_chars_per_line:
+    oversized_single_word = len(words) == 1 and len(text) > hard_chars_per_line
+    if len(text) > hard_chars_per_line and not oversized_single_word:
         return None
     return TimedLine(
         start=words[0].start,
@@ -379,7 +443,12 @@ def _text_partition_rank(state: _TextPartitionState) -> tuple[int, ...]:
 
 def _text_layout_penalty(line: TimedLine, following: TranscriptWord | None) -> int:
     words = line.text.split()
-    penalty = 4 if len(words) == 1 else 0
+    if len(words) == 1:
+        penalty = 20
+    elif len(words) == 2:
+        penalty = 6
+    else:
+        penalty = 0
     if following is None:
         return penalty
 
@@ -401,19 +470,10 @@ def _plain_token(text: str) -> str:
 def _expand_oversized_words(
     words: Sequence[TranscriptWord],
     capacity: int,
-    max_chars_per_line: int,
 ) -> tuple[TranscriptWord, ...]:
     result: list[TranscriptWord] = []
     for word in words:
         result.extend(_split_word_by_capacity(word, capacity))
-    for word in result:
-        if any(
-            len(part) > max_chars_per_line and "-" not in part
-            for part in word.text.split()
-        ):
-            raise ValidationError(
-                "Одно слово не помещается в заданный лимит символов в строке"
-            )
     return tuple(result)
 
 
@@ -448,7 +508,7 @@ def _normalize_stretched_word_anchors(
             anchor_end = following.start
         result.append(
             TranscriptWord(
-                anchor_end - duration,
+                _finite_start_before(anchor_end, duration),
                 anchor_end,
                 word.text,
                 word.probability,
@@ -495,7 +555,7 @@ def _split_word_by_duration(
         # отбрасываем только приписанную ему начальную тишину.
         return (
             TranscriptWord(
-                word.end - max_duration,
+                _finite_start_before(word.end, max_duration),
                 word.end,
                 word.text,
                 word.probability,
@@ -579,6 +639,13 @@ def _timing_weights(chunks: Sequence[str]) -> list[int]:
     return weights
 
 
+def _finite_start_before(end: float, duration: float) -> float:
+    start = max(0.0, end - duration)
+    if start < end:
+        return start
+    return max(0.0, math.nextafter(end, -math.inf))
+
+
 def _split_text_by_capacity(text: str, capacity: int) -> tuple[str, ...]:
     remaining = text.strip()
     chunks: list[str] = []
@@ -587,7 +654,7 @@ def _split_text_by_capacity(text: str, capacity: int) -> tuple[str, ...]:
         if split_at < 1:
             hyphen_at = remaining.rfind("-", 1, capacity)
             if hyphen_at < 1:
-                raise ValidationError("Длинное слово невозможно разбить без повреждения")
+                return (text.strip(),)
             split_at = hyphen_at + 1
         chunks.append(remaining[:split_at].strip())
         remaining = remaining[split_at:].strip()
@@ -705,32 +772,97 @@ def _group_timed_lines(
     lines: Sequence[TimedLine],
     *,
     max_lines: int,
-    min_duration: float,
-    max_duration: float,
-    max_cps: float,
+    pause_threshold: float,
 ) -> tuple[_RawCue, ...]:
-    """Группирует готовые строки по времени, не меняя их текстовые границы."""
-    result: list[_RawCue] = []
-    index = 0
-    while index < len(lines):
-        grouped = (lines[index],)
-        if (
-            max_lines == 2
-            and index + 1 < len(lines)
-            and not lines[index].sentence_end
-            and lines[index].sentence_index == lines[index + 1].sentence_index
+    """Глобально группирует строки, не оставляя короткий хвост справа."""
+    states: list[_CueGroupingState | None] = [None] * (len(lines) + 1)
+    states[0] = _CueGroupingState((), 0, 0, 0)
+    for start in range(len(lines)):
+        _expand_cue_grouping_state(
+            states,
+            lines,
+            start=start,
+            max_lines=max_lines,
+            pause_threshold=pause_threshold,
+        )
+    final = states[-1]
+    if final is None:
+        # Одна строка всегда допустима, поэтому сюда можно попасть только при
+        # внутренней ошибке алгоритма, а не из-за содержимого распознавания.
+        return tuple(_cue_from_lines((line,)) for line in lines)
+    return tuple(_cue_from_lines(group) for group in final.groups)
+
+
+def _expand_cue_grouping_state(
+    states: list[_CueGroupingState | None],
+    lines: Sequence[TimedLine],
+    *,
+    start: int,
+    max_lines: int,
+    pause_threshold: float,
+) -> None:
+    state = states[start]
+    if state is None:
+        return
+    for size in range(1, max_lines + 1):
+        end = start + size
+        if end > len(lines):
+            return
+        group = tuple(lines[start:end])
+        if not _line_group_is_allowed(group, pause_threshold):
+            continue
+        candidate = _advance_cue_grouping(state, group, start)
+        current = states[end]
+        if current is None or _cue_grouping_rank(candidate) < _cue_grouping_rank(
+            current
         ):
-            pair = (lines[index], lines[index + 1])
-            if _line_group_fits_timing(
-                pair,
-                min_duration=min_duration,
-                max_duration=max_duration,
-                max_cps=max_cps,
-            ):
-                grouped = pair
-        result.append(_cue_from_lines(grouped))
-        index += len(grouped)
-    return tuple(result)
+            states[end] = candidate
+
+
+def _line_group_is_allowed(
+    lines: Sequence[TimedLine],
+    pause_threshold: float,
+) -> bool:
+    if len(lines) < 2:
+        return True
+    left, right = lines[-2:]
+    if left.sentence_index == right.sentence_index:
+        return True
+    return right.start - left.end < min(pause_threshold, _SENTENCE_PAIR_MAX_GAP)
+
+
+def _advance_cue_grouping(
+    state: _CueGroupingState,
+    group: tuple[TimedLine, ...],
+    start: int,
+) -> _CueGroupingState:
+    words = sum(len(line.text.split()) for line in group)
+    orphan_penalty = 0
+    if len(group) == 1:
+        if words == 1:
+            orphan_penalty = 10
+        elif words == 2:
+            orphan_penalty = 3
+    crosses_sentence = int(
+        len(group) > 1 and group[0].sentence_index != group[-1].sentence_index
+    )
+    return _CueGroupingState(
+        groups=(*state.groups, group),
+        orphan_penalty=state.orphan_penalty + orphan_penalty,
+        sentence_boundary_penalty=(state.sentence_boundary_penalty + crosses_sentence),
+        single_position_penalty=(
+            state.single_position_penalty + (start if len(group) == 1 else 0)
+        ),
+    )
+
+
+def _cue_grouping_rank(state: _CueGroupingState) -> tuple[int, ...]:
+    return (
+        len(state.groups),
+        state.orphan_penalty,
+        state.sentence_boundary_penalty,
+        -state.single_position_penalty,
+    )
 
 
 def _cue_from_lines(lines: Sequence[TimedLine]) -> _RawCue:
@@ -740,33 +872,6 @@ def _cue_from_lines(lines: Sequence[TimedLine]) -> _RawCue:
         text="\n".join(line.text for line in lines),
         words=tuple(word for line in lines for word in line.words),
     )
-
-
-def _line_group_fits_timing(
-    lines: Sequence[TimedLine],
-    *,
-    min_duration: float,
-    max_duration: float,
-    max_cps: float,
-) -> bool:
-    cue = _cue_from_lines(lines)
-    duration = max(
-        min(cue.end - cue.start, max_duration),
-        _required_duration(cue.text, min_duration, max_cps),
-    )
-    if duration > max_duration + 1e-9:
-        return False
-    try:
-        _start_range(
-            cue,
-            duration,
-            None,
-            start_drift=_MAX_BOUNDARY_DRIFT,
-            end_drift=_MAX_BOUNDARY_DRIFT,
-        )
-    except ValidationError:
-        return False
-    return True
 
 
 def _schedule_timing(
@@ -783,10 +888,42 @@ def _schedule_timing(
     cues = _group_timed_lines(
         normalized,
         max_lines=max_lines,
-        min_duration=min_duration,
-        max_duration=max_duration,
-        max_cps=max_cps,
+        pause_threshold=pause_threshold,
     )
+    try:
+        scheduled, adjusted, max_drift_ms = _schedule_target_timing(
+            cues,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            max_cps=max_cps,
+            pause_threshold=pause_threshold,
+            audio_duration=audio_duration,
+        )
+    except ValidationError:
+        scheduled = _schedule_anchor_fallback(cues, audio_duration)
+        if len(scheduled) == len(cues):
+            blocks = _timing_block_ranges(cues, pause_threshold)
+            adjusted, max_drift_ms = _boundary_diagnostics(cues, scheduled, blocks)
+        else:
+            adjusted, max_drift_ms = 0, 0
+    return _ScheduledTiming(
+        scheduled,
+        adjusted,
+        max_drift_ms,
+        anomaly_adjustments,
+    )
+
+
+def _schedule_target_timing(
+    cues: Sequence[_RawCue],
+    *,
+    min_duration: float,
+    max_duration: float,
+    max_cps: float,
+    pause_threshold: float,
+    audio_duration: float | None,
+) -> tuple[tuple[_RawCue, ...], int, int]:
+    """Пытается назначить целевое время; содержимое не зависит от успеха попытки."""
     durations = tuple(
         max(
             min(cue.end - cue.start, max_duration),
@@ -812,8 +949,137 @@ def _schedule_timing(
         _RawCue(start, start + duration, cue.text, cue.words)
         for cue, start, duration in zip(cues, starts, durations, strict=True)
     )
+    scheduled = _remove_floating_overlaps(scheduled)
+    if not _cue_timing_is_structural(scheduled):
+        raise ValidationError("Точность временной шкалы не позволяет назначить реплики")
     adjusted, max_drift_ms = _boundary_diagnostics(cues, scheduled, block_ranges)
-    return _ScheduledTiming(scheduled, adjusted, max_drift_ms, anomaly_adjustments)
+    return scheduled, adjusted, max_drift_ms
+
+
+def _remove_floating_overlaps(cues: Sequence[_RawCue]) -> tuple[_RawCue, ...]:
+    """Устраняет машинную погрешность на общей границе соседних реплик."""
+    result: list[_RawCue] = []
+    previous_end = 0.0
+    for cue in cues:
+        start = max(previous_end, cue.start)
+        end = max(cue.end, start + 1e-9)
+        result.append(_RawCue(start, end, cue.text, cue.words))
+        previous_end = end
+    return tuple(result)
+
+
+def _schedule_anchor_fallback(
+    cues: Sequence[_RawCue],
+    audio_duration: float | None,
+) -> tuple[_RawCue, ...]:
+    """Назначает монотонное время по якорям без ограничений чтения и длительности."""
+    if not cues:
+        return ()
+    natural_end = max(cue.end for cue in cues)
+    timeline_end = max(
+        _MIN_RENDERED_CUE_DURATION,
+        audio_duration if audio_duration is not None else natural_end,
+    )
+    required_for_all_cues = len(cues) * _MIN_RENDERED_CUE_DURATION
+    maximum_cues = (
+        len(cues)
+        if timeline_end >= required_for_all_cues
+        else max(1, int(timeline_end // _MIN_RENDERED_CUE_DURATION))
+    )
+    compacted = _compact_cues(cues, maximum_cues)
+    cue_count = len(compacted)
+    minimum_span = cue_count * _MIN_RENDERED_CUE_DURATION
+    timeline_start = min(
+        max(0.0, compacted[0].start),
+        max(0.0, timeline_end - minimum_span),
+    )
+    final_anchor = min(timeline_end, max(timeline_start, compacted[-1].end))
+    final_end = max(final_anchor, timeline_start + minimum_span)
+    final_end = min(timeline_end, final_end)
+
+    boundaries = [timeline_start]
+    for index in range(cue_count - 1):
+        desired = (compacted[index].end + compacted[index + 1].start) / 2
+        minimum = boundaries[-1] + _MIN_RENDERED_CUE_DURATION
+        remaining = cue_count - index - 1
+        maximum = final_end - remaining * _MIN_RENDERED_CUE_DURATION
+        boundaries.append(min(max(desired, minimum), maximum))
+    boundaries.append(final_end)
+    scheduled = tuple(
+        _RawCue(
+            start=boundaries[index],
+            end=boundaries[index + 1],
+            text=cue.text,
+            words=cue.words,
+        )
+        for index, cue in enumerate(compacted)
+    )
+    if _cue_timing_is_structural(scheduled):
+        return scheduled
+    return _schedule_evenly_from_zero(compacted, timeline_end)
+
+
+def _schedule_evenly_from_zero(
+    cues: Sequence[_RawCue],
+    timeline_end: float,
+) -> tuple[_RawCue, ...]:
+    step = timeline_end / len(cues)
+    scheduled = tuple(
+        _RawCue(
+            start=step * index,
+            end=timeline_end if index + 1 == len(cues) else step * (index + 1),
+            text=cue.text,
+            words=cue.words,
+        )
+        for index, cue in enumerate(cues)
+    )
+    if _cue_timing_is_structural(scheduled):
+        return scheduled
+    return (
+        _RawCue(
+            start=0.0,
+            end=timeline_end,
+            text=" ".join(cue.text.replace("\n", " ") for cue in cues),
+            words=tuple(word for cue in cues for word in cue.words),
+        ),
+    )
+
+
+def _cue_timing_is_structural(cues: Sequence[_RawCue]) -> bool:
+    previous_end = 0.0
+    for cue in cues:
+        if (
+            not math.isfinite(cue.start)
+            or not math.isfinite(cue.end)
+            or cue.start < previous_end
+            or cue.end <= cue.start
+        ):
+            return False
+        previous_end = cue.end
+    return True
+
+
+def _compact_cues(
+    cues: Sequence[_RawCue],
+    maximum_cues: int,
+) -> tuple[_RawCue, ...]:
+    """Сжимает только экстремально короткую шкалу, не теряя текст и слова."""
+    if len(cues) <= maximum_cues:
+        return tuple(cues)
+    result: list[_RawCue] = []
+    for group_index in range(maximum_cues):
+        start = group_index * len(cues) // maximum_cues
+        end = (group_index + 1) * len(cues) // maximum_cues
+        group = cues[start:end]
+        result.append(
+            _RawCue(
+                start=group[0].start,
+                end=max(cue.end for cue in group),
+                text=" ".join(cue.text.replace("\n", " ") for cue in group),
+                words=tuple(word for cue in group for word in cue.words),
+            )
+        )
+    return tuple(result)
 
 
 def _timing_block_ranges(
@@ -941,7 +1207,7 @@ def _boundary_diagnostics(
             )
     adjusted = tuple(drift for drift in drifts if drift > 1e-9)
     maximum = max(adjusted, default=0.0)
-    return len(adjusted), int(round(maximum * 1000))
+    return len(adjusted), _duration_milliseconds(maximum)
 
 
 def _internal_boundary_drifts(
@@ -1071,9 +1337,100 @@ def _join_word_texts(words: Sequence[TranscriptWord]) -> str:
     return result
 
 
-def _validate_interval(start: float, end: float, label: str) -> None:
-    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
-        raise ValidationError(f"Некорректные временные границы {label}: {start}–{end}")
+def _normalize_input_segments(
+    segments: Sequence[TranscriptSegment],
+    audio_duration: float | None,
+) -> tuple[TranscriptSegment, ...]:
+    """Сохраняет распознанный текст даже при повреждённых границах сегмента."""
+    content: list[tuple[TranscriptSegment, str]] = []
+    for segment in segments:
+        text = " ".join(segment.text.split()) or _join_word_texts(segment.words)
+        if text:
+            content.append((segment, text))
+    if not content:
+        return ()
+
+    valid_ends = [
+        segment.end
+        for segment, _ in content
+        if _interval_is_valid(segment.start, segment.end)
+    ]
+    horizon = audio_duration or max(valid_ends, default=float(len(content)))
+    horizon = max(horizon, _MIN_RENDERED_CUE_DURATION)
+    intervals_are_usable = _segment_intervals_are_usable(content, audio_duration)
+    if intervals_are_usable:
+        return tuple(replace(segment, text=text) for segment, text in content)
+
+    normalized: list[TranscriptSegment] = []
+    for index, (segment, text) in enumerate(content):
+        start = horizon * index / len(content)
+        end = horizon * (index + 1) / len(content)
+        normalized.append(
+            TranscriptSegment(
+                start=start,
+                end=max(end, start + horizon / (len(content) * 2)),
+                text=text,
+                words=(),
+                segment_id=segment.segment_id,
+            )
+        )
+    return tuple(normalized)
+
+
+def _segment_intervals_are_usable(
+    content: Sequence[tuple[TranscriptSegment, str]],
+    audio_duration: float | None,
+) -> bool:
+    for segment, _ in content:
+        if not _interval_is_valid(segment.start, segment.end):
+            return False
+        if audio_duration is not None and segment.end > audio_duration + 1e-9:
+            return False
+    return True
+
+
+def _presentation_diagnostics(
+    cues: Sequence[Cue],
+    *,
+    hard_chars_per_line: int,
+    max_cps: float,
+    max_duration: float,
+) -> dict[str, int | float]:
+    rendered_timestamps = _quantize_cue_timestamps(cues)
+    durations_ms = tuple(end - start for start, end in rendered_timestamps)
+    actual_cps = tuple(
+        visible_character_count(cue.text) * 1000 / duration_ms
+        for cue, duration_ms in zip(cues, durations_ms, strict=True)
+    )
+    line_lengths = tuple(len(line) for cue in cues for line in cue.text.splitlines())
+    return {
+        "reading_speed_target_exceeded_cues": sum(
+            value > max_cps
+            and not math.isclose(value, max_cps, rel_tol=1e-9, abs_tol=1e-9)
+            for value in actual_cps
+        ),
+        "max_actual_cps": round(max(actual_cps, default=0.0), 6),
+        "duration_target_exceeded_cues": sum(
+            duration_ms > _duration_milliseconds(max_duration)
+            for duration_ms in durations_ms
+        ),
+        "max_actual_duration_ms": max(durations_ms, default=0),
+        "line_length_target_exceeded_lines": sum(
+            length > hard_chars_per_line for length in line_lengths
+        ),
+        "max_actual_line_length": max(line_lengths, default=0),
+    }
+
+
+def _interval_is_valid(start: float, end: float) -> bool:
+    return math.isfinite(start) and math.isfinite(end) and start >= 0 and end > start
+
+
+def _duration_milliseconds(duration: float) -> int:
+    milliseconds = duration * 1000
+    if math.isfinite(milliseconds):
+        return int(round(milliseconds))
+    return int(duration) * 1000
 
 
 def _validate_settings(

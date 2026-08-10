@@ -131,7 +131,9 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> FakeService:
     return service
 
 
-def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService) -> None:
+def test_static_page_and_config_have_no_secret_fields(
+    fake_service: FakeService,
+) -> None:
     del fake_service
     client = TestClient(web_app.app)
 
@@ -145,8 +147,8 @@ def test_static_page_and_config_have_no_secret_fields(fake_service: FakeService)
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.5.1"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.1"
+    assert health.json()["version"] == "1.5.2"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.2"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -264,7 +266,9 @@ def test_pick_and_refresh_are_serialized_on_server(
 
     original_build_items = fake_service.build_items
 
-    def tracked_build_items(paths: list[str], settings: dict[str, Any]) -> list[dict[str, Any]]:
+    def tracked_build_items(
+        paths: list[str], settings: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if paths == [str(refreshed_path.resolve(strict=False))]:
             refresh_build_entered.set()
         return original_build_items(paths, settings)
@@ -311,28 +315,40 @@ def test_state_changing_api_rejects_cross_origin_and_non_loopback_host(
     client = TestClient(web_app.app)
 
     assert client.post("/api/refresh", json=payload).status_code == 200
-    assert client.post(
-        "/api/refresh",
-        json=payload,
-        headers={"Origin": "https://attacker.example"},
-    ).status_code == 403
-    assert client.post(
-        "/api/refresh",
-        json=payload,
-        headers={"Host": "attacker.example"},
-    ).status_code == 403
+    assert (
+        client.post(
+            "/api/refresh",
+            json=payload,
+            headers={"Origin": "https://attacker.example"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/refresh",
+            json=payload,
+            headers={"Host": "attacker.example"},
+        ).status_code
+        == 403
+    )
 
     local_client = TestClient(web_app.app, base_url="http://127.0.0.1:7862")
-    assert local_client.post(
-        "/api/refresh",
-        json=payload,
-        headers={"Origin": "http://127.0.0.1:7862"},
-    ).status_code == 200
-    assert local_client.post(
-        "/api/refresh",
-        json=payload,
-        headers={"Origin": "http://127.0.0.1:9999"},
-    ).status_code == 403
+    assert (
+        local_client.post(
+            "/api/refresh",
+            json=payload,
+            headers={"Origin": "http://127.0.0.1:7862"},
+        ).status_code
+        == 200
+    )
+    assert (
+        local_client.post(
+            "/api/refresh",
+            json=payload,
+            headers={"Origin": "http://127.0.0.1:9999"},
+        ).status_code
+        == 403
+    )
     assert fake_service.build_calls
 
 
@@ -651,7 +667,9 @@ def test_web_settings_reject_unknown_backend(fake_service: FakeService) -> None:
     assert response.status_code == 422
 
 
-def test_folder_collection_filters_media_and_respects_recursive_mode(tmp_path: Path) -> None:
+def test_folder_collection_filters_media_and_respects_recursive_mode(
+    tmp_path: Path,
+) -> None:
     nested = tmp_path / "Вложенный каталог"
     nested.mkdir()
     top_video = tmp_path / "Лекция.mp4"
@@ -662,7 +680,9 @@ def test_folder_collection_filters_media_and_respects_recursive_mode(tmp_path: P
     ignored.write_text("не медиа", encoding="utf-8")
 
     assert collect_media_paths(tmp_path, recursive=False) == (top_video,)
-    expected = tuple(sorted((top_video, nested_audio), key=lambda path: str(path).casefold()))
+    expected = tuple(
+        sorted((top_video, nested_audio), key=lambda path: str(path).casefold())
+    )
     assert collect_media_paths(tmp_path, recursive=True) == expected
 
 

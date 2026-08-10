@@ -18,7 +18,7 @@ def test_unknown_backend_without_explicit_model_is_domain_error() -> None:
 
 
 def test_package_version_matches_v151_milestone() -> None:
-    assert __version__ == "1.5.1"
+    assert __version__ == "1.5.2"
 
 
 def test_processing_settings_round_trip_subtitle_layout_limits() -> None:
@@ -77,7 +77,7 @@ def test_transcript_round_trip_from_sidecar_mapping() -> None:
     "mutation",
     (
         {"duration": "1.5"},
-        {"segments": []},
+        {"segments": {}},
         {"quantized": 0},
         {"metadata": []},
     ),
@@ -107,3 +107,17 @@ def test_transcript_from_mapping_rejects_malformed_payload(
 
     with pytest.raises(ValidationError, match="sidecar"):
         Transcript.from_mapping(payload)
+
+
+def test_transcript_from_mapping_preserves_text_without_segments() -> None:
+    transcript = Transcript(
+        text="Готовая расшифровка без посегментных меток.",
+        language="ru",
+        duration=1.5,
+        segments=(),
+        model="local-model",
+        device="cpu",
+        quantized=False,
+    )
+
+    assert Transcript.from_mapping(transcript.to_dict()) == transcript

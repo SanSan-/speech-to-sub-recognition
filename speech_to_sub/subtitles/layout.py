@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from collections.abc import Sequence
 from typing import Literal
@@ -41,8 +41,14 @@ class LayoutDiagnostics:
     adjusted_boundaries: int = 0
     max_boundary_drift_ms: int = 0
     timing_anomaly_adjustments: int = 0
+    reading_speed_target_exceeded_cues: int = 0
+    max_actual_cps: float = 0.0
+    duration_target_exceeded_cues: int = 0
+    max_actual_duration_ms: int = 0
+    line_length_target_exceeded_lines: int = 0
+    max_actual_line_length: int = 0
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | float]:
         """Возвращает JSON-совместимое представление для sidecar."""
         return {
             "reconciled_segments": self.reconciled_segments,
@@ -52,6 +58,16 @@ class LayoutDiagnostics:
             "adjusted_boundaries": self.adjusted_boundaries,
             "max_boundary_drift_ms": self.max_boundary_drift_ms,
             "timing_anomaly_adjustments": self.timing_anomaly_adjustments,
+            "reading_speed_target_exceeded_cues": (
+                self.reading_speed_target_exceeded_cues
+            ),
+            "max_actual_cps": self.max_actual_cps,
+            "duration_target_exceeded_cues": self.duration_target_exceeded_cues,
+            "max_actual_duration_ms": self.max_actual_duration_ms,
+            "line_length_target_exceeded_lines": (
+                self.line_length_target_exceeded_lines
+            ),
+            "max_actual_line_length": self.max_actual_line_length,
         }
 
 
@@ -71,7 +87,7 @@ class TimedSentence:
     words: tuple[TranscriptWord, ...]
     start: float
     end: float
-    boundary: Literal["sentence", "pause", "end"]
+    boundary: Literal["sentence", "end"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,15 +113,13 @@ class _MutableWord:
 @dataclass(slots=True)
 class _AlignmentWordState:
     result: list[_MutableWord]
-    pending_dash: TranscriptWord | None = None
-    pending_prefix: str = ""
+    pending_decorations: list[TranscriptWord] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class _DisplayUnitState:
     result: list[str]
-    pending_dash: bool = False
-    pending_prefix: str = ""
+    pending_decorations: list[str] = field(default_factory=list)
 
 
 def visible_character_count(text: str) -> int:
@@ -124,13 +138,21 @@ def prepare_timed_words(segments: Sequence[TranscriptSegment]) -> PreparedWords:
     for segment in segments:
         text = _clean_text(segment.text)
         words = tuple(word for word in segment.words if _clean_text(word.text))
-        _validate_word_intervals(words)
+        if words and not _word_intervals_are_valid(
+            words,
+            segment_start=segment.start,
+            segment_end=segment.end,
+        ):
+            words = ()
         if words:
             words, island_retimed = _retime_leading_island(segment, words)
             retimed += int(island_retimed)
             if text and _texts_correspond(text, words):
                 prepared.extend(_reconcile_text_with_words(text, words))
                 reconciled += 1
+            elif text:
+                prepared.extend(_words_from_segment(segment.start, segment.end, text))
+                synthetic += 1
             else:
                 prepared.extend(_normalize_alignment_words(words))
                 alignment_text += 1
@@ -138,8 +160,7 @@ def prepare_timed_words(segments: Sequence[TranscriptSegment]) -> PreparedWords:
             prepared.extend(_words_from_segment(segment.start, segment.end, text))
             synthetic += 1
 
-    ordered = tuple(sorted(prepared, key=lambda word: (word.start, word.end)))
-    merged = _merge_global_hyphen_suffixes(ordered)
+    merged = _merge_global_hyphen_suffixes(prepared)
     return PreparedWords(
         words=merged,
         diagnostics=LayoutDiagnostics(
@@ -166,19 +187,10 @@ def build_timed_sentences(
     for index, word in enumerate(words):
         following = words[index + 1] if index + 1 < len(words) else None
         sentence_end = bool(_SENTENCE_END_RE.search(_clean_text(word.text)))
-        hard_pause = bool(
-            following is not None and following.start - word.end >= pause_threshold
-        )
-        if following is not None and not sentence_end and not hard_pause:
+        if following is not None and not sentence_end:
             continue
         chunk = tuple(words[start : index + 1])
-        boundary: Literal["sentence", "pause", "end"]
-        if sentence_end:
-            boundary = "sentence"
-        elif hard_pause:
-            boundary = "pause"
-        else:
-            boundary = "end"
+        boundary: Literal["sentence", "end"] = "sentence" if sentence_end else "end"
         result.append(
             TimedSentence(
                 text=_join_prepared_words(chunk),
@@ -331,7 +343,11 @@ def _consume_alignment_word(
     if _capture_alignment_decoration(state, token, word):
         return
     token = _normalize_leading_hyphen(token)
-    if state.result and state.result[-1].text.endswith("-"):
+    if (
+        state.result
+        and state.result[-1].text.endswith("-")
+        and not state.pending_decorations
+    ):
         _append_to_previous(state.result[-1], token, word)
         return
     _append_alignment_lexeme(state, token, word)
@@ -343,15 +359,23 @@ def _capture_alignment_decoration(
     word: TranscriptWord,
 ) -> bool:
     if token in _DASHES:
-        state.pending_dash = word
+        state.pending_decorations.append(
+            TranscriptWord(word.start, word.end, "—", word.probability)
+        )
         return True
-    if _is_closing_punctuation(token) and state.result:
-        _append_to_previous(state.result[-1], token, word)
-        return True
+    if _is_closing_punctuation(token):
+        if state.pending_decorations:
+            state.pending_decorations.append(word)
+            return True
+        if state.result:
+            _append_to_previous(state.result[-1], token, word)
+            return True
     if _is_punctuation_only(token, _OPENING_PUNCTUATION):
-        state.pending_prefix += token
+        state.pending_decorations.append(word)
         return True
-    if _is_hyphen_suffix(token) and state.pending_dash is None:
+    if _is_hyphen_suffix(token) and not any(
+        decoration.text == "—" for decoration in state.pending_decorations
+    ):
         _append_alignment_suffix(state.result, token, word)
         return True
     return False
@@ -373,30 +397,48 @@ def _append_alignment_lexeme(
     token: str,
     word: TranscriptWord,
 ) -> None:
-    prefix = state.pending_prefix
-    start = word.start
+    decorations = tuple(state.pending_decorations)
+    start = min(
+        (item.start for item in decorations),
+        default=word.start,
+    )
     probabilities = _probabilities(word)
-    if state.pending_dash is not None:
-        prefix += "— "
-        start = min(start, state.pending_dash.start)
-        probabilities.extend(_probabilities(state.pending_dash))
-        state.pending_dash = None
-    state.result.append(_MutableWord(prefix + token, start, word.end, probabilities))
-    state.pending_prefix = ""
+    for decoration in decorations:
+        probabilities.extend(_probabilities(decoration))
+    text = _format_pending_decorations(
+        tuple(decoration.text for decoration in decorations),
+        token,
+    )
+    end = max((item.end for item in decorations), default=word.end)
+    state.result.append(_MutableWord(text, start, max(end, word.end), probabilities))
+    state.pending_decorations.clear()
 
 
 def _finish_alignment_words(state: _AlignmentWordState) -> None:
-    if state.pending_dash is None:
+    decoration_words = tuple(state.pending_decorations)
+    if not decoration_words:
         return
+    decoration = _format_pending_decorations(
+        tuple(word.text for word in decoration_words)
+    )
+    start = min(word.start for word in decoration_words)
+    end = max(word.end for word in decoration_words)
+    probabilities = [
+        probability
+        for word in decoration_words
+        for probability in _probabilities(word)
+    ]
     if state.result:
-        _append_to_previous(state.result[-1], " —", state.pending_dash)
+        state.result[-1].text += f" {decoration}"
+        state.result[-1].end = max(state.result[-1].end, end)
+        state.result[-1].probabilities.extend(probabilities)
         return
     state.result.append(
         _MutableWord(
-            "—",
-            state.pending_dash.start,
-            state.pending_dash.end,
-            _probabilities(state.pending_dash),
+            decoration,
+            start,
+            end,
+            probabilities,
         )
     )
 
@@ -420,6 +462,8 @@ def _probabilities(word: TranscriptWord) -> list[float]:
 
 def _words_from_segment(start: float, end: float, text: str) -> tuple[TranscriptWord, ...]:
     units = _display_units(text)
+    if not units:
+        return ()
     weights = [max(1, len(_compact_text(unit))) for unit in units]
     total_weight = sum(weights)
     elapsed = 0
@@ -446,25 +490,25 @@ def _consume_display_token(state: _DisplayUnitState, raw_token: str) -> None:
     if _capture_display_decoration(state, token):
         return
     token = _normalize_leading_hyphen(token)
-    prefix = state.pending_prefix
-    if state.pending_dash:
-        prefix += "— "
-    state.result.append(prefix + token)
-    state.pending_dash = False
-    state.pending_prefix = ""
+    state.result.append(_format_pending_decorations(tuple(state.pending_decorations), token))
+    state.pending_decorations.clear()
 
 
 def _capture_display_decoration(state: _DisplayUnitState, token: str) -> bool:
     if token == "—":
-        state.pending_dash = True
+        state.pending_decorations.append(token)
         return True
-    if _is_closing_punctuation(token) and state.result:
-        state.result[-1] += token
-        return True
+    if _is_closing_punctuation(token):
+        if state.pending_decorations:
+            state.pending_decorations.append(token)
+            return True
+        if state.result:
+            state.result[-1] += token
+            return True
     if _is_punctuation_only(token, _OPENING_PUNCTUATION):
-        state.pending_prefix += token
+        state.pending_decorations.append(token)
         return True
-    if _is_hyphen_suffix(token) and not state.pending_dash:
+    if _is_hyphen_suffix(token) and "—" not in state.pending_decorations:
         _append_display_suffix(state.result, token)
         return True
     return False
@@ -478,8 +522,28 @@ def _append_display_suffix(result: list[str], token: str) -> None:
 
 
 def _finish_display_units(state: _DisplayUnitState) -> None:
-    if state.pending_dash and state.result:
-        state.result[-1] += " —"
+    if not state.pending_decorations:
+        return
+    decoration = _format_pending_decorations(tuple(state.pending_decorations))
+    if state.result:
+        state.result[-1] += f" {decoration}"
+    else:
+        state.result.append(decoration)
+
+
+def _format_pending_decorations(
+    decorations: Sequence[str],
+    lexeme: str = "",
+) -> str:
+    result = ""
+    for decoration in decorations:
+        if decoration == "—":
+            if result and not result.endswith(" "):
+                result += " "
+            result += "— "
+        else:
+            result += decoration
+    return f"{result}{lexeme}".rstrip()
 
 
 def _normalize_leading_hyphen(token: str) -> str:
@@ -616,17 +680,30 @@ def _plain_word_text(words: Sequence[TranscriptWord]) -> str:
     return " ".join(_clean_text(word.text) for word in words)
 
 
-def _validate_word_intervals(words: Sequence[TranscriptWord]) -> None:
+def _word_intervals_are_valid(
+    words: Sequence[TranscriptWord],
+    *,
+    segment_start: float,
+    segment_end: float,
+) -> bool:
+    """Проверяет словные якоря без превращения ошибки выравнивания в отказ SRT."""
+    if not _interval_is_valid(segment_start, segment_end):
+        return False
+    previous_end = segment_start
     for word in words:
         if (
-            not math.isfinite(word.start)
-            or not math.isfinite(word.end)
-            or word.start < 0
-            or word.end <= word.start
+            not _interval_is_valid(word.start, word.end)
+            or word.start + 1e-9 < previous_end
+            or word.start + 1e-9 < segment_start
+            or word.end > segment_end + 1e-9
         ):
-            raise ValidationError(
-                f"Некорректные временные границы слова: {word.start}–{word.end}"
-            )
+            return False
+        previous_end = word.end
+    return True
+
+
+def _interval_is_valid(start: float, end: float) -> bool:
+    return math.isfinite(start) and math.isfinite(end) and start >= 0 and end > start
 
 
 def _is_punctuation_only(token: str, allowed: frozenset[str]) -> bool:

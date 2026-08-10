@@ -189,7 +189,6 @@ class Transcript:
         segments_raw = value.get("segments")
         if (
             not isinstance(segments_raw, list)
-            or not segments_raw
             or any(not isinstance(segment, Mapping) for segment in segments_raw)
         ):
             raise ValidationError("Список сегментов распознавания в sidecar имеет неверный формат.")

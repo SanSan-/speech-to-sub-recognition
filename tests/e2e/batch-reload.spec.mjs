@@ -229,7 +229,7 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   const device = page.getByLabel("Устройство");
   const maxCharsPerLine = page.getByLabel("Базовая длина строки SRT");
   const lineLengthGap = page.getByLabel("Допуск длины строки SRT");
-  const maxCps = page.getByLabel("Скорость чтения, символов/с");
+  const maxCps = page.getByLabel("Ориентир скорости чтения, символов/с");
   const cancel = page.getByRole("button", { name: "Отменить" });
   const retry = page.getByRole("button", { name: "Повторить ошибки" });
   await language.selectOption("ru");

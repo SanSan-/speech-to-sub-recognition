@@ -26,13 +26,16 @@ def test_format_timestamp_rounds_milliseconds_and_supports_long_audio() -> None:
     assert format_timestamp(0) == "00:00:00,000"
     assert format_timestamp(3661.9996) == "01:01:02,000"
     assert format_timestamp(100 * 3600 + 2.003) == "100:00:02,003"
+    huge_timestamp = format_timestamp(1e306)
+    assert huge_timestamp.count(":") == 2
+    assert huge_timestamp.endswith(",000")
 
 
-def test_builder_prefers_word_timestamps_and_splits_on_pause() -> None:
+def test_builder_preserves_segment_text_when_word_text_disagrees() -> None:
     segment = TranscriptSegment(
         start=0.0,
         end=4.0,
-        text="Fallback text must not be used",
+        text="Исходный текст должен сохраниться.",
         words=(
             TranscriptWord(0.0, 0.5, "Hello"),
             TranscriptWord(0.5, 1.0, "world."),
@@ -43,10 +46,9 @@ def test_builder_prefers_word_timestamps_and_splits_on_pause() -> None:
 
     cues = build_cues((segment,), audio_duration=4.0)
 
-    assert [cue.text for cue in cues] == ["Hello world.", "Second cue."]
+    assert [cue.text for cue in cues] == ["Исходный текст должен сохраниться."]
     assert cues[0].start == 0.0
-    assert cues[0].end <= cues[1].start
-    assert cues[1].end <= 4.0
+    assert cues[0].end <= 4.0
 
 
 def test_builder_does_not_add_spaces_around_hyphenated_word() -> None:
@@ -64,6 +66,41 @@ def test_builder_does_not_add_spaces_around_hyphenated_word() -> None:
     cues = build_cues((segment,))
 
     assert cues[0].text == "IP-адрес"
+
+
+def test_alignment_only_decorations_preserve_count_and_order() -> None:
+    segment = TranscriptSegment(
+        0.0,
+        1.0,
+        "",
+        words=(
+            TranscriptWord(0.0, 0.25, "—"),
+            TranscriptWord(0.25, 0.5, "—"),
+            TranscriptWord(0.5, 0.75, "("),
+            TranscriptWord(0.75, 1.0, "«"),
+        ),
+    )
+
+    prepared = prepare_timed_words((segment,))
+
+    assert [word.text for word in prepared.words] == ["— — («"]
+
+
+def test_alignment_pending_decorations_do_not_reorder_closing_punctuation() -> None:
+    segment = TranscriptSegment(
+        0.0,
+        1.0,
+        "",
+        words=(
+            TranscriptWord(0.0, 0.3, "a"),
+            TranscriptWord(0.3, 0.6, "—"),
+            TranscriptWord(0.6, 1.0, ")"),
+        ),
+    )
+
+    prepared = prepare_timed_words((segment,))
+
+    assert [word.text for word in prepared.words] == ["a — )"]
 
 
 def test_builder_uses_segment_timestamps_and_limits_text_to_two_lines() -> None:
@@ -107,6 +144,7 @@ def test_builder_removes_overlaps_between_segments() -> None:
             TranscriptSegment(0.0, 1.5, "First cue."),
             TranscriptSegment(1.5, 3.0, "Second cue."),
         ),
+        max_lines=1,
         audio_duration=3.0,
     )
 
@@ -269,7 +307,7 @@ def test_builder_enforces_line_and_reading_speed_limits() -> None:
     )
 
 
-def test_builder_starts_each_sentence_in_a_new_cue() -> None:
+def test_builder_starts_each_sentence_on_a_new_line() -> None:
     segment = TranscriptSegment(
         0.0,
         3.0,
@@ -284,10 +322,12 @@ def test_builder_starts_each_sentence_in_a_new_cue() -> None:
 
     cues = build_cues((segment,), audio_duration=3.5)
 
-    assert [cue.text for cue in cues] == ["Первое предложение.", "Второе предложение!"]
+    assert [cue.text for cue in cues] == [
+        "Первое предложение.\nВторое предложение!"
+    ]
 
 
-def test_builder_uses_pause_as_hard_boundary_for_short_phrase() -> None:
+def test_builder_does_not_split_unfinished_sentence_at_pause() -> None:
     segment = TranscriptSegment(
         0.0,
         3.0,
@@ -300,7 +340,7 @@ def test_builder_uses_pause_as_hard_boundary_for_short_phrase() -> None:
 
     cues = build_cues((segment,), audio_duration=3.0)
 
-    assert [cue.text for cue in cues] == ["Да,", "продолжаем."]
+    assert [cue.text for cue in cues] == ["Да, продолжаем."]
 
 
 def test_validator_applies_layout_limits_only_when_requested() -> None:
@@ -313,11 +353,18 @@ def test_validator_applies_layout_limits_only_when_requested() -> None:
         validate_cues((cue,), max_cps=5)
 
 
-def test_builder_rejects_impossible_reading_window() -> None:
+def test_builder_reports_impossible_reading_window_without_failure() -> None:
     segment = TranscriptSegment(0.0, 0.5, "Очень длинная фраза.")
 
-    with pytest.raises(ValidationError, match="Невозможно выдержать лимит"):
-        build_cues((segment,), max_cps=5, audio_duration=0.5)
+    result = build_cues_with_diagnostics(
+        (segment,),
+        max_cps=5,
+        audio_duration=0.5,
+    )
+
+    assert [cue.text for cue in result.cues] == ["Очень длинная фраза."]
+    assert result.diagnostics.reading_speed_target_exceeded_cues == 1
+    validate_cues(result.cues, audio_duration=0.5)
 
 
 def test_builder_keeps_raw_speech_inside_extended_cue() -> None:
@@ -333,10 +380,11 @@ def test_builder_keeps_raw_speech_inside_extended_cue() -> None:
 
     cues = build_cues((segment,), max_chars_per_line=42, max_cps=17, audio_duration=10.0)
 
-    assert len(cues) == 2
-    assert cues[0].start <= 5.0 <= 6.8 <= cues[0].end
-    assert cues[1].start <= 7.0 <= 8.8 <= cues[1].end
-    assert cues[0].end <= cues[1].start
+    assert len(cues) == 1
+    assert cues[0].text == (
+        "Первая содержательная фраза.\nВторая содержательная фраза."
+    )
+    assert cues[0].start <= 5.0 <= 6.8 <= 7.0 <= 8.8 <= cues[0].end
 
 
 def test_builder_merges_hyphen_suffix_across_segments() -> None:
@@ -377,7 +425,7 @@ def test_builder_splits_sentences_glued_inside_one_token() -> None:
 
     cues = build_cues((segment,), audio_duration=3.0)
 
-    assert [cue.text for cue in cues] == ["Нет звука.", "Ждём продолжения."]
+    assert [cue.text for cue in cues] == ["Нет звука.\nЖдём продолжения."]
 
 
 def test_builder_attaches_separate_closing_quote_to_previous_sentence() -> None:
@@ -396,7 +444,7 @@ def test_builder_attaches_separate_closing_quote_to_previous_sentence() -> None:
     cues = build_cues((segment,), audio_duration=2.0)
 
     assert [word.text for word in prepared.words] == ['Почему?".', "Следующая."]
-    assert [cue.text for cue in cues] == ['Почему?".', "Следующая."]
+    assert [cue.text for cue in cues] == ['Почему?".\nСледующая.']
 
 
 def test_builder_prefers_punctuation_line_break_and_never_splits_word() -> None:
@@ -453,7 +501,7 @@ def test_builder_uses_bounded_drift_for_dense_realistic_speech() -> None:
     assert all(left.end <= right.start for left, right in zip(result.cues, result.cues[1:]))
 
 
-def test_builder_rejects_boundary_drift_over_one_second() -> None:
+def test_builder_uses_best_effort_beyond_boundary_drift_target() -> None:
     sentence = "Много быстрых слов нужно показать читателю без нарушения строгих ограничений."
     segments = (
         TranscriptSegment(
@@ -476,8 +524,11 @@ def test_builder_rejects_boundary_drift_over_one_second() -> None:
         ),
     )
 
-    with pytest.raises(ValidationError, match="Невозможно|сдвиг|физически"):
-        build_cues(segments, audio_duration=13.0)
+    result = build_cues_with_diagnostics(segments, audio_duration=13.0)
+
+    assert len(result.cues) == 3
+    assert result.diagnostics.reading_speed_target_exceeded_cues == 3
+    validate_cues(result.cues, audio_duration=13.0)
 
 
 def test_rendered_minimum_duration_survives_millisecond_rounding() -> None:
@@ -514,7 +565,7 @@ def test_diagnostics_counts_shared_internal_boundary_once() -> None:
         TranscriptSegment(0.5, 1.0, "Второе."),
     )
 
-    result = build_cues_with_diagnostics(segments, audio_duration=2.0)
+    result = build_cues_with_diagnostics(segments, max_lines=1, audio_duration=2.0)
 
     assert result.cues[0].end == pytest.approx(result.cues[1].start)
     assert result.diagnostics.adjusted_boundaries == 1
@@ -564,10 +615,10 @@ def test_builder_splits_long_vocalization_only_at_restored_hyphens() -> None:
 
     cues = build_cues((segment,), audio_duration=8.5)
 
-    assert len(cues) == 2
-    assert all(cue.end - cue.start <= 7.0 for cue in cues)
-    assert cues[0].text.endswith("-")
-    assert "".join(cue.text.replace("\n", "") for cue in cues) == text
+    assert len(cues) == 1
+    assert cues[0].end - cues[0].start <= 7.0
+    assert cues[0].text.splitlines()[0].endswith("-")
+    assert cues[0].text.replace("\n", "") == text
 
 
 def test_builder_retimes_long_ordinary_word_without_splitting_text() -> None:
@@ -653,11 +704,8 @@ def test_builder_right_anchors_stretched_single_word_before_sentence_layout(
     )
     assert result.diagnostics.timing_anomaly_adjustments == 1
     assert " ".join(" ".join(cue.text.splitlines()) for cue in result.cues) == text
-    assert all(cue.end - cue.start <= 7.0 for cue in result.cues)
-    assert all(
-        visible_character_count(cue.text) / (cue.end - cue.start) <= 17
-        for cue in result.cues
-    )
+    assert result.diagnostics.duration_target_exceeded_cues > 0
+    validate_cues(result.cues, audio_duration=words[-1].end + 1.0)
 
 
 def test_builder_redistributes_long_vocalization_with_tiny_tail_intervals() -> None:
@@ -808,10 +856,10 @@ def test_text_first_lines_do_not_depend_on_source_duration() -> None:
         ["Первая длинная смысловая часть,", "и вторая тоже остаётся целой."],
     ]
     assert len(build_cues((TranscriptSegment(0.0, 4.0, text),), audio_duration=5.0)) == 1
-    assert len(build_cues((TranscriptSegment(0.0, 9.5, text),), audio_duration=10.0)) == 2
+    assert len(build_cues((TranscriptSegment(0.0, 9.5, text),), audio_duration=10.0)) == 1
 
 
-def test_scheduler_reports_physically_impossible_single_semantic_line() -> None:
+def test_scheduler_reports_long_semantic_line_without_failure() -> None:
     text = "Одна смысловая строка."
     segment = TranscriptSegment(
         0.0,
@@ -820,8 +868,11 @@ def test_scheduler_reports_physically_impossible_single_semantic_line() -> None:
         words=_proportional_words(text, 0.0, 10.0),
     )
 
-    with pytest.raises(ValidationError, match="реплика 1|физически"):
-        build_cues((segment,), audio_duration=11.0)
+    result = build_cues_with_diagnostics((segment,), audio_duration=11.0)
+
+    assert [cue.text for cue in result.cues] == [text]
+    assert result.diagnostics.duration_target_exceeded_cues == 1
+    validate_cues(result.cues, audio_duration=11.0)
 
 
 @pytest.mark.parametrize("line_length_gap", [-1, 21, True, "8"])
