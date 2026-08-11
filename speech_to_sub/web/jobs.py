@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
+from speech_to_sub.constants import SubtitleFormat
 from speech_to_sub.web.job_store import SQLiteJobStore
 
 LOG_HISTORY_LIMIT = 250
@@ -25,6 +26,7 @@ TERMINAL_FILE_STATES = frozenset({"cached", "skipped", "done", "error"}) | (
     CANCELLED_FILE_STATES
 )
 RETRYABLE_FILE_STATES = frozenset({"error"}) | CANCELLED_FILE_STATES
+SUPPORTED_OUTPUT_FORMATS = frozenset(item.value for item in SubtitleFormat)
 CANCELLED_ERROR = "Обработка отменена пользователем."
 
 Event = dict[str, Any]
@@ -371,6 +373,7 @@ class JobRegistry:
         if self._store is not None:
             snapshot = self._store.load(job_id)
             if snapshot is not None:
+                snapshot = _normalize_snapshot_for_read(snapshot)
                 if not include_events:
                     snapshot.pop("events", None)
                 return snapshot
@@ -410,7 +413,7 @@ class JobRegistry:
             if self._store is not None:
                 snapshots = self._store.list(limit=1)
                 if snapshots:
-                    snapshot = snapshots[0]
+                    snapshot = _normalize_snapshot_for_read(snapshots[0])
                     snapshot.pop("events", None)
                     return snapshot
             return {"active": False, "terminal": False}
@@ -455,6 +458,7 @@ class JobRegistry:
             raise JobStateError("В задаче нет файлов для повторного запуска.")
         paths = [str(item["path"]) for item in failed_items]
         settings = copy.deepcopy(snapshot.get("settings") or {})
+        settings.setdefault("output_format", "srt")
         if "force" in settings or force:
             settings["force"] = force
         retry_items = _refresh_retry_items(
@@ -815,6 +819,7 @@ def _prepare_retry_item(item: Mapping[str, Any]) -> dict[str, Any]:
         "warning",
         "warnings",
         "srt_output",
+        "subtitle_output",
         "sidecar_output",
         "audio_output",
         "outputs",
@@ -857,6 +862,7 @@ def _job_from_snapshot(
     snapshot: Mapping[str, Any],
     persist_snapshot: PersistSnapshot | None,
 ) -> BatchJob:
+    snapshot = _normalize_snapshot_for_read(snapshot)
     items = [copy.deepcopy(dict(item)) for item in snapshot.get("items", [])]
     paths = tuple(str(item.get("path") or "") for item in items if item.get("path"))
     job = BatchJob(
@@ -882,6 +888,51 @@ def _job_from_snapshot(
     _restore_event_history(job, snapshot)
     _restore_terminal_state(job, snapshot)
     return job
+
+
+def _normalize_snapshot_for_read(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Дополняет старый SRT-контракт в памяти, не изменяя persisted snapshot."""
+    normalized = copy.deepcopy(dict(snapshot))
+    settings = copy.deepcopy(dict(normalized.get("settings") or {}))
+    if "output_format" not in settings:
+        settings["output_format"] = "srt"
+    normalized["settings"] = settings
+
+    settings_format = settings.get("output_format")
+    items: list[dict[str, Any]] = []
+    for raw_item in normalized.get("items", []):
+        item = copy.deepcopy(dict(raw_item))
+        item_format = _snapshot_item_output_format(item, settings_format)
+        if "output_format" not in item and item_format is not None:
+            item["output_format"] = item_format
+        if (
+            item_format == "srt"
+            and "subtitle_output" not in item
+            and item.get("srt_output")
+        ):
+            item["subtitle_output"] = item["srt_output"]
+        items.append(item)
+    normalized["items"] = items
+    return normalized
+
+
+def _snapshot_item_output_format(
+    item: Mapping[str, Any],
+    settings_format: object,
+) -> str | None:
+    explicit = item.get("output_format")
+    if explicit in SUPPORTED_OUTPUT_FORMATS:
+        return str(explicit)
+    subtitle_output = item.get("subtitle_output")
+    if subtitle_output:
+        extension = Path(str(subtitle_output)).suffix.removeprefix(".").casefold()
+        if extension in SUPPORTED_OUTPUT_FORMATS:
+            return extension
+    if item.get("srt_output"):
+        return "srt"
+    if settings_format in SUPPORTED_OUTPUT_FORMATS:
+        return str(settings_format)
+    return None
 
 
 def _restore_event_history(job: BatchJob, snapshot: Mapping[str, Any]) -> None:

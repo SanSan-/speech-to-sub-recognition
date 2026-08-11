@@ -24,6 +24,7 @@ from speech_to_sub.constants import (
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_STRIDE_LENGTH_SECONDS,
     DEFAULT_VAD_MIN_SILENCE_MS,
+    SubtitleFormat,
 )
 from speech_to_sub.exceptions import ValidationError
 
@@ -235,6 +236,7 @@ class ProcessingSettings:
     keep_audio: bool = False
     force: bool = False
     recursive: bool = False
+    output_format: SubtitleFormat = SubtitleFormat.SRT
     output_dir: Path | None = None
     verbose: bool = False
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE
@@ -259,6 +261,8 @@ class ProcessingSettings:
         _normalize_model_path(data)
         _normalize_choice_field(data, "openai_model")
         _normalize_choice_field(data, "aligner")
+        if "output_format" in data:
+            data["output_format"] = _normalize_output_format(data["output_format"])
         _normalize_aligner_model_path(data)
         for key in ("worker_python_path", "aligner_worker_python_path", "output_dir"):
             _normalize_optional_path(data, key)
@@ -278,6 +282,7 @@ class ProcessingSettings:
             str(self.aligner_worker_python_path) if self.aligner_worker_python_path else None
         )
         data["output_dir"] = str(self.output_dir) if self.output_dir else None
+        data["output_format"] = self.output_format.value
         return data
 
 
@@ -287,6 +292,19 @@ def _normalize_choice_field(data: dict[str, Any], key: str) -> None:
         data[key] = str(value).strip().casefold()
     else:
         data.pop(key, None)
+
+
+def _normalize_output_format(value: object) -> SubtitleFormat:
+    if isinstance(value, SubtitleFormat):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Формат субтитров должен быть строкой: srt, ass или vtt.")
+    try:
+        return SubtitleFormat(value.strip().casefold())
+    except ValueError as exc:
+        raise ValidationError(
+            f"Неизвестный формат субтитров '{value}'. Поддерживаются: srt, ass, vtt."
+        ) from exc
 
 
 def _normalize_model_path(data: dict[str, Any]) -> None:
@@ -347,9 +365,15 @@ def _finite_float(
 class OutputPaths:
     """Пути артефактов одного входного файла."""
 
-    srt_path: Path
+    subtitle_path: Path
     sidecar_path: Path
     normalized_audio_path: Path
+    output_format: SubtitleFormat = SubtitleFormat.SRT
+
+    @property
+    def srt_path(self) -> Path | None:
+        """Возвращает устаревший SRT-путь только для формата SRT."""
+        return self.subtitle_path if self.output_format is SubtitleFormat.SRT else None
 
 
 @dataclass(frozen=True)
@@ -358,7 +382,8 @@ class FileResult:
 
     input_path: Path
     state: str
-    srt_path: Path | None = None
+    subtitle_path: Path | None = None
+    output_format: SubtitleFormat = SubtitleFormat.SRT
     sidecar_path: Path | None = None
     audio_path: Path | None = None
     error: str | None = None
@@ -366,12 +391,24 @@ class FileResult:
     skipped: bool = False
     probe: MediaProbe | None = None
 
+    @property
+    def srt_path(self) -> Path | None:
+        """Возвращает устаревший SRT-путь только для формата SRT."""
+        if self.output_format is not SubtitleFormat.SRT:
+            return None
+        return self.subtitle_path
+
     def to_dict(self) -> dict[str, Any]:
+        subtitle_output = str(self.subtitle_path) if self.subtitle_path else None
         return {
             "path": str(self.input_path),
             "name": self.input_path.name,
             "state": self.state,
-            "srt_output": str(self.srt_path) if self.srt_path else None,
+            "output_format": self.output_format.value,
+            "subtitle_output": subtitle_output,
+            "srt_output": subtitle_output
+            if self.output_format is SubtitleFormat.SRT
+            else None,
             "sidecar_output": str(self.sidecar_path) if self.sidecar_path else None,
             "audio_output": str(self.audio_path) if self.audio_path else None,
             "error": self.error,

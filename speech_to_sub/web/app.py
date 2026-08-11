@@ -311,6 +311,11 @@ def ui_config() -> dict[str, Any]:
             {"value": "ru", "label": "Русский"},
             {"value": "auto", "label": "Автоопределение"},
         ],
+        "output_formats": [
+            {"value": "srt", "label": "SRT"},
+            {"value": "ass", "label": "ASS"},
+            {"value": "vtt", "label": "VTT"},
+        ],
         "supported_extensions": sorted(SUPPORTED_MEDIA_EXTENSIONS),
     }
     if settings_error is not None:
@@ -402,10 +407,12 @@ def retry_job(job_id: str, payload: RetryRequest | None = None) -> dict[str, Any
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         job_registry.release_reservation(reservation)
+    retry_snapshot = job.snapshot(active=True)
     return {
         "job_id": job.job_id,
         "retry_of": job_id,
-        "items": job.snapshot(active=True)["items"],
+        "settings": retry_snapshot["settings"],
+        "items": retry_snapshot["items"],
     }
 
 

@@ -7,12 +7,14 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from speech_to_sub.asr.registry import backend_names
+from speech_to_sub import __version__
 from speech_to_sub.alignment.registry import aligner_names
+from speech_to_sub.asr.registry import backend_names
 from speech_to_sub.constants import (
     DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     SUPPORTED_OPENAI_MODELS,
+    SubtitleFormat,
 )
 from speech_to_sub.exceptions import SpeechToSubError, ValidationError
 from speech_to_sub.models import ProcessingSettings
@@ -32,8 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Создаёт CLI parser."""
     parser = _CliArgumentParser(
         prog="speech-to-sub",
-        description="Пакетное распознавание речи и создание SRT.",
+        description="Пакетное распознавание речи и создание субтитров.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--input", nargs="+", required=True, type=Path, help="Файл или папка.")
     parser.add_argument("--backend", choices=backend_names(), help="Движок распознавания.")
     parser.add_argument(
@@ -45,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-python-path", type=Path)
     parser.add_argument("--aligner-worker-python-path", type=Path)
     parser.add_argument("--output-dir", type=Path, help="Корневой каталог результатов.")
+    parser.add_argument(
+        "--output-format",
+        choices=tuple(output_format.value for output_format in SubtitleFormat),
+        help="Формат готовых субтитров: srt, ass или vtt (по умолчанию srt).",
+    )
     parser.add_argument("--recursive", action="store_true", default=None)
     parser.add_argument("--language", choices=("en", "ru", "auto"))
     parser.add_argument("--audio-language")
@@ -97,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "Обойти кеш готового SRT и распознавания, заново выполнить распознавание и "
+            "Обойти кеш готовых субтитров и распознавания, заново выполнить распознавание и "
             "выбранное выравнивание, затем атомарно заменить целевые результаты."
         ),
     )
@@ -159,6 +167,7 @@ def _merge_settings(base: ProcessingSettings, args: argparse.Namespace) -> Proce
         "worker_python_path",
         "aligner_worker_python_path",
         "output_dir",
+        "output_format",
         "recursive",
         "language",
         "audio_language",

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from speech_to_sub import __version__
+from speech_to_sub.constants import SubtitleFormat
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import (
+    FileResult,
     ProcessingSettings,
     Transcript,
     TranscriptSegment,
@@ -17,8 +21,8 @@ def test_unknown_backend_without_explicit_model_is_domain_error() -> None:
         ProcessingSettings.from_mapping({"backend": "unknown"})
 
 
-def test_package_version_matches_v153_milestone() -> None:
-    assert __version__ == "1.5.3"
+def test_package_version_matches_v160_milestone() -> None:
+    assert __version__ == "1.6.0"
 
 
 def test_processing_settings_round_trip_subtitle_layout_limits() -> None:
@@ -31,6 +35,36 @@ def test_processing_settings_round_trip_subtitle_layout_limits() -> None:
     assert settings.max_cps == 16.5
     assert settings.to_dict()["line_length_gap"] == 6
     assert settings.to_dict()["max_cps"] == 16.5
+
+
+def test_processing_settings_defaults_to_srt_and_normalizes_output_format() -> None:
+    default_settings = ProcessingSettings.from_mapping({})
+    ass_settings = ProcessingSettings.from_mapping({"output_format": " ASS "})
+
+    assert default_settings.output_format is SubtitleFormat.SRT
+    assert default_settings.to_dict()["output_format"] == "srt"
+    assert ass_settings.output_format is SubtitleFormat.ASS
+    assert ass_settings.to_dict()["output_format"] == "ass"
+
+
+@pytest.mark.parametrize("value", (None, 7, True, "", "txt"))
+def test_processing_settings_rejects_invalid_output_format(value: object) -> None:
+    with pytest.raises(ValidationError, match="Формат субтитров|Неизвестный формат"):
+        ProcessingSettings.from_mapping({"output_format": value})
+
+
+def test_file_result_exposes_generic_output_and_limits_legacy_srt_field() -> None:
+    ass_path = Path("sample.ru.ass")
+    result = FileResult(
+        input_path=Path("sample.mp4"),
+        state="done",
+        subtitle_path=ass_path,
+        output_format=SubtitleFormat.ASS,
+    ).to_dict()
+
+    assert result["output_format"] == "ass"
+    assert result["subtitle_output"] == str(ass_path)
+    assert result["srt_output"] is None
 
 
 def test_cloud_settings_round_trip_with_ignored_compatibility_model_path() -> None:

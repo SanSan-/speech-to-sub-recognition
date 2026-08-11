@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from speech_to_sub.constants import SIDECAR_SCHEMA_VERSION, SubtitleFormat
 from speech_to_sub.exceptions import ValidationError
-from speech_to_sub.constants import SIDECAR_SCHEMA_VERSION
 from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils import io_utils
 from speech_to_sub.utils.cache import (
@@ -184,6 +184,8 @@ def test_cache_fingerprints_separate_recognition_and_layout_settings(
     assert "srt_builder_version" not in recognition
     assert layout == {
         "srt_builder_version": "4",
+        "subtitle_renderer_version": "4",
+        "output_format": "srt",
         "max_chars_per_line": 42,
         "line_length_gap": 8,
         "max_cps": 17.0,
@@ -203,6 +205,7 @@ def test_cache_fingerprints_separate_recognition_and_layout_settings(
         )
         != recognition
     )
+
 
     faster_settings = replace(settings, backend="faster-whisper")
     faster_runtime = {**runtime, "backend": "faster-whisper"}
@@ -298,6 +301,67 @@ def test_cache_fingerprints_separate_recognition_and_layout_settings(
 
     source_path.write_bytes(b"media-v2")
     assert build_source_fingerprint(source_path)["sha256"] != source["sha256"]
+
+
+def test_output_format_changes_only_light_fingerprint(tmp_path: Path) -> None:
+    settings = ProcessingSettings(model_path=tmp_path / "model")
+    runtime = {
+        "backend": "faster-whisper",
+        "engine_version": "test",
+        "device": "cpu",
+        "compute_type": "float32",
+        "quantized": False,
+    }
+    recognition = build_recognition_fingerprint(settings, 0, runtime=runtime)
+    layouts = {
+        output_format: build_layout_fingerprint(
+            replace(settings, output_format=output_format)
+        )
+        for output_format in SubtitleFormat
+    }
+
+    assert all(
+        build_recognition_fingerprint(
+            replace(settings, output_format=output_format),
+            0,
+            runtime=runtime,
+        )
+        == recognition
+        for output_format in SubtitleFormat
+    )
+    assert {layout["output_format"] for layout in layouts.values()} == {
+        "srt",
+        "ass",
+        "vtt",
+    }
+    assert len({tuple(layout.items()) for layout in layouts.values()}) == 3
+
+
+def test_v2_layout_without_format_is_normalized_as_srt() -> None:
+    recognition = {"pipeline_version": "7"}
+    legacy_layout = {
+        "srt_builder_version": "4",
+        "max_chars_per_line": 42,
+        "line_length_gap": 8,
+        "max_cps": 17.0,
+    }
+
+    fingerprints = sidecar_fingerprints(
+        {
+            "sidecar_schema_version": SIDECAR_SCHEMA_VERSION,
+            "recognition_settings": recognition,
+            "layout_settings": legacy_layout,
+        }
+    )
+
+    assert fingerprints == (
+        recognition,
+        {
+            **legacy_layout,
+            "output_format": "srt",
+            "subtitle_renderer_version": "4",
+        },
+    )
 
 
 def test_cloud_fingerprint_excludes_local_runtime_options_and_permission(

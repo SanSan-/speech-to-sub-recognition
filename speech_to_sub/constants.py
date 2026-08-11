@@ -1,6 +1,24 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
+
+
+class SubtitleFormat(StrEnum):
+    """Поддерживаемый формат готовых субтитров."""
+
+    SRT = "srt"
+    ASS = "ass"
+    VTT = "vtt"
+
+    @property
+    def extension(self) -> str:
+        return f".{self.value}"
+
+    @property
+    def display_name(self) -> str:
+        return self.value.upper()
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 RESOURCES_DIR = BASE_DIR / "resources"
@@ -53,6 +71,11 @@ DEFAULT_BEAM_SIZE = 5
 MAX_BATCH_PATHS = 10_000
 PIPELINE_VERSION = "7"
 SRT_BUILDER_VERSION = "4"
+SUBTITLE_RENDERER_VERSIONS = {
+    "srt": "4",
+    "ass": "1",
+    "vtt": "1",
+}
 SIDECAR_SCHEMA_VERSION = 2
 
 SUPPORTED_VIDEO_EXTENSIONS = frozenset({".mp4", ".m4v", ".mov", ".mkv", ".webm"})

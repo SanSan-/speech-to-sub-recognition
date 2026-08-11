@@ -10,6 +10,8 @@ from speech_to_sub.constants import (
     QWEN_ALIGNMENT_MAX_SEGMENT_SECONDS,
     SIDECAR_SCHEMA_VERSION,
     SRT_BUILDER_VERSION,
+    SUBTITLE_RENDERER_VERSIONS,
+    SubtitleFormat,
 )
 from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils.io_utils import atomic_write_json, read_text_utf8, sha256_file
@@ -34,6 +36,8 @@ _LAYOUT_SETTING_KEYS = frozenset(
         "max_chars_per_line",
         "line_length_gap",
         "max_cps",
+        "output_format",
+        "subtitle_renderer_version",
     }
 )
 
@@ -105,9 +109,13 @@ def build_recognition_fingerprint(
 
 
 def build_layout_fingerprint(settings: ProcessingSettings) -> dict[str, Any]:
-    """Возвращает параметры лёгкой SRT-разметки."""
+    """Возвращает параметры лёгкой разметки и выбранного рендерера."""
     return {
         "srt_builder_version": SRT_BUILDER_VERSION,
+        "subtitle_renderer_version": SUBTITLE_RENDERER_VERSIONS[
+            settings.output_format.value
+        ],
+        "output_format": settings.output_format.value,
         "max_chars_per_line": settings.max_chars_per_line,
         "line_length_gap": settings.line_length_gap,
         "max_cps": settings.max_cps,
@@ -133,11 +141,12 @@ def sidecar_matches(
 ) -> bool:
     """Проверяет оба отпечатка готового SRT и завершённый статус."""
     fingerprints = sidecar_fingerprints(sidecar)
+    expected_layout = _normalize_v2_layout(layout_settings)
     return bool(
         sidecar
         and sidecar.get("status") == "done"
         and sidecar.get("source") == source
-        and fingerprints == (recognition_settings, layout_settings)
+        and fingerprints == (recognition_settings, expected_layout)
     )
 
 
@@ -172,11 +181,24 @@ def sidecar_fingerprints(
         recognition = sidecar.get("recognition_settings")
         layout = sidecar.get("layout_settings")
         if isinstance(recognition, Mapping) and isinstance(layout, Mapping):
-            return dict(recognition), dict(layout)
+            return dict(recognition), _normalize_v2_layout(layout)
         return None
     if schema_version is not None:
         return None
     return _legacy_sidecar_fingerprints(sidecar)
+
+
+def _normalize_v2_layout(layout: Mapping[str, Any]) -> dict[str, Any]:
+    """Считает старый v2 layout без формата прежним SRT-контрактом."""
+    normalized = dict(layout)
+    if "output_format" not in normalized:
+        normalized["output_format"] = SubtitleFormat.SRT.value
+    if "subtitle_renderer_version" not in normalized:
+        normalized["subtitle_renderer_version"] = normalized.get(
+            "srt_builder_version",
+            SUBTITLE_RENDERER_VERSIONS[SubtitleFormat.SRT.value],
+        )
+    return normalized
 
 
 def _legacy_sidecar_fingerprints(

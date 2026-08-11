@@ -12,6 +12,7 @@ node_modules/
 .idea/
 docs/
 logs/
+build/
 resources/cache/
 resources/runtimes/
 resources/state/

@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from speech_to_sub import __version__
 from speech_to_sub import cli
 from speech_to_sub.constants import (
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
@@ -14,6 +15,16 @@ from speech_to_sub.constants import (
 )
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
+
+
+def test_cli_reports_package_version(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"speech-to-sub {__version__}"
 
 
 def _install_cli_dependencies(monkeypatch: pytest.MonkeyPatch) -> logging.Logger:
@@ -64,6 +75,8 @@ def test_main_returns_batch_exit_codes(
             "aligner-python.exe",
             "--language",
             "ru",
+            "--output-format",
+            "ass",
             "--max-chars-per-line",
             "40",
             "--line-length-gap",
@@ -89,6 +102,7 @@ def test_main_returns_batch_exit_codes(
     assert received["settings"]["worker_python_path"] == "backend-python.exe"
     assert received["settings"]["aligner_worker_python_path"] == "aligner-python.exe"
     assert received["settings"]["language"] == "ru"
+    assert received["settings"]["output_format"] == "ass"
     assert received["settings"]["max_chars_per_line"] == 40
     assert received["settings"]["line_length_gap"] == 6
     assert received["settings"]["max_cps"] == 16.5
@@ -213,6 +227,18 @@ def test_parser_rejects_unknown_backend_without_traceback(
     assert cli.main(["--input", "sample.mp4", "--backend", "unknown"]) == 1
     captured = capsys.readouterr()
     assert "--backend" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_parser_rejects_unknown_output_format_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_cli_dependencies(monkeypatch)
+
+    assert cli.main(["--input", "sample.mp4", "--output-format", "txt"]) == 1
+    captured = capsys.readouterr()
+    assert "--output-format" in captured.err
     assert "Traceback" not in captured.err
 
 

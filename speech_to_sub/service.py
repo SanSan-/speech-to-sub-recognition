@@ -28,6 +28,7 @@ from speech_to_sub.constants import (
     MAX_LINE_LENGTH_GAP,
     SIDECAR_SCHEMA_VERSION,
     SUPPORTED_OPENAI_MODELS,
+    SubtitleFormat,
     WORK_DIR,
 )
 from speech_to_sub.exceptions import (
@@ -51,8 +52,12 @@ from speech_to_sub.models import (
     Transcript,
     TranscriptSegment,
 )
-from speech_to_sub.subtitles.builder import build_cues_with_diagnostics, render_srt
-from speech_to_sub.subtitles.validator import validate_srt_text
+from speech_to_sub.subtitles.builder import (
+    build_cues_with_diagnostics,
+    build_presentation_diagnostics,
+)
+from speech_to_sub.subtitles.formats import render_subtitles
+from speech_to_sub.subtitles.validator import validate_subtitle_text
 from speech_to_sub.utils.cache import (
     build_layout_fingerprint,
     build_recognition_fingerprint,
@@ -117,7 +122,7 @@ class _FileProcessingContext:
 
 @dataclass(frozen=True, slots=True)
 class _CachedRecognition:
-    """Проверенный тяжёлый результат, пригодный для новой SRT-разметки."""
+    """Проверенный тяжёлый результат, пригодный для новой разметки субтитров."""
 
     transcript: Transcript
     normalized_duration: float
@@ -194,7 +199,10 @@ def build_items(
     output_map = _build_output_map(media_paths, settings, common_root)
     ffprobe_path = get_command_path("FFPROBE_PATH", "ffprobe")
     items = _build_pending_items(media_paths, settings, output_map)
-    items.extend(_build_discovery_error_item(failure) for failure in failures)
+    items.extend(
+        _build_discovery_error_item(failure, settings.output_format)
+        for failure in failures
+    )
     total = len(items)
     _report_preparation(
         progress_callback,
@@ -336,7 +344,10 @@ def build_pending_items(
     common_root = _common_input_root(_ordered_discovery_paths(media_paths, failures))
     output_map = _build_output_map(media_paths, settings, common_root)
     items = _build_pending_items(media_paths, settings, output_map)
-    items.extend(_build_discovery_error_item(failure) for failure in failures)
+    items.extend(
+        _build_discovery_error_item(failure, settings.output_format)
+        for failure in failures
+    )
     return sorted(items, key=lambda item: str(item["path"]).casefold())
 
 
@@ -356,7 +367,9 @@ def _build_pending_items(
                 "state": "queued",
                 "stage": "Ожидание",
                 "progress": 0,
-                "srt_output": str(outputs.srt_path),
+                "output_format": outputs.output_format.value,
+                "subtitle_output": str(outputs.subtitle_path),
+                "srt_output": _legacy_srt_output(outputs),
                 "sidecar_output": str(outputs.sidecar_path),
                 "audio_output": str(outputs.normalized_audio_path)
                 if settings.keep_audio
@@ -371,6 +384,7 @@ def _build_pending_items(
 
 def _build_discovery_error_item(
     failure: MediaDiscoveryFailure,
+    output_format: SubtitleFormat,
 ) -> dict[str, Any]:
     return {
         "path": str(failure.path),
@@ -379,6 +393,8 @@ def _build_discovery_error_item(
         "state": "error",
         "stage": VALIDATION_ERROR_STAGE,
         "progress": 100,
+        "output_format": output_format.value,
+        "subtitle_output": None,
         "srt_output": None,
         "sidecar_output": None,
         "audio_output": None,
@@ -424,10 +440,10 @@ def _classify_card_without_source_hash(
     if settings.force:
         item.update(stage="Полное повторное распознавание")
         return
-    if outputs.srt_path.exists() and not outputs.sidecar_path.exists():
+    if outputs.subtitle_path.exists() and not outputs.sidecar_path.exists():
         item.update(
             state="skipped",
-            stage="Существующий SRT",
+            stage="Существующие субтитры",
             progress=100,
             skipped=True,
         )
@@ -496,6 +512,7 @@ def process_paths(
                 failure,
                 index=index,
                 total=len(ordered_paths),
+                output_format=settings.output_format,
                 emit_event=emit_event,
                 log=log,
             ).to_dict()
@@ -517,6 +534,7 @@ def process_paths(
                             ordered_paths[index - 1 :],
                             first_index=index,
                             total=len(ordered_paths),
+                            output_format=settings.output_format,
                             emit_event=emit_event,
                             log=log,
                         )
@@ -529,6 +547,7 @@ def process_paths(
                             failure,
                             index=index,
                             total=len(ordered_paths),
+                            output_format=settings.output_format,
                             emit_event=emit_event,
                             log=log,
                         )
@@ -632,7 +651,7 @@ def build_output_paths(
     include_source_extension: bool = False,
     collision_suffix: str | None = None,
 ) -> OutputPaths:
-    """Формирует пути SRT, sidecar и сохраняемого FLAC."""
+    """Формирует изолированные пути субтитров, sidecar и сохраняемого FLAC."""
     language = settings.language.casefold() or "auto"
     if settings.output_dir:
         output_root = settings.output_dir.expanduser().resolve()
@@ -648,10 +667,15 @@ def build_output_paths(
     stem = input_path.name if include_source_extension else input_path.stem
     if collision_suffix:
         stem = f"{stem}.{collision_suffix}"
+    artifact_base = f"{stem}.{language}"
+    format_suffix = (
+        "" if settings.output_format is SubtitleFormat.SRT else settings.output_format.extension
+    )
     return OutputPaths(
-        srt_path=parent / f"{stem}.{language}.srt",
-        sidecar_path=parent / f"{stem}.{language}.asr.json",
-        normalized_audio_path=parent / f"{stem}.{language}.asr.flac",
+        subtitle_path=parent / f"{artifact_base}{settings.output_format.extension}",
+        sidecar_path=parent / f"{artifact_base}{format_suffix}.asr.json",
+        normalized_audio_path=parent / f"{artifact_base}{format_suffix}.asr.flac",
+        output_format=settings.output_format,
     )
 
 
@@ -660,6 +684,7 @@ def _discovery_failure_result(
     *,
     index: int,
     total: int,
+    output_format: SubtitleFormat,
     emit_event: EventCallback,
     log: LogCallback,
 ) -> FileResult:
@@ -677,7 +702,12 @@ def _discovery_failure_result(
         log,
         f"Файл {index}/{total}: {failure.path.name} — ошибка: {failure.error}",
     )
-    return FileResult(input_path=failure.path, state="error", error=failure.error)
+    return FileResult(
+        input_path=failure.path,
+        state="error",
+        output_format=output_format,
+        error=failure.error,
+    )
 
 
 def _process_one(
@@ -726,7 +756,15 @@ def _process_one(
             error=message,
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — {message}")
-        return FileResult(input_path=path, state="error", error=message), backend
+        return (
+            FileResult(
+                input_path=path,
+                state="error",
+                output_format=settings.output_format,
+                error=message,
+            ),
+            backend,
+        )
 
 
 def _process_one_locked(
@@ -795,7 +833,7 @@ def _process_one_locked(
             return existing_result, backend
         if cached_recognition is not None:
             return (
-                _rebuild_srt_from_cached_recognition(
+                _rebuild_subtitle_from_cached_recognition(
                     context,
                     cached_recognition,
                     probe=probe,
@@ -836,8 +874,17 @@ def _process_one_locked(
             normalized_duration,
             backend=backend,
         )
-        _emit_file(emit_event, path, index, total, "writing", "Формирование SRT", 88)
-        srt_text, subtitle_layout = _build_srt_artifacts(
+        format_label = settings.output_format.display_name
+        _emit_file(
+            emit_event,
+            path,
+            index,
+            total,
+            "writing",
+            f"Формирование {format_label}",
+            88,
+        )
+        subtitle_text, subtitle_layout = _build_subtitle_artifacts(
             transcript,
             settings,
             normalized_duration,
@@ -871,7 +918,7 @@ def _process_one_locked(
         )
         _publish_artifacts(
             outputs,
-            srt_text=srt_text,
+            subtitle_text=subtitle_text,
             sidecar=sidecar,
             audio_source=temporary_audio if settings.keep_audio else None,
         )
@@ -888,12 +935,16 @@ def _process_one_locked(
                 outputs.normalized_audio_path if settings.keep_audio else None
             ),
         )
-        _write_log(log, f"Файл {index}/{total}: {path.name} — SRT готов.")
+        _write_log(
+            log,
+            f"Файл {index}/{total}: {path.name} — {format_label} готов.",
+        )
         return (
             FileResult(
                 input_path=path,
                 state="done",
-                srt_path=outputs.srt_path,
+                subtitle_path=outputs.subtitle_path,
+                output_format=outputs.output_format,
                 sidecar_path=outputs.sidecar_path,
                 audio_path=outputs.normalized_audio_path
                 if settings.keep_audio
@@ -920,6 +971,7 @@ def _process_one_locked(
             FileResult(
                 input_path=path,
                 state="cancelled",
+                output_format=settings.output_format,
                 error=message,
                 probe=probe,
             ),
@@ -940,7 +992,13 @@ def _process_one_locked(
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — ошибка: {message}")
         return (
-            FileResult(input_path=path, state="error", error=message, probe=probe),
+            FileResult(
+                input_path=path,
+                state="error",
+                output_format=settings.output_format,
+                error=message,
+                probe=probe,
+            ),
             backend,
         )
 
@@ -995,7 +1053,8 @@ def _reuse_existing_result(
             FileResult(
                 input_path=path,
                 state="cached",
-                srt_path=outputs.srt_path,
+                subtitle_path=outputs.subtitle_path,
+                output_format=outputs.output_format,
                 sidecar_path=outputs.sidecar_path,
                 audio_path=outputs.normalized_audio_path
                 if settings.keep_audio
@@ -1005,26 +1064,28 @@ def _reuse_existing_result(
             ),
             None,
         )
-    if outputs.srt_path.exists():
+    if outputs.subtitle_path.exists():
         _emit_file(
             context.emit_event,
             path,
             context.index,
             context.total,
             "skipped",
-            "SRT уже существует",
+            f"{outputs.output_format.display_name} уже существует",
             100,
             outputs=outputs,
         )
         _write_log(
             context.log,
-            f"Файл {context.index}/{context.total}: {path.name} — SRT безопасно пропущен.",
+            f"Файл {context.index}/{context.total}: {path.name} — "
+            f"{outputs.output_format.display_name} безопасно пропущен.",
         )
         return (
             FileResult(
                 input_path=path,
                 state="skipped",
-                srt_path=outputs.srt_path,
+                subtitle_path=outputs.subtitle_path,
+                output_format=outputs.output_format,
                 sidecar_path=outputs.sidecar_path
                 if outputs.sidecar_path.exists()
                 else None,
@@ -1041,7 +1102,7 @@ def _reuse_existing_result(
     return None, cached_recognition
 
 
-def _rebuild_srt_from_cached_recognition(
+def _rebuild_subtitle_from_cached_recognition(
     context: _FileProcessingContext,
     cached: _CachedRecognition,
     *,
@@ -1051,7 +1112,7 @@ def _rebuild_srt_from_cached_recognition(
     warning: str | None,
     started_at: str,
 ) -> FileResult:
-    """Пересобирает только SRT и sidecar из проверенного тяжёлого кеша."""
+    """Пересобирает субтитры и sidecar из проверенного тяжёлого кеша."""
     normalized_duration, audio_source = _prepare_reused_audio(
         context,
         stream,
@@ -1064,10 +1125,10 @@ def _rebuild_srt_from_cached_recognition(
         context.index,
         context.total,
         "writing",
-        "Пересборка SRT из кеша распознавания",
+        f"Пересборка {context.outputs.output_format.display_name} из кеша распознавания",
         88,
     )
-    srt_text, subtitle_layout = _build_srt_artifacts(
+    subtitle_text, subtitle_layout = _build_subtitle_artifacts(
         cached.transcript,
         context.settings,
         normalized_duration,
@@ -1087,11 +1148,11 @@ def _rebuild_srt_from_cached_recognition(
     )
     _publish_artifacts(
         context.outputs,
-        srt_text=srt_text,
+        subtitle_text=subtitle_text,
         sidecar=sidecar,
         audio_source=audio_source,
     )
-    return _complete_reused_srt(context, probe)
+    return _complete_reused_subtitle(context, probe)
 
 
 def _build_reused_sidecar(
@@ -1124,7 +1185,7 @@ def _build_reused_sidecar(
     )
 
 
-def _complete_reused_srt(
+def _complete_reused_subtitle(
     context: _FileProcessingContext,
     probe: MediaProbe,
 ) -> FileResult:
@@ -1145,12 +1206,13 @@ def _complete_reused_srt(
     _write_log(
         context.log,
         f"Файл {context.index}/{context.total}: {context.path.name} — "
-        "SRT пересобран из кеша распознавания.",
+        f"{context.outputs.output_format.display_name} пересобран из кеша распознавания.",
     )
     return FileResult(
         input_path=context.path,
         state="done",
-        srt_path=context.outputs.srt_path,
+        subtitle_path=context.outputs.subtitle_path,
+        output_format=context.outputs.output_format,
         sidecar_path=context.outputs.sidecar_path,
         audio_path=audio_output,
         probe=probe,
@@ -1188,7 +1250,7 @@ def _prepare_reused_audio(
     return duration, context.temporary_audio
 
 
-def _build_srt_artifacts(
+def _build_subtitle_artifacts(
     transcript: Transcript,
     settings: ProcessingSettings,
     normalized_duration: float,
@@ -1216,9 +1278,10 @@ def _build_srt_artifacts(
         max_cps=settings.max_cps,
         audio_duration=normalized_duration,
     )
-    srt_text = render_srt(build_result.cues)
-    validate_srt_text(
-        srt_text,
+    subtitle_text = render_subtitles(build_result.cues, settings.output_format)
+    rendered_cues = validate_subtitle_text(
+        subtitle_text,
+        settings.output_format,
         duration=normalized_duration,
         max_chars_per_line=(
             settings.max_chars_per_line
@@ -1228,8 +1291,17 @@ def _build_srt_artifacts(
         line_length_gap=settings.line_length_gap,
     )
     diagnostics = build_result.diagnostics.to_dict()
+    diagnostics.update(
+        build_presentation_diagnostics(
+            rendered_cues,
+            hard_chars_per_line=(
+                settings.max_chars_per_line + settings.line_length_gap
+            ),
+            max_cps=settings.max_cps,
+        )
+    )
     _log_subtitle_layout_diagnostics(path, log, diagnostics)
-    return srt_text, diagnostics
+    return subtitle_text, diagnostics
 
 
 def _build_sidecar_payload(
@@ -1263,8 +1335,12 @@ def _build_sidecar_payload(
         "normalized_audio_duration": normalized_duration,
         "transcript": transcript.to_dict(),
         SUBTITLE_LAYOUT_SIDECAR_KEY: dict(subtitle_layout),
+        "output_format": outputs.output_format.value,
+        "subtitle_output": str(outputs.subtitle_path),
+        "srt_output": _legacy_srt_output(outputs),
         "outputs": {
-            "srt": str(outputs.srt_path),
+            "subtitle": str(outputs.subtitle_path),
+            "srt": _legacy_srt_output(outputs),
             "sidecar": str(outputs.sidecar_path),
             "audio": str(outputs.normalized_audio_path) if keep_audio else None,
         },
@@ -1515,7 +1591,7 @@ def _log_subtitle_layout_diagnostics(
             f"максимум {diagnostics.get('max_actual_line_length', 0):g} символов"
         )
     if events:
-        _write_log(log, f"{path.name}: разметка SRT — {'; '.join(events)}.")
+        _write_log(log, f"{path.name}: разметка субтитров — {'; '.join(events)}.")
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -1532,6 +1608,7 @@ def _cancel_remaining(
     *,
     first_index: int,
     total: int,
+    output_format: SubtitleFormat,
     emit_event: EventCallback,
     log: LogCallback,
 ) -> list[FileResult]:
@@ -1550,7 +1627,14 @@ def _cancel_remaining(
             error=message,
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — отменено до запуска.")
-        results.append(FileResult(input_path=path, state="cancelled", error=message))
+        results.append(
+            FileResult(
+                input_path=path,
+                state="cancelled",
+                output_format=output_format,
+                error=message,
+            )
+        )
     return results
 
 
@@ -1561,7 +1645,7 @@ def _is_valid_cache(
     recognition_settings: dict[str, Any],
     layout_settings: dict[str, Any],
 ) -> bool:
-    if not outputs.srt_path.is_file():
+    if not outputs.subtitle_path.is_file():
         return False
     sidecar = load_sidecar(outputs.sidecar_path)
     if not sidecar_matches(
@@ -1575,8 +1659,9 @@ def _is_valid_cache(
     if duration is None:
         return False
     try:
-        validate_srt_text(
-            read_text_utf8(outputs.srt_path),
+        validate_subtitle_text(
+            read_text_utf8(outputs.subtitle_path),
+            outputs.output_format,
             duration=duration,
             max_chars_per_line=_cached_line_length_target(sidecar, layout_settings),
             line_length_gap=int(layout_settings["line_length_gap"]),
@@ -1605,7 +1690,7 @@ def _is_valid_cache_candidate(
     source: dict[str, Any],
     fingerprints: tuple[dict[str, Any], dict[str, Any]] | None,
 ) -> bool:
-    """Проверяет найденную пару fingerprints как готовый SRT-кеш."""
+    """Проверяет найденную пару fingerprints как готовый кеш субтитров."""
     if fingerprints is None:
         return False
     return _is_valid_cache(
@@ -1624,7 +1709,7 @@ def _cache_fingerprints_for_lookup(
     backend: AsrBackend | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Строит runtime-aware fingerprint только для существующего кандидата кеша."""
-    if not outputs.sidecar_path.is_file():
+    if not any(path.is_file() for path in _recognition_sidecar_candidates(outputs)):
         return None
     selected_backend = backend if backend is not None else get_backend(settings.backend)
     runtime = _loaded_runtime_signature(selected_backend, settings)
@@ -1652,8 +1737,28 @@ def _load_cached_recognition(
     source: dict[str, Any],
     recognition_settings: dict[str, Any],
 ) -> _CachedRecognition | None:
-    sidecar = load_sidecar(outputs.sidecar_path)
-    if not sidecar_recognition_matches(sidecar, source, recognition_settings):
+    for sidecar_path in _recognition_sidecar_candidates(outputs):
+        sidecar = load_sidecar(sidecar_path)
+        cached = _cached_recognition_from_sidecar(
+            sidecar,
+            source,
+            recognition_settings,
+        )
+        if cached is not None:
+            return cached
+    return None
+
+
+def _cached_recognition_from_sidecar(
+    sidecar: Mapping[str, Any] | None,
+    source: Mapping[str, Any],
+    recognition_settings: dict[str, Any],
+) -> _CachedRecognition | None:
+    if not sidecar_recognition_matches(
+        dict(sidecar) if sidecar is not None else None,
+        dict(source),
+        recognition_settings,
+    ):
         return None
     duration = _sidecar_audio_duration(sidecar)
     transcript_raw = sidecar.get("transcript") if sidecar else None
@@ -1670,6 +1775,19 @@ def _load_cached_recognition(
         normalized_duration=duration,
         recognition_settings=recognition_settings,
     )
+
+
+def _recognition_sidecar_candidates(outputs: OutputPaths) -> tuple[Path, ...]:
+    """Возвращает текущий sidecar первым, затем соседние форматы без повторов."""
+    extension = outputs.output_format.extension
+    artifact_base = outputs.subtitle_path.name[: -len(extension)]
+    candidates = [outputs.sidecar_path]
+    for output_format in SubtitleFormat:
+        format_suffix = "" if output_format is SubtitleFormat.SRT else output_format.extension
+        candidate = outputs.subtitle_path.parent / f"{artifact_base}{format_suffix}.asr.json"
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
 
 
 def _loaded_aligner_runtime(
@@ -1816,7 +1934,7 @@ def _record_saved_audio(
 def _publish_artifacts(
     outputs: OutputPaths,
     *,
-    srt_text: str | None = None,
+    subtitle_text: str | None = None,
     sidecar: Mapping[str, Any] | None = None,
     audio_source: Path | None = None,
 ) -> None:
@@ -1828,10 +1946,10 @@ def _publish_artifacts(
             staged_audio = _staging_path(outputs.normalized_audio_path, token)
             atomic_copy_file(audio_source, staged_audio)
             staged[outputs.normalized_audio_path] = staged_audio
-        if srt_text is not None:
-            staged_srt = _staging_path(outputs.srt_path, token)
-            atomic_write_text_utf8(staged_srt, srt_text)
-            staged[outputs.srt_path] = staged_srt
+        if subtitle_text is not None:
+            staged_subtitle = _staging_path(outputs.subtitle_path, token)
+            atomic_write_text_utf8(staged_subtitle, subtitle_text)
+            staged[outputs.subtitle_path] = staged_subtitle
         if sidecar is not None:
             staged_sidecar = _staging_path(outputs.sidecar_path, token)
             write_sidecar(staged_sidecar, dict(sidecar))
@@ -1861,7 +1979,7 @@ def _commit_staged_artifacts(staged: Mapping[Path, Path], token: str) -> None:
             if backup.exists():
                 os.replace(backup, target)
         raise
-    finally:
+    else:
         for backup in backups.values():
             backup.unlink(missing_ok=True)
 
@@ -1913,6 +2031,8 @@ def _validate_backend_settings(settings: ProcessingSettings) -> None:
 
 
 def _validate_output_settings(settings: ProcessingSettings) -> None:
+    if not isinstance(settings.output_format, SubtitleFormat):
+        raise ValidationError("Формат субтитров должен иметь значение srt, ass или vtt.")
     if settings.audio_stream_index is not None and settings.audio_stream_index < 0:
         raise ValidationError("Индекс аудиопотока не может быть отрицательным.")
     if (
@@ -1921,7 +2041,7 @@ def _validate_output_settings(settings: ProcessingSettings) -> None:
         or settings.max_chars_per_line < 20
         or settings.max_chars_per_line > 80
     ):
-        raise ValidationError("Лимит строки SRT должен быть от 20 до 80 символов.")
+        raise ValidationError("Лимит строки субтитров должен быть от 20 до 80 символов.")
     if (
         isinstance(settings.line_length_gap, bool)
         or not isinstance(settings.line_length_gap, int)
@@ -1929,7 +2049,8 @@ def _validate_output_settings(settings: ProcessingSettings) -> None:
         or settings.line_length_gap > MAX_LINE_LENGTH_GAP
     ):
         raise ValidationError(
-            f"Допуск длины строки SRT должен быть от 0 до {MAX_LINE_LENGTH_GAP} символов."
+            "Допуск длины строки субтитров должен быть от 0 до "
+            f"{MAX_LINE_LENGTH_GAP} символов."
         )
     if (
         isinstance(settings.max_cps, bool)
@@ -1938,7 +2059,7 @@ def _validate_output_settings(settings: ProcessingSettings) -> None:
         or settings.max_cps < 5
         or settings.max_cps > 60
     ):
-        raise ValidationError("Скорость чтения SRT должна быть от 5 до 60 CPS.")
+        raise ValidationError("Скорость чтения субтитров должна быть от 5 до 60 CPS.")
 
 
 def _validate_chunk_settings(settings: ProcessingSettings) -> None:
@@ -1996,7 +2117,9 @@ def _emit_file(
     }
     if outputs:
         event.update(
-            srt_output=str(outputs.srt_path),
+            output_format=outputs.output_format.value,
+            subtitle_output=str(outputs.subtitle_path),
+            srt_output=_legacy_srt_output(outputs),
             sidecar_output=str(outputs.sidecar_path),
             audio_output=str(audio_output) if audio_output else None,
         )
@@ -2005,6 +2128,13 @@ def _emit_file(
     if probe is not None:
         event["probe"] = probe.to_dict()
     emit_event(event)
+
+
+def _legacy_srt_output(outputs: OutputPaths) -> str | None:
+    """Сохраняет прежнее поле API только для настоящего SRT-результата."""
+    if outputs.output_format is not SubtitleFormat.SRT:
+        return None
+    return str(outputs.subtitle_path)
 
 
 def _write_log(log: LogCallback, message: str) -> None:
@@ -2034,7 +2164,7 @@ def _build_output_map(
     }
     groups: dict[str, list[Path]] = {}
     for path, outputs in candidates.items():
-        groups.setdefault(str(outputs.srt_path).casefold(), []).append(path)
+        groups.setdefault(str(outputs.subtitle_path).casefold(), []).append(path)
     for collided_paths in groups.values():
         if len(collided_paths) < 2:
             continue
@@ -2066,7 +2196,7 @@ def _build_output_map(
 def _output_groups(candidates: Mapping[Path, OutputPaths]) -> dict[str, list[Path]]:
     groups: dict[str, list[Path]] = {}
     for path, outputs in candidates.items():
-        groups.setdefault(str(outputs.srt_path).casefold(), []).append(path)
+        groups.setdefault(str(outputs.subtitle_path).casefold(), []).append(path)
     return groups
 
 
@@ -2074,7 +2204,7 @@ def _output_lock_path(outputs: OutputPaths) -> Path:
     lock_root = WORK_DIR / "locks"
     lock_root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
-        str(outputs.srt_path.resolve()).casefold().encode("utf-8")
+        str(outputs.subtitle_path.resolve()).casefold().encode("utf-8")
     ).hexdigest()
     return lock_root / f"{digest}.lock"
 

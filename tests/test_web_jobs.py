@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from speech_to_sub.web.job_store import SQLiteJobStore
-from speech_to_sub.web.jobs import JobRegistry
+from speech_to_sub.web.jobs import (
+    JobRegistry,
+    _normalize_snapshot_for_read,
+    _prepare_retry_item,
+)
 from speech_to_sub.utils.cache import build_source_fingerprint
 
 
@@ -56,7 +60,7 @@ def test_registry_persists_cancel_restart_retry_and_sse(tmp_path: Path) -> None:
         r"D:\Видео\отмена №2.mkv",
         r"D:\Видео\отмена №3.wav",
     ]
-    settings = {"language": "ru", "device": "cpu"}
+    settings = {"language": "ru", "device": "cpu", "output_format": "ass"}
 
     def cancellable_processor(
         selected_paths,
@@ -185,6 +189,110 @@ def test_registry_persists_cancel_restart_retry_and_sse(tmp_path: Path) -> None:
         "items" not in summary and "events" not in summary for summary in summaries
     )
     restarted.close()
+
+
+def test_retry_item_preserves_output_format_and_clears_old_artifact_paths() -> None:
+    prepared = _prepare_retry_item(
+        {
+            "path": r"D:\Видео\лекция.mp4",
+            "state": "error",
+            "output_format": "vtt",
+            "subtitle_output": r"D:\Видео\лекция.ru.vtt",
+            "srt_output": r"D:\Видео\старый.ru.srt",
+            "sidecar_output": r"D:\Видео\лекция.ru.vtt.asr.json",
+            "audio_output": r"D:\Видео\лекция.ru.asr.flac",
+            "outputs": {"subtitle": r"D:\Видео\лекция.ru.vtt"},
+            "error": "Контролируемая ошибка",
+        }
+    )
+
+    assert prepared["output_format"] == "vtt"
+    assert prepared["state"] == "queued"
+    assert prepared["stage"] == "Повторный запуск"
+    for key in (
+        "subtitle_output",
+        "srt_output",
+        "sidecar_output",
+        "audio_output",
+        "outputs",
+        "error",
+    ):
+        assert key not in prepared
+
+
+def test_retry_canonicalizes_persisted_legacy_settings_to_srt(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-jobs.sqlite3"
+    registry = JobRegistry(store=SQLiteJobStore(database))
+    path = r"D:\Видео\старый выпуск.mp4"
+    srt_output = r"D:\Видео\старый выпуск.ru.srt"
+
+    def failed_processor(paths, settings, emit_event, log, *, cancel_check=None):
+        del settings, emit_event, log, cancel_check
+        return [
+            {
+                "path": paths[0],
+                "state": "error",
+                "error": "Контрольная ошибка",
+                "srt_output": srt_output,
+            }
+        ]
+
+    source = registry.start(
+        paths=[path],
+        settings={"language": "ru"},
+        items=[{"path": path, "state": "queued"}],
+        processor=failed_processor,
+    )
+    assert source.finished.wait(timeout=3)
+    assert "output_format" not in registry.snapshot(source.job_id)["settings"]
+    registry.close()
+
+    store = SQLiteJobStore(database)
+    raw_legacy = store.load(source.job_id)
+    assert raw_legacy is not None
+    assert "output_format" not in raw_legacy["settings"]
+    assert "output_format" not in raw_legacy["items"][0]
+    assert "subtitle_output" not in raw_legacy["items"][0]
+
+    restarted = JobRegistry(store=store)
+    restored = restarted.snapshot(source.job_id)
+    assert restored["settings"]["output_format"] == "srt"
+    assert restored["items"][0]["output_format"] == "srt"
+    assert restored["items"][0]["subtitle_output"] == srt_output
+    raw_after_read = store.load(source.job_id)
+    assert raw_after_read is not None
+    assert "output_format" not in raw_after_read["settings"]
+    assert "subtitle_output" not in raw_after_read["items"][0]
+
+    retried = restarted.retry(source.job_id, failed_processor)
+    assert retried.settings["output_format"] == "srt"
+    assert retried.snapshot(active=True)["settings"]["output_format"] == "srt"
+    assert retried.finished.wait(timeout=3)
+    assert restarted.snapshot(retried.job_id)["settings"]["output_format"] == "srt"
+    restarted.close()
+
+
+def test_snapshot_normalizer_preserves_generic_ass_and_vtt_outputs() -> None:
+    for output_format in ("ass", "vtt"):
+        subtitle_output = rf"D:\Видео\лекция.ru.{output_format}"
+        source = {
+            "settings": {},
+            "items": [
+                {
+                    "path": r"D:\Видео\лекция.mp4",
+                    "subtitle_output": subtitle_output,
+                    "srt_output": r"D:\Видео\старый путь.ru.srt",
+                }
+            ],
+        }
+
+        normalized = _normalize_snapshot_for_read(source)
+
+        assert normalized["settings"]["output_format"] == "srt"
+        assert normalized["items"][0]["output_format"] == output_format
+        assert normalized["items"][0]["subtitle_output"] == subtitle_output
+        assert "output_format" not in source["settings"]
+        assert "output_format" not in source["items"][0]
 
 
 def test_retry_rebuilds_and_persists_changed_source_fingerprint(tmp_path: Path) -> None:

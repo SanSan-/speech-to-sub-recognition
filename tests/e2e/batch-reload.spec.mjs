@@ -94,6 +94,9 @@ test("рабочие панели растягиваются, настройки
   const srtSettings = page.locator("#srtSettings");
   const longFormSettings = page.locator("#longFormSettings");
   const advancedSettings = page.locator("#advancedSettings");
+  const outputFormat = page.getByLabel("Формат субтитров");
+  await expect(outputFormat).toHaveValue("srt");
+  await expect(outputFormat.locator("option")).toHaveText(["SRT", "ASS", "VTT"]);
   await expect(alignmentSettings).not.toHaveAttribute("open", "");
   await expect(srtSettings).toHaveAttribute("open", "");
   await expect(longFormSettings).not.toHaveAttribute("open", "");
@@ -106,10 +109,10 @@ test("рабочие панели растягиваются, настройки
   await expect(longFormSettings).toHaveAttribute("open", "");
   await expect(advancedSettings).toHaveAttribute("open", "");
   await expect(page.locator('label[for="force"] .field-hint')).toContainText(
-    "Обойти кеш готового SRT и распознавания",
+    "Обойти кеш готовых субтитров и распознавания",
   );
 
-  await page.getByLabel("Допуск длины строки SRT").fill("7");
+  await page.getByLabel("Допуск длины строки субтитров").fill("7");
   await page.getByLabel("Окно длинной записи, сек.").fill("420");
   await page.getByLabel("Сохранить нормализованный FLAC").check();
   await expect
@@ -175,10 +178,12 @@ test("рабочие панели растягиваются, настройки
   await page.reload();
   await expect(page.locator("#advancedSettings")).not.toHaveAttribute("open", "");
   await page.locator("#advancedSettings > summary").click();
+  await expect(outputFormat).toBeVisible();
+  await expect(outputFormat).toHaveValue("srt");
   await expect(page.getByLabel("Сохранить нормализованный FLAC")).toBeChecked();
   await page.locator("#longFormSettings > summary").click();
   await expect(page.getByLabel("Окно длинной записи, сек.")).toHaveValue("420");
-  await expect(page.getByLabel("Допуск длины строки SRT")).toHaveValue("7");
+  await expect(page.getByLabel("Допуск длины строки субтитров")).toHaveValue("7");
 
   const mobileLayout = await page.evaluate(() => {
     const fileList = document.querySelector("#fileList");
@@ -208,6 +213,7 @@ test("облачный режим требует несохраняемого с
 
   const backend = page.locator("#backend");
   const consent = page.getByLabel("Разрешить передачу аудио в OpenAI");
+  const outputFormat = page.getByLabel("Формат субтитров");
   const start = page.getByRole("button", { name: "Запустить" });
   await backend.selectOption("openai-api");
 
@@ -222,6 +228,7 @@ test("облачный режим требует несохраняемого с
   await expect(page.locator("#workerPythonPath")).toBeDisabled();
   await expect(page.locator("#quantizationEnabled")).toBeDisabled();
   await expect(page.locator("#autoDownloadModel")).toBeDisabled();
+  await expect(outputFormat).toBeEnabled();
   await expect(consent).not.toBeChecked();
   await expect(start).toBeDisabled();
 
@@ -230,10 +237,161 @@ test("облачный режим требует несохраняемого с
   const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "{}"), SETTINGS_KEY);
   expect(stored).not.toHaveProperty("allow_cloud_processing");
 
+  await outputFormat.selectOption("vtt");
+  await expect(page.locator("#brandSubtitle")).toHaveText(
+    "Облачное пакетное распознавание речи в VTT",
+  );
+
   await backend.selectOption("faster-whisper");
   await backend.selectOption("openai-api");
   await expect(consent).not.toBeChecked();
   await expect(start).toBeDisabled();
+});
+
+test("формат субтитров безопасно мигрирует localStorage и сохраняется", async ({ page }) => {
+  await page.goto("/");
+  const outputFormat = page.getByLabel("Формат субтитров");
+  await expect(outputFormat).toHaveValue("srt");
+
+  await page.evaluate((key) => {
+    localStorage.setItem(key, JSON.stringify({ language: "ru" }));
+  }, SETTINGS_KEY);
+  await page.reload();
+  await expect(outputFormat).toHaveValue("srt");
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("srt");
+
+  await page.evaluate((key) => {
+    localStorage.setItem(key, JSON.stringify({ output_format: "txt" }));
+  }, SETTINGS_KEY);
+  await page.reload();
+  await expect(outputFormat).toHaveValue("srt");
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("srt");
+
+  await outputFormat.selectOption("ass");
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("ass");
+  await page.reload();
+  await expect(outputFormat).toHaveValue("ass");
+  await expect(page.locator("#brandSubtitle")).toHaveText(
+    "Локальное пакетное распознавание речи в ASS",
+  );
+});
+
+test("выбранный формат проходит через pick, refresh и transcribe без скрытого обновления", async ({ page }) => {
+  const payloads = { pick: [], refresh: [], transcribe: [] };
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/pick") {
+      payloads.pick.push(request.postDataJSON());
+    } else if (pathname === "/api/refresh") {
+      payloads.refresh.push(request.postDataJSON());
+    }
+  });
+
+  await page.goto("/");
+  const outputFormat = page.getByLabel("Формат субтитров");
+  for (const format of ["srt", "ass", "vtt"]) {
+    await outputFormat.selectOption(format);
+    await page.getByRole("button", { name: "Файлы" }).click();
+    await expect(page.locator(".file-card")).toHaveCount(3);
+    expect(payloads.pick.at(-1).settings.output_format).toBe(format);
+    await expect(page.locator(".file-card").first().locator(".output-label").first())
+      .toHaveText(format.toUpperCase());
+    await expect(page.locator(".file-card").first().locator(".output-path").first())
+      .toHaveText(new RegExp(`\\.${format}$`, "i"));
+  }
+
+  const refreshCount = payloads.refresh.length;
+  await outputFormat.selectOption("ass");
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("ass");
+  expect(payloads.refresh).toHaveLength(refreshCount);
+  await page.getByRole("button", { name: "Обновить" }).click();
+  await expect.poll(() => payloads.refresh.length).toBe(refreshCount + 1);
+  expect(payloads.refresh.at(-1).settings.output_format).toBe("ass");
+  await expect(page.locator(".file-card").first().locator(".output-label").first())
+    .toHaveText("ASS");
+
+  await page.route("**/api/transcribe", async (route) => {
+    payloads.transcribe.push(route.request().postDataJSON());
+    await route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Контрольная остановка запуска по формату." }),
+    });
+  });
+  await outputFormat.selectOption("vtt");
+  await page.getByRole("button", { name: "Запустить" }).click();
+  await expect.poll(() => payloads.transcribe.length).toBe(1);
+  expect(payloads.transcribe[0].settings.output_format).toBe("vtt");
+  await expect(page.locator("#logConsole")).toContainText(
+    "Контрольная остановка запуска по формату",
+  );
+});
+
+test("снимок прежней версии сбрасывает сохранённый VTT в SRT и показывает старый путь", async ({ page }) => {
+  const jobId = "a".repeat(32);
+  await page.addInitScript((key) => {
+    localStorage.setItem(key, JSON.stringify({ output_format: "vtt" }));
+  }, SETTINGS_KEY);
+  await page.route("**/api/active-job", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        active: false,
+        terminal: true,
+        job_id: jobId,
+        status: "ok",
+        source_paths: ["D:\\E2E\\Старый выпуск.mp4"],
+        settings: { language: "ru" },
+        items: [{
+          path: "D:\\E2E\\Старый выпуск.mp4",
+          name: "Старый выпуск.mp4",
+          state: "done",
+          progress: 100,
+          srt_output: "D:\\E2E\\Старый выпуск.ru.srt",
+        }],
+        logs: [],
+        total: 1,
+        done: 1,
+        latest_event_id: 1,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByLabel("Формат субтитров")).toHaveValue("srt");
+  await expect(page.locator("#brandSubtitle")).toHaveText(
+    "Локальное пакетное распознавание речи в SRT",
+  );
+  await expect(page.locator(".output-label").first()).toHaveText("SRT");
+  await expect(page.locator(".output-path").first()).toHaveText(/\.ru\.srt$/i);
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("srt");
 });
 
 test("папка рекурсивно готовится с ранним прогрессом и без скрытого обновления", async ({ page, request }) => {
@@ -315,7 +473,7 @@ test("папка рекурсивно готовится с ранним про�
   expect(requestPayloads.refresh[0].settings.recursive).toBe(true);
 
   const refreshCount = requestPayloads.refresh.length;
-  await page.getByLabel("Базовая длина строки SRT").fill("39");
+  await page.getByLabel("Базовая длина строки субтитров").fill("39");
   await expect
     .poll(() =>
       page.evaluate(
@@ -636,13 +794,15 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
 
   const language = page.getByLabel("Язык распознавания");
   const device = page.getByLabel("Устройство");
-  const maxCharsPerLine = page.getByLabel("Базовая длина строки SRT");
-  const lineLengthGap = page.getByLabel("Допуск длины строки SRT");
+  const outputFormat = page.getByLabel("Формат субтитров");
+  const maxCharsPerLine = page.getByLabel("Базовая длина строки субтитров");
+  const lineLengthGap = page.getByLabel("Допуск длины строки субтитров");
   const maxCps = page.getByLabel("Ориентир скорости чтения, символов/с");
   const cancel = page.getByRole("button", { name: "Отменить" });
   const retry = page.getByRole("button", { name: "Повторить ошибки" });
   await language.selectOption("ru");
   await device.selectOption("cpu");
+  await outputFormat.selectOption("ass");
   await maxCharsPerLine.fill("40");
   await lineLengthGap.fill("6");
   await maxCps.fill("16.5");
@@ -654,6 +814,7 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
     .toMatchObject({
       language: "ru",
       device: "cpu",
+      output_format: "ass",
       max_chars_per_line: 40,
       line_length_gap: 6,
       max_cps: 16.5,
@@ -662,6 +823,7 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await page.reload();
   await expect(language).toHaveValue("ru");
   await expect(device).toHaveValue("cpu");
+  await expect(outputFormat).toHaveValue("ass");
   await expect(maxCharsPerLine).toHaveValue("40");
   await expect(lineLengthGap).toHaveValue("6");
   await expect(maxCps).toHaveValue("16.5");
@@ -676,6 +838,8 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect(fileDuration(page, "Лекция 01.mp4")).toHaveText("1:00");
   await expect(fileDuration(page, "Разбор алгоритма №2.mkv")).toHaveText("1:01");
   await expect(fileDuration(page, "Ошибка дорожки 03.wav")).toHaveText("1:02");
+  await expect(page.locator(".file-card").first().locator(".output-label").first())
+    .toHaveText("ASS");
 
   await page.locator("#advancedSettings > summary").click();
   const force = page.getByLabel("Перезаписать целевые результаты");
@@ -695,6 +859,9 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect
     .poll(async () => (await e2eState(request)).process_settings[0]?.force)
     .toBe(true);
+  await expect
+    .poll(async () => (await e2eState(request)).process_settings[0]?.output_format)
+    .toBe("ass");
   await expect(page.locator("#logConsole")).toContainText(
     "Начата постановка выбранных источников в очередь.",
   );
@@ -732,6 +899,7 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect(fileDuration(page, "Ошибка дорожки 03.wav")).toHaveCount(0);
   await expect(language).toHaveValue("ru");
   await expect(device).toHaveValue("cpu");
+  await expect(outputFormat).toHaveValue("ass");
   await page.locator("#advancedSettings > summary").click();
   await expect(force).not.toBeChecked();
   await expect(language).toBeDisabled();
@@ -788,9 +956,24 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect(retry).toBeEnabled();
   await expect(language).toHaveValue("ru");
   await expect(device).toHaveValue("cpu");
+  await expect(outputFormat).toHaveValue("ass");
   await expect.poll(() => controlLineCount(page)).toBe(1);
 
+  await outputFormat.selectOption("vtt");
+  await expect(page.locator("#brandSubtitle")).toHaveText(
+    "Локальное пакетное распознавание речи в VTT",
+  );
   await retry.click();
+  await expect(outputFormat).toHaveValue("ass");
+  await expect(page.locator("#brandSubtitle")).toHaveText(
+    "Локальное пакетное распознавание речи в ASS",
+  );
+  await expect
+    .poll(() => page.evaluate(
+      (key) => JSON.parse(localStorage.getItem(key) ?? "{}").output_format,
+      SETTINGS_KEY,
+    ))
+    .toBe("ass");
   await expect(page.locator(".file-card")).toHaveCount(2);
   await expect(page.locator(".file-name")).toHaveText([
     "Разбор алгоритма №2.mkv",
@@ -806,6 +989,9 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   await expect
     .poll(async () => (await e2eState(request)).process_settings[1]?.force)
     .toBe(false);
+  await expect
+    .poll(async () => (await e2eState(request)).process_settings[1]?.output_format)
+    .toBe("ass");
 
   const release = await request.post("/__e2e__/release", {
     headers: LOCAL_ORIGIN_HEADERS,
@@ -822,6 +1008,8 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   );
   await expect(fileDuration(page, "Разбор алгоритма №2.mkv")).toHaveText("1:01");
   await expect(fileDuration(page, "Ошибка дорожки 03.wav")).toHaveText("1:02");
+  await expect(fileCard(page, "Разбор алгоритма №2.mkv").locator(".output-label").first())
+    .toHaveText("ASS");
   await expect(retry).toBeEnabled();
   await expect.poll(() => controlLineCount(page)).toBe(1);
 
@@ -831,4 +1019,19 @@ test("SQLite сохраняет batch при reload, cancel и retry", async ({ 
   expect(jobs).toHaveLength(2);
   expect(jobs[0].retry_of).toBe(originalJobId);
   expect(jobs[1].job_id).toBe(originalJobId);
+});
+
+test("SQLite snapshot 1.5.x после restart отображается как SRT", async ({ page, request }) => {
+  const seeded = await request.post("/__e2e__/seed-legacy-srt", {
+    headers: LOCAL_ORIGIN_HEADERS,
+  });
+  expect(seeded.ok()).toBeTruthy();
+  const { srt_output: srtOutput } = await seeded.json();
+
+  await page.goto("/");
+  await expect(page.getByLabel("Формат субтитров")).toHaveValue("srt");
+  await expect(fileCard(page, "Старая лекция.mp4").locator(".output-label").first())
+    .toHaveText("SRT");
+  await expect(fileCard(page, "Старая лекция.mp4").locator(".output-path").first())
+    .toHaveText(srtOutput);
 });

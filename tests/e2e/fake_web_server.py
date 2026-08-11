@@ -158,7 +158,10 @@ class FakeBatchService:
     ) -> list[dict[str, Any]]:
         with self._lock:
             self.build_settings.append(copy.deepcopy(settings))
-            return [copy.deepcopy(self._items[path]) for path in paths]
+            items = [copy.deepcopy(self._items[path]) for path in paths]
+        for item in items:
+            item.update(self._output_fields(str(item["path"]), settings))
+        return items
 
     def unload(self) -> None:
         """Заглушка выгрузки модели: локальная модель в E2E не создаётся."""
@@ -182,14 +185,15 @@ class FakeBatchService:
             call_number = len(self.calls)
 
         if call_number == 1:
-            return self._run_initial(paths, emit_event, log, cancel_check)
+            return self._run_initial(paths, settings, emit_event, log, cancel_check)
         if call_number == 2:
-            return self._run_retry(paths, emit_event)
+            return self._run_retry(paths, settings, emit_event)
         raise RuntimeError(f"E2E не ожидает запуск №{call_number}")
 
     def _run_initial(
         self,
         paths: list[str],
+        settings: dict[str, Any],
         emit_event: Callable[[dict[str, Any]], None],
         log: logging.Logger,
         cancel_check: Callable[[], bool],
@@ -202,7 +206,7 @@ class FakeBatchService:
             state="done",
             stage="Готово",
             progress=100,
-            outputs=self._outputs(paths[0]),
+            **self._output_fields(paths[0], settings),
         )
         emit_event(self._file_event(paths[0]))
         log.info(CONTROL_LOG_LINE)
@@ -227,6 +231,7 @@ class FakeBatchService:
     def _run_retry(
         self,
         paths: list[str],
+        settings: dict[str, Any],
         emit_event: Callable[[dict[str, Any]], None],
     ) -> list[dict[str, Any]]:
         if paths != list(FAKE_PATHS[1:]):
@@ -250,7 +255,7 @@ class FakeBatchService:
             stage="Готово",
             progress=100,
             error=None,
-            outputs=self._outputs(paths[0]),
+            **self._output_fields(paths[0], settings),
         )
         self._update(
             paths[1],
@@ -258,6 +263,7 @@ class FakeBatchService:
             stage="Ошибка",
             progress=100,
             error="Контролируемая ошибка E2E",
+            **self._output_fields(paths[1], settings),
         )
         return [self._result(paths[0]), self._result(paths[1])]
 
@@ -308,16 +314,22 @@ class FakeBatchService:
             "stage": item["stage"],
             "progress": item["progress"],
             "error": item["error"],
-            "outputs": item["outputs"],
+            "output_format": item.get("output_format", "srt"),
+            "subtitle_output": item.get("subtitle_output"),
+            "sidecar_output": item.get("sidecar_output"),
             "probe": copy.deepcopy(item["probe"]),
         }
 
     @staticmethod
-    def _outputs(path: str) -> dict[str, str]:
+    def _output_fields(path: str, settings: dict[str, Any]) -> dict[str, str]:
         source = Path(path)
+        output_format = str(settings.get("output_format") or "srt")
         return {
-            "srt": str(source.with_suffix(".srt")),
-            "sidecar": str(source.with_suffix(".json")),
+            "output_format": output_format,
+            "subtitle_output": str(source.with_suffix(f".{output_format}")),
+            "sidecar_output": str(
+                source.with_name(f"{source.stem}.{output_format}.asr.json")
+            ),
         }
 
 
@@ -391,6 +403,44 @@ def e2e_restart() -> dict[str, Any]:
         "status": snapshot.get("status"),
         "terminal": snapshot.get("terminal", False),
     }
+
+
+@web_app.app.post("/__e2e__/seed-legacy-srt")
+def e2e_seed_legacy_srt() -> dict[str, Any]:
+    """Создаёт terminal snapshot формата 1.5.x и переоткрывает реестр."""
+    previous = web_app.job_registry
+    previous.close()
+    now = time.time()
+    job_id = "legacy-srt-e2e"
+    source_path = r"D:\E2E\Старая лекция.mp4"
+    srt_output = r"D:\E2E\Старая лекция.ru.srt"
+    store = SQLiteJobStore(E2E_JOB_DB)
+    store.save(
+        {
+            "job_id": job_id,
+            "status": "ok",
+            "active": False,
+            "terminal": True,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": now,
+            "source_paths": [source_path],
+            "settings": {"language": "ru"},
+            "items": [
+                {
+                    "path": source_path,
+                    "name": "Старая лекция.mp4",
+                    "state": "done",
+                    "progress": 100,
+                    "srt_output": srt_output,
+                }
+            ],
+        },
+        [(1, {"type": "done", "status": "ok"})],
+    )
+    store.close()
+    web_app.job_registry = JobRegistry(store=SQLiteJobStore(E2E_JOB_DB))
+    return {"job_id": job_id, "srt_output": srt_output}
 
 
 def main() -> None:

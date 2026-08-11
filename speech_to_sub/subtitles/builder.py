@@ -1,4 +1,4 @@
-"""Преобразование временных меток ASR в читаемые SRT-реплики."""
+"""Преобразование временных меток ASR в читаемые реплики субтитров."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ _WEAK_END_WORDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class Cue:
-    """Одна пронумерованная реплика SRT."""
+    """Одна пронумерованная реплика субтитров."""
 
     index: int
     start: float
@@ -252,7 +252,7 @@ def build_srt(
 
 def render_srt(cues: Sequence[Cue]) -> str:
     """Форматирует cues как SRT с LF и завершающей пустой строкой."""
-    timestamps = _quantize_cue_timestamps(cues)
+    timestamps = quantize_cue_timestamps(cues, units_per_second=1000)
     blocks = [
         f"{cue.index}\n{_format_milliseconds(start)} --> "
         f"{_format_milliseconds(end)}\n{cue.text}"
@@ -267,16 +267,20 @@ def format_timestamp(seconds: float) -> str:
 
 
 def _rounded_milliseconds(seconds: float) -> int:
+    return _rounded_timestamp_units(seconds, units_per_second=1000)
+
+
+def _rounded_timestamp_units(seconds: float, *, units_per_second: int) -> int:
     if not math.isfinite(seconds) or seconds < 0:
         raise ValidationError(
-            "Временная метка SRT должна быть конечной и неотрицательной"
+            "Временная метка субтитров должна быть конечной и неотрицательной"
         )
     integral_seconds = math.floor(seconds)
-    milliseconds = int(round((seconds - integral_seconds) * 1000))
-    if milliseconds == 1000:
+    fraction_units = int(round((seconds - integral_seconds) * units_per_second))
+    if fraction_units == units_per_second:
         integral_seconds += 1
-        milliseconds = 0
-    return integral_seconds * 1000 + milliseconds
+        fraction_units = 0
+    return integral_seconds * units_per_second + fraction_units
 
 
 def _format_milliseconds(total_milliseconds: int) -> str:
@@ -286,15 +290,29 @@ def _format_milliseconds(total_milliseconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
 
 
-def _quantize_cue_timestamps(
+def quantize_cue_timestamps(
     cues: Sequence[Cue],
+    *,
+    units_per_second: int,
 ) -> tuple[tuple[int, int], ...]:
-    """Квантует общую шкалу, сохраняя положительность и непересечение в SRT."""
+    """Квантует общую шкалу, сохраняя положительность и непересечение реплик."""
+    if (
+        isinstance(units_per_second, bool)
+        or not isinstance(units_per_second, int)
+        or units_per_second <= 0
+    ):
+        raise ValidationError("Точность временной шкалы должна быть положительной.")
     result: list[tuple[int, int]] = []
     previous_end = 0
     for cue in cues:
-        start = max(previous_end, _rounded_milliseconds(cue.start))
-        end = max(start + 1, _rounded_milliseconds(cue.end))
+        start = max(
+            previous_end,
+            _rounded_timestamp_units(cue.start, units_per_second=units_per_second),
+        )
+        end = max(
+            start + 1,
+            _rounded_timestamp_units(cue.end, units_per_second=units_per_second),
+        )
         result.append((start, end))
         previous_end = end
     return tuple(result)
@@ -306,7 +324,7 @@ def _canonicalize_cues(cues: Sequence[Cue]) -> tuple[Cue, ...]:
         replace(cue, start=start / 1000, end=end / 1000)
         for cue, (start, end) in zip(
             cues,
-            _quantize_cue_timestamps(cues),
+            quantize_cue_timestamps(cues, units_per_second=1000),
             strict=True,
         )
     )
@@ -1396,7 +1414,7 @@ def _presentation_diagnostics(
     max_cps: float,
     max_duration: float,
 ) -> dict[str, int | float]:
-    rendered_timestamps = _quantize_cue_timestamps(cues)
+    rendered_timestamps = quantize_cue_timestamps(cues, units_per_second=1000)
     durations_ms = tuple(end - start for start, end in rendered_timestamps)
     actual_cps = tuple(
         visible_character_count(cue.text) * 1000 / duration_ms
@@ -1420,6 +1438,22 @@ def _presentation_diagnostics(
         ),
         "max_actual_line_length": max(line_lengths, default=0),
     }
+
+
+def build_presentation_diagnostics(
+    cues: Sequence[Cue],
+    *,
+    hard_chars_per_line: int,
+    max_cps: float,
+    max_duration: float = 7.0,
+) -> dict[str, int | float]:
+    """Измеряет фактическое представление уже квантованных реплик."""
+    return _presentation_diagnostics(
+        cues,
+        hard_chars_per_line=hard_chars_per_line,
+        max_cps=max_cps,
+        max_duration=max_duration,
+    )
 
 
 def _interval_is_valid(start: float, end: float) -> bool:

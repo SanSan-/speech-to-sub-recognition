@@ -14,6 +14,7 @@ const selectedPath = document.getElementById("selectedPath");
 const statusSummary = document.getElementById("statusSummary");
 const settingsForm = document.getElementById("settingsForm");
 const backendSelect = document.getElementById("backend");
+const outputFormatSelect = document.getElementById("outputFormat");
 const modelPathInput = document.getElementById("modelPath");
 const cloudSettings = document.getElementById("cloudSettings");
 const allowCloudProcessingInput = document.getElementById("allowCloudProcessing");
@@ -37,6 +38,7 @@ const PREPARATION_POLL_INTERVAL_MS = 400;
 const PREPARATION_STATUS_TIMEOUT_MS = 4000;
 const PREPARATION_STALE_WARNING_MS = 12000;
 const CARD_PAGE_SIZE = 200;
+const OUTPUT_FORMAT_VALUES = new Set(["srt", "ass", "vtt"]);
 const ACTIVE_STATES = new Set([
   "queued",
   "probing",
@@ -69,6 +71,7 @@ const BUILTIN_DEFAULTS = {
   allow_cpu_fallback: false,
   allow_cloud_processing: false,
   openai_model: "whisper-1",
+  output_format: "srt",
   max_chars_per_line: 42,
   line_length_gap: 8,
   max_cps: 17,
@@ -159,6 +162,15 @@ function isCloudBackend() {
   return backendSelect.value === "openai-api";
 }
 
+function supportedOutputFormat(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return OUTPUT_FORMAT_VALUES.has(normalized) ? normalized : null;
+}
+
+function selectedOutputFormat() {
+  return supportedOutputFormat(outputFormatSelect?.value) || "srt";
+}
+
 function updatePickerHint() {
   if (!pickerHint) {
     return;
@@ -195,9 +207,10 @@ function updateBackendMode(options = {}) {
       input.disabled = locked || cloud;
     });
   });
+  const outputFormat = selectedOutputFormat().toUpperCase();
   brandSubtitle.textContent = cloud
-    ? "Облачное пакетное распознавание речи в SRT"
-    : "Локальное пакетное распознавание речи в SRT";
+    ? `Облачное пакетное распознавание речи в ${outputFormat}`
+    : `Локальное пакетное распознавание речи в ${outputFormat}`;
   settingsModeHint.textContent = cloud
     ? "Аудио передаётся в OpenAI только после явного согласия"
     : "Сеть при распознавании не используется";
@@ -408,9 +421,21 @@ function loadStoredSettings() {
     if (!parsed || typeof parsed !== "object") {
       return null;
     }
-    delete parsed.allow_cloud_processing;
-    delete parsed.force;
-    delete parsed.recursive;
+    let migrated = false;
+    ["allow_cloud_processing", "force", "recursive"].forEach((key) => {
+      if (Object.hasOwn(parsed, key)) {
+        delete parsed[key];
+        migrated = true;
+      }
+    });
+    const outputFormat = supportedOutputFormat(parsed.output_format) || "srt";
+    if (parsed.output_format !== outputFormat) {
+      parsed.output_format = outputFormat;
+      migrated = true;
+    }
+    if (migrated && window.localStorage) {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(parsed));
+    }
     return parsed;
   } catch {
     appendLog("Не удалось прочитать сохранённые настройки.");
@@ -949,9 +974,29 @@ function collectNotice(item) {
   return null;
 }
 
+function subtitleOutputPath(item) {
+  const value = item?.subtitle_output ?? item?.srt_output;
+  return value ? String(value) : null;
+}
+
+function outputFormatFromPath(path) {
+  const match = /\.([^.\\/]+)$/.exec(String(path || ""));
+  return supportedOutputFormat(match?.[1]);
+}
+
+function itemOutputFormat(item, subtitlePath) {
+  return (
+    supportedOutputFormat(item?.output_format)
+    || outputFormatFromPath(subtitlePath)
+    || (item?.srt_output ? "srt" : null)
+    || "srt"
+  );
+}
+
 function updateOutputs(entry, item) {
+  const subtitlePath = subtitleOutputPath(item);
   const outputs = [
-    ["SRT", item.srt_output],
+    [itemOutputFormat(item, subtitlePath).toUpperCase(), subtitlePath],
     ["JSON", item.sidecar_output],
     ["FLAC", item.audio_output],
   ].filter(([, path]) => Boolean(path));
@@ -1403,6 +1448,19 @@ function restoreCounters(snapshot, items) {
   state.jobDone = asFiniteNumber(snapshot.done, state.completed.size);
 }
 
+function applyJobSettings(settings) {
+  if (!settings || typeof settings !== "object") {
+    return;
+  }
+  const snapshotSettings = {
+    ...settings,
+    output_format: supportedOutputFormat(settings.output_format) || "srt",
+  };
+  applySettingValues(snapshotSettings);
+  persistSettings();
+  updateBackendMode({ resetConsent: true });
+}
+
 async function loadActiveJob(options = {}) {
   let result;
   try {
@@ -1437,11 +1495,7 @@ async function loadActiveJob(options = {}) {
     result.logs.forEach((line) => appendLog(line));
   }
 
-  if (result.settings && typeof result.settings === "object") {
-    applySettingValues(result.settings);
-    persistSettings();
-    updateBackendMode({ resetConsent: true });
-  }
+  applyJobSettings(result.settings);
   if (result.active) {
     state.jobId = result.job_id;
     setTerminalState("running");
@@ -1714,6 +1768,7 @@ async function retryFailed() {
       `/api/jobs/${encodeURIComponent(sourceJobId)}/retry`,
       { allow_cloud_processing: cloudAllowed, force: forceAllowed },
     );
+    applyJobSettings(result.settings);
     state.jobId = result.job_id;
     state.displayedJobId = result.job_id;
     state.eventCursor = 0;
@@ -1757,6 +1812,7 @@ async function loadUiConfig() {
   setSelectOptions(alignerSelect, config.aligners, defaults.aligner);
   setSelectOptions(deviceSelect, config.devices, defaults.device);
   setSelectOptions(languageSelect, config.languages, defaults.language);
+  setSelectOptions(outputFormatSelect, config.output_formats, defaults.output_format);
   applySettingValues(defaults);
   const stored = loadStoredSettings();
   if (stored) {
@@ -1838,6 +1894,9 @@ backendSelect.addEventListener("change", () => {
 });
 alignerSelect.addEventListener("change", enforceBackendCompatibilityForAligner);
 allowCloudProcessingInput.addEventListener("change", () => {
+  updateBackendMode();
+});
+outputFormatSelect.addEventListener("change", () => {
   updateBackendMode();
 });
 

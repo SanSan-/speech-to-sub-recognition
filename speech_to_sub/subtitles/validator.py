@@ -1,4 +1,4 @@
-"""Синтаксическая и временная проверка субтитров SRT."""
+"""Синтаксическая и временная проверка поддерживаемых субтитров."""
 
 from __future__ import annotations
 
@@ -9,12 +9,28 @@ from collections.abc import Sequence
 from speech_to_sub.constants import DEFAULT_LINE_LENGTH_GAP, MAX_LINE_LENGTH_GAP
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.subtitles.builder import Cue
+from speech_to_sub.subtitles.formats import (
+    ASS_DEFAULT_STYLE,
+    ASS_EVENTS_FORMAT,
+    ASS_SCRIPT_INFO_LINES,
+    ASS_STYLE_FORMAT,
+    SubtitleFormat,
+    ass_separator,
+    unescape_ass_text,
+    unescape_vtt_text,
+)
 from speech_to_sub.subtitles.layout import visible_character_count
 
 _TIMESTAMP_RE = re.compile(
     r"^(?P<hours>\d{2,}):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d),(?P<milliseconds>\d{3})$"
 )
 _TIMING_LINE_RE = re.compile(r"^(?P<start>\S+) --> (?P<end>\S+)$")
+_VTT_TIMESTAMP_RE = re.compile(
+    r"^(?P<hours>\d{2,}):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)\.(?P<milliseconds>\d{3})$"
+)
+_ASS_TIMESTAMP_RE = re.compile(
+    r"^(?P<hours>\d+):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)\.(?P<centiseconds>\d{2})$"
+)
 
 
 def validate_cues(
@@ -29,7 +45,7 @@ def validate_cues(
 ) -> None:
     """Проверяет структуру и переданные явно ограничения раскладки."""
     if not cues:
-        raise ValidationError("SRT не содержит ни одной реплики")
+        raise ValidationError("Субтитры не содержат ни одной реплики")
     _validate_duration_settings(audio_duration, duration_tolerance)
     _validate_layout_settings(max_chars_per_line, line_length_gap, max_lines, max_cps)
 
@@ -77,7 +93,7 @@ def _validate_cue(
 ) -> None:
     if cue.index != expected_index:
         raise ValidationError(
-            "Нумерация SRT должна быть последовательной и начинаться с единицы"
+            "Нумерация реплик должна быть последовательной и начинаться с единицы"
         )
     _validate_cue_text(
         cue,
@@ -155,7 +171,7 @@ def _validate_layout_settings(
             f"Допуск длины строки должен быть целым числом от 0 до {MAX_LINE_LENGTH_GAP}"
         )
     if max_lines is not None and max_lines not in (1, 2):
-        raise ValidationError("SRT допускает лимит в одну или две строки")
+        raise ValidationError("Субтитры допускают лимит в одну или две строки")
     if max_cps is not None and (not math.isfinite(max_cps) or max_cps <= 0):
         raise ValidationError("Лимит CPS должен быть положительным конечным числом")
 
@@ -242,6 +258,194 @@ def validate_srt_text(
     )
 
 
+def parse_vtt(content: str) -> tuple[Cue, ...]:
+    """Разбирает детерминированный профиль WebVTT генератора."""
+    normalized = _normalized_subtitle_text(content, "VTT")
+    lines = normalized.split("\n")
+    if lines[0] != "WEBVTT":
+        raise ValidationError("VTT должен начинаться с заголовка WEBVTT")
+    if len(lines) < 3 or lines[1] != "":
+        raise ValidationError("После заголовка WEBVTT должна быть пустая строка")
+    blocks = re.split(r"\n[ \t]*\n", "\n".join(lines[2:]))
+    cues: list[Cue] = []
+    for block_number, block in enumerate(blocks, start=1):
+        block_lines = block.split("\n")
+        timing_index = _vtt_timing_index(block_lines, block_number)
+        text_lines = block_lines[timing_index + 1 :]
+        if len(text_lines) not in (1, 2) or any(not line.strip() for line in text_lines):
+            raise ValidationError(
+                f"Реплика VTT {block_number} должна содержать одну или две непустые строки"
+            )
+        timing_match = _TIMING_LINE_RE.fullmatch(block_lines[timing_index])
+        if timing_match is None:
+            raise ValidationError(f"Некорректный тайминг VTT в блоке {block_number}")
+        cues.append(
+            Cue(
+                index=block_number,
+                start=_parse_vtt_timestamp(timing_match.group("start")),
+                end=_parse_vtt_timestamp(timing_match.group("end")),
+                text=unescape_vtt_text("\n".join(text_lines)),
+            )
+        )
+    return tuple(cues)
+
+
+def _vtt_timing_index(lines: list[str], block_number: int) -> int:
+    if not lines or len(lines) > 4:
+        raise ValidationError(f"Некорректная структура блока VTT {block_number}")
+    if _TIMING_LINE_RE.fullmatch(lines[0]):
+        return 0
+    if len(lines) < 3:
+        raise ValidationError(f"Некорректная структура блока VTT {block_number}")
+    try:
+        cue_id = int(lines[0])
+    except ValueError as exc:
+        raise ValidationError(f"Некорректный идентификатор VTT: {lines[0]!r}") from exc
+    if cue_id != block_number:
+        raise ValidationError("Нумерация VTT должна быть последовательной")
+    return 1
+
+
+def validate_vtt(
+    content: str,
+    *,
+    audio_duration: float | None = None,
+    duration_tolerance: float = 0.001,
+    max_chars_per_line: int | None = None,
+    line_length_gap: int = DEFAULT_LINE_LENGTH_GAP,
+    max_lines: int | None = None,
+    max_cps: float | None = None,
+) -> tuple[Cue, ...]:
+    """Разбирает и полностью проверяет WebVTT."""
+    cues = parse_vtt(content)
+    validate_cues(
+        cues,
+        audio_duration=audio_duration,
+        duration_tolerance=duration_tolerance,
+        max_chars_per_line=max_chars_per_line,
+        line_length_gap=line_length_gap,
+        max_lines=max_lines,
+        max_cps=max_cps,
+    )
+    return cues
+
+
+def parse_ass(content: str) -> tuple[Cue, ...]:
+    """Разбирает безопасный профиль ASS, создаваемый генератором."""
+    normalized = _normalized_subtitle_text(content, "ASS")
+    lines = normalized.split("\n")
+    expected_header = [
+        *ASS_SCRIPT_INFO_LINES,
+        "",
+        "[V4+ Styles]",
+        ASS_STYLE_FORMAT,
+        ASS_DEFAULT_STYLE,
+        "",
+        "[Events]",
+        ASS_EVENTS_FORMAT,
+    ]
+    if lines[: len(expected_header)] != expected_header:
+        raise ValidationError("ASS содержит неподдерживаемый заголовок или стиль")
+    dialogue_lines = lines[len(expected_header) :]
+    if not dialogue_lines:
+        raise ValidationError("ASS не содержит ни одной реплики")
+    if any(not line for line in dialogue_lines):
+        raise ValidationError("ASS содержит пустую строку внутри раздела Events")
+    return tuple(
+        _parse_ass_dialogue(line, index)
+        for index, line in enumerate(dialogue_lines, start=1)
+    )
+
+
+def _parse_ass_dialogue(line: str, index: int) -> Cue:
+    event = ass_separator(index, line).get(index)
+    if event is None or not event.translatable:
+        raise ValidationError(f"Некорректная строка Events ASS: {line!r}")
+    if (
+        event.layer != 0
+        or event.style != "Default"
+        or event.actor
+        or event.effect
+    ):
+        raise ValidationError(f"Реплика ASS {index} не соответствует профилю генератора")
+    if any(value != 0 for value in (event.margin_l, event.margin_r, event.margin_v)):
+        raise ValidationError(f"Реплика ASS {index} содержит неподдерживаемые отступы")
+    return Cue(
+        index=index,
+        start=_parse_ass_timestamp(event.start_time or ""),
+        end=_parse_ass_timestamp(event.end_time or ""),
+        text=unescape_ass_text(event.text or ""),
+    )
+
+
+def validate_ass(
+    content: str,
+    *,
+    audio_duration: float | None = None,
+    duration_tolerance: float = 0.01,
+    max_chars_per_line: int | None = None,
+    line_length_gap: int = DEFAULT_LINE_LENGTH_GAP,
+    max_lines: int | None = None,
+    max_cps: float | None = None,
+) -> tuple[Cue, ...]:
+    """Разбирает и полностью проверяет ASS."""
+    cues = parse_ass(content)
+    validate_cues(
+        cues,
+        audio_duration=audio_duration,
+        duration_tolerance=duration_tolerance,
+        max_chars_per_line=max_chars_per_line,
+        line_length_gap=line_length_gap,
+        max_lines=max_lines,
+        max_cps=max_cps,
+    )
+    return cues
+
+
+def validate_subtitle_text(
+    content: str,
+    output_format: SubtitleFormat,
+    duration: float | None = None,
+    *,
+    max_chars_per_line: int | None = None,
+    line_length_gap: int = DEFAULT_LINE_LENGTH_GAP,
+    max_lines: int | None = None,
+    max_cps: float | None = None,
+) -> tuple[Cue, ...]:
+    """Проверяет готовый текст через единый контракт service layer."""
+    validators = {
+        SubtitleFormat.SRT: validate_srt,
+        SubtitleFormat.ASS: validate_ass,
+        SubtitleFormat.VTT: validate_vtt,
+    }
+    duration_tolerances = {
+        SubtitleFormat.SRT: 0.001,
+        SubtitleFormat.ASS: 0.01,
+        SubtitleFormat.VTT: 0.001,
+    }
+    validator = validators.get(output_format)
+    if validator is None:
+        raise ValidationError(f"Неподдерживаемый формат субтитров: {output_format!r}.")
+    return validator(
+        content,
+        audio_duration=duration,
+        duration_tolerance=duration_tolerances[output_format],
+        max_chars_per_line=max_chars_per_line,
+        line_length_gap=line_length_gap,
+        max_lines=max_lines,
+        max_cps=max_cps,
+    )
+
+
+def _normalized_subtitle_text(content: str, label: str) -> str:
+    if content.startswith("\ufeff"):
+        raise ValidationError(f"{label} не должен содержать UTF-8 BOM")
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not normalized.strip():
+        raise ValidationError(f"{label} пуст")
+    return normalized
+
+
 def _parse_timestamp(value: str) -> float:
     match = _TIMESTAMP_RE.fullmatch(value)
     if match is None:
@@ -253,3 +457,32 @@ def _parse_timestamp(value: str) -> float:
         + int(match.group("milliseconds"))
     )
     return total_milliseconds / 1000
+
+
+def _parse_vtt_timestamp(value: str) -> float:
+    match = _VTT_TIMESTAMP_RE.fullmatch(value)
+    if match is None:
+        raise ValidationError(f"Некорректная временная метка VTT: {value!r}")
+    total_milliseconds = (
+        int(match.group("hours")) * 3_600_000
+        + int(match.group("minutes")) * 60_000
+        + int(match.group("seconds")) * 1000
+        + int(match.group("milliseconds"))
+    )
+    return total_milliseconds / 1000
+
+
+def _parse_ass_timestamp(value: str) -> float:
+    match = _ASS_TIMESTAMP_RE.fullmatch(value)
+    if match is None:
+        raise ValidationError(f"Некорректная временная метка ASS: {value!r}")
+    hours = int(match.group("hours"))
+    if hours > 595:
+        raise ValidationError("Временная метка ASS превышает предел 595 часов")
+    total_centiseconds = (
+        hours * 360_000
+        + int(match.group("minutes")) * 6_000
+        + int(match.group("seconds")) * 100
+        + int(match.group("centiseconds"))
+    )
+    return total_centiseconds / 100

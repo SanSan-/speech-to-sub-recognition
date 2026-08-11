@@ -60,6 +60,7 @@ class ProcessingSettingsPayload(ApiModel):
     allow_cpu_fallback: bool = False
     allow_cloud_processing: bool = Field(default=False, strict=True)
     openai_model: Literal["whisper-1"] = DEFAULT_OPENAI_MODEL
+    output_format: Literal["srt", "ass", "vtt"] = "srt"
     keep_audio: bool = False
     force: bool = Field(default=False, strict=True)
     recursive: bool = False

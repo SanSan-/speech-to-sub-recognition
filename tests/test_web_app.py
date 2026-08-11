@@ -19,6 +19,7 @@ from speech_to_sub.models import AudioStreamInfo, MediaProbe
 from speech_to_sub.web import app as web_app
 from speech_to_sub.web import __main__ as web_main
 from speech_to_sub.web.__main__ import _read_port, _read_reload
+from speech_to_sub.web.job_store import SQLiteJobStore
 from speech_to_sub.web.jobs import JobNotFoundError, JobRegistry
 from speech_to_sub.web.picker import (
     PickSelection,
@@ -73,6 +74,7 @@ class FakeService:
                 "progress": 0,
                 "cached": False,
                 "skipped": False,
+                **self._subtitle_fields(path, settings),
             }
             for path in paths
         ]
@@ -91,6 +93,7 @@ class FakeService:
                 "progress": 0,
                 "cached": False,
                 "skipped": False,
+                **self._subtitle_fields(path, settings),
             }
             for path in paths
         ]
@@ -117,9 +120,9 @@ class FakeService:
         emit_event: Any,
         log: Any,
     ) -> list[dict[str, Any]]:
-        del settings
         results = []
         for path in paths:
+            subtitle_fields = FakeService._subtitle_fields(path, settings)
             log.info("Тестовое распознавание: %s", Path(path).name)
             emit_event(
                 {
@@ -128,7 +131,7 @@ class FakeService:
                     "state": "done",
                     "stage": "Готово",
                     "progress": 100,
-                    "srt_output": str(Path(path).with_suffix(".srt")),
+                    **subtitle_fields,
                 }
             )
             results.append(
@@ -136,10 +139,21 @@ class FakeService:
                     "path": path,
                     "name": Path(path).name,
                     "state": "done",
-                    "srt_output": str(Path(path).with_suffix(".srt")),
+                    **subtitle_fields,
                 }
             )
         return results
+
+    @staticmethod
+    def _subtitle_fields(
+        path: str,
+        settings: dict[str, Any],
+    ) -> dict[str, str]:
+        output_format = str(settings.get("output_format") or "srt")
+        return {
+            "output_format": output_format,
+            "subtitle_output": str(Path(path).with_suffix(f".{output_format}")),
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -205,8 +219,8 @@ def test_static_page_and_config_have_no_secret_fields(
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.5.3"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.5.3"
+    assert health.json()["version"] == "1.6.0"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.6.0"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -244,6 +258,12 @@ def test_static_page_and_config_have_no_secret_fields(
     assert defaults["auto_download_model"] is True
     assert defaults["allow_cloud_processing"] is False
     assert defaults["openai_model"] == "whisper-1"
+    assert defaults["output_format"] == "srt"
+    assert config.json()["output_formats"] == [
+        {"value": "srt", "label": "SRT"},
+        {"value": "ass", "label": "ASS"},
+        {"value": "vtt", "label": "VTT"},
+    ]
     assert isinstance(config.json()["openai_configured"], bool)
     assert defaults["long_form_window_seconds"] == 300
     assert defaults["vad_filter"] is True
@@ -251,6 +271,7 @@ def test_static_page_and_config_have_no_secret_fields(
     assert defaults["line_length_gap"] == 8
     assert defaults["max_cps"] == 17.0
     assert 'id="backend"' in index.text
+    assert 'id="outputFormat"' in index.text
     assert 'id="maxCharsPerLine"' in index.text
     assert 'id="lineLengthGap"' in index.text
     assert 'id="maxCps"' in index.text
@@ -848,6 +869,46 @@ def test_web_settings_forward_subtitle_layout_limits(fake_service: FakeService) 
     assert forwarded["max_cps"] == 16.5
 
 
+@pytest.mark.parametrize("output_format", ("srt", "ass", "vtt"))
+def test_web_settings_forward_selected_output_format(
+    fake_service: FakeService,
+    output_format: str,
+) -> None:
+    client = TestClient(web_app.app)
+
+    response = client.post(
+        "/api/refresh",
+        json={
+            "paths": [r"D:\Media\lesson.mp4"],
+            "settings": {"output_format": output_format},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = fake_service.build_calls[0][1]
+    assert forwarded["output_format"] == output_format
+    item = response.json()["items"][0]
+    assert item["output_format"] == output_format
+    assert item["subtitle_output"].endswith(f".{output_format}")
+
+
+@pytest.mark.parametrize("output_format", ("ssa", "SRT", "", 1, True))
+def test_web_settings_reject_unknown_output_format(
+    fake_service: FakeService,
+    output_format: object,
+) -> None:
+    response = TestClient(web_app.app).post(
+        "/api/refresh",
+        json={
+            "paths": [r"D:\Media\lesson.mp4"],
+            "settings": {"output_format": output_format},
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.build_calls == []
+
+
 @pytest.mark.parametrize(
     "settings",
     (
@@ -1236,6 +1297,67 @@ def test_partial_job_stream_and_terminal_snapshot(
     assert [event["payload"]["type"] for event in cursor_events] == ["done"]
 
 
+def test_legacy_sqlite_snapshot_is_normalized_by_restart_and_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "legacy-api.sqlite3"
+    job_id = "legacy-srt-job"
+    source_path = r"D:\Видео\Старая лекция.mp4"
+    srt_output = r"D:\Видео\Старая лекция.ru.srt"
+    store = SQLiteJobStore(database)
+    store.save(
+        {
+            "job_id": job_id,
+            "status": "ok",
+            "active": False,
+            "terminal": True,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "completed_at": time.time(),
+            "source_paths": [source_path],
+            "settings": {"language": "ru"},
+            "items": [
+                {
+                    "path": source_path,
+                    "name": "Старая лекция.mp4",
+                    "state": "done",
+                    "progress": 100,
+                    "srt_output": srt_output,
+                }
+            ],
+        },
+        [(1, {"type": "done", "status": "ok"})],
+    )
+    store.close()
+
+    restarted = JobRegistry(store=SQLiteJobStore(database))
+    monkeypatch.setattr(web_app, "job_registry", restarted)
+    client = TestClient(web_app.app)
+
+    def assert_normalized(payload: dict[str, Any]) -> None:
+        assert payload["settings"]["output_format"] == "srt"
+        assert payload["items"][0]["output_format"] == "srt"
+        assert payload["items"][0]["subtitle_output"] == srt_output
+        assert payload["items"][0]["srt_output"] == srt_output
+
+    try:
+        assert_normalized(client.get("/api/active-job").json())
+        assert_normalized(client.get(f"/api/jobs/{job_id}").json())
+
+        restarted._jobs.pop(job_id)
+        assert_normalized(client.get("/api/active-job").json())
+        assert_normalized(client.get(f"/api/jobs/{job_id}").json())
+
+        raw_snapshot = restarted._store.load(job_id)
+        assert raw_snapshot is not None
+        assert "output_format" not in raw_snapshot["settings"]
+        assert "output_format" not in raw_snapshot["items"][0]
+        assert "subtitle_output" not in raw_snapshot["items"][0]
+    finally:
+        restarted.close()
+
+
 def test_second_job_and_unload_are_blocked_while_worker_is_active(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1521,7 +1643,11 @@ def test_jobs_api_cancel_and_retry_only_unsuccessful_items(
         "/api/transcribe",
         json={
             "paths": paths,
-            "settings": {"language": "ru", "device": "cpu"},
+            "settings": {
+                "language": "ru",
+                "device": "cpu",
+                "output_format": "ass",
+            },
         },
     )
     assert started.status_code == 200
@@ -1562,6 +1688,7 @@ def test_jobs_api_cancel_and_retry_only_unsuccessful_items(
     retried_response = client.post(f"/api/jobs/{job_id}/retry")
     assert retried_response.status_code == 200
     assert retried_response.json()["retry_of"] == job_id
+    assert retried_response.json()["settings"]["output_format"] == "ass"
     retried_id = retried_response.json()["job_id"]
     retried = web_app.job_registry.get(retried_id)
     assert retried.finished.wait(timeout=3)
@@ -1570,6 +1697,7 @@ def test_jobs_api_cancel_and_retry_only_unsuccessful_items(
     assert paths[0] not in retried_paths
     assert retried_detail["status"] == "ok"
     assert retried_detail["retry_of"] == job_id
+    assert retried_detail["settings"]["output_format"] == "ass"
     assert len(service.pending_calls) == 1
     assert len(service.build_calls) == 1
     assert client.get("/api/jobs/missing-job").status_code == 404

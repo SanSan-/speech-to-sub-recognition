@@ -11,6 +11,7 @@ import pytest
 from filelock import FileLock
 
 from speech_to_sub import service
+from speech_to_sub.constants import SubtitleFormat
 from speech_to_sub.exceptions import MediaError, ValidationError
 from speech_to_sub.models import (
     AudioStreamInfo,
@@ -21,7 +22,7 @@ from speech_to_sub.models import (
     TranscriptSegment,
     TranscriptWord,
 )
-from speech_to_sub.subtitles.validator import parse_srt
+from speech_to_sub.subtitles.validator import parse_ass, parse_srt, parse_vtt
 from speech_to_sub.utils import io_utils
 
 
@@ -400,6 +401,8 @@ def test_build_pending_items_does_not_probe_or_hash(
             "state": "queued",
             "stage": "Ожидание",
             "progress": 0,
+            "output_format": "srt",
+            "subtitle_output": str(tmp_path / "очередь.ru.srt"),
             "srt_output": str(tmp_path / "очередь.ru.srt"),
             "sidecar_output": str(tmp_path / "очередь.ru.asr.json"),
             "audio_output": None,
@@ -609,6 +612,9 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     assert sidecar["started_at"] <= sidecar["finished_at"]
     assert sidecar["created_at"] == sidecar["finished_at"]
     assert sidecar["sidecar_schema_version"] == 2
+    assert sidecar["output_format"] == "srt"
+    assert sidecar["subtitle_output"] == str(srt_path)
+    assert sidecar["srt_output"] == str(srt_path)
     assert sidecar["source"]["sha256"]
     assert "settings" not in sidecar
     assert sidecar["recognition_settings"]["language"] == "ru"
@@ -621,6 +627,8 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     }
     assert sidecar["layout_settings"] == {
         "srt_builder_version": "4",
+        "subtitle_renderer_version": "4",
+        "output_format": "srt",
         "max_chars_per_line": 42,
         "line_length_gap": 8,
         "max_cps": 17.0,
@@ -760,7 +768,7 @@ def test_service_uses_transcript_text_when_backend_returns_no_segments() -> None
         quantized=False,
     )
 
-    srt_text, diagnostics = service._build_srt_artifacts(
+    srt_text, diagnostics = service._build_subtitle_artifacts(
         transcript,
         ProcessingSettings(language="ru"),
         1.0,
@@ -784,7 +792,7 @@ def test_service_uses_transcript_text_when_segments_have_no_content() -> None:
         quantized=False,
     )
 
-    srt_text, diagnostics = service._build_srt_artifacts(
+    srt_text, diagnostics = service._build_subtitle_artifacts(
         transcript,
         ProcessingSettings(language="ru"),
         1.0,
@@ -1318,7 +1326,7 @@ def test_layout_diagnostics_log_contains_only_nonzero_events() -> None:
     )
 
     assert messages == [
-        "лекция.mp4: разметка SRT — восстановлены текст и пунктуация сегментов: 2; "
+        "лекция.mp4: разметка субтитров — восстановлены текст и пунктуация сегментов: 2; "
         "перенесены фрагменты с аномальными начальными метками: 1; "
         "скорректированы временные границы реплик: 3; максимальный сдвиг границы, мс: 120."
     ]
@@ -2061,3 +2069,276 @@ def test_artifact_commit_restores_previous_files_on_partial_failure(
 
     assert srt.read_text(encoding="utf-8") == "old srt"
     assert sidecar.read_text(encoding="utf-8") == "old sidecar"
+
+
+def test_artifact_commit_keeps_unrestored_backup_after_double_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    srt = tmp_path / "sample.en.srt"
+    sidecar = tmp_path / "sample.en.asr.json"
+    staged_srt = tmp_path / ".sample.srt.stage"
+    staged_sidecar = tmp_path / ".sample.json.stage"
+    token = "transaction"
+    srt_backup = service._backup_path(srt, token)
+    sidecar_backup = service._backup_path(sidecar, token)
+    srt.write_text("old srt", encoding="utf-8", newline="")
+    sidecar.write_text("old sidecar", encoding="utf-8", newline="")
+    staged_srt.write_text("new srt", encoding="utf-8", newline="")
+    staged_sidecar.write_text("new sidecar", encoding="utf-8", newline="")
+    real_replace = service.os.replace
+
+    def fail_publish_and_restore(source: Path, destination: Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path == staged_sidecar and destination_path == sidecar:
+            raise OSError("тестовый сбой публикации")
+        if source_path == sidecar_backup and destination_path == sidecar:
+            raise OSError("тестовый сбой восстановления")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(service.os, "replace", fail_publish_and_restore)
+
+    with pytest.raises(OSError, match="тестовый сбой восстановления"):
+        service._commit_staged_artifacts(
+            {srt: staged_srt, sidecar: staged_sidecar},
+            token,
+        )
+
+    assert srt.read_text(encoding="utf-8") == "old srt"
+    assert not srt_backup.exists()
+    assert not sidecar.exists()
+    assert sidecar_backup.read_text(encoding="utf-8") == "old sidecar"
+
+
+@pytest.mark.parametrize(
+    "output_format, subtitle_name, sidecar_name, audio_name",
+    (
+        (
+            SubtitleFormat.SRT,
+            "sample.ru.srt",
+            "sample.ru.asr.json",
+            "sample.ru.asr.flac",
+        ),
+        (
+            SubtitleFormat.ASS,
+            "sample.ru.ass",
+            "sample.ru.ass.asr.json",
+            "sample.ru.ass.asr.flac",
+        ),
+        (
+            SubtitleFormat.VTT,
+            "sample.ru.vtt",
+            "sample.ru.vtt.asr.json",
+            "sample.ru.vtt.asr.flac",
+        ),
+    ),
+)
+def test_build_output_paths_isolates_format_specific_artifacts(
+    tmp_path: Path,
+    output_format: SubtitleFormat,
+    subtitle_name: str,
+    sidecar_name: str,
+    audio_name: str,
+) -> None:
+    outputs = service.build_output_paths(
+        tmp_path / "sample.mp4",
+        ProcessingSettings(language="ru", output_format=output_format),
+    )
+
+    assert outputs.subtitle_path == tmp_path / subtitle_name
+    assert outputs.sidecar_path == tmp_path / sidecar_name
+    assert outputs.normalized_audio_path == tmp_path / audio_name
+    assert outputs.srt_path == (
+        outputs.subtitle_path if output_format is SubtitleFormat.SRT else None
+    )
+
+
+def test_format_switch_reuses_recognition_and_keeps_artifacts_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "лекция.mp4"
+    media.write_bytes(b"source")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    results: dict[SubtitleFormat, dict[str, Any]] = {}
+
+    for output_format in SubtitleFormat:
+        [result] = service.process_paths(
+            [media],
+            {
+                "language": "ru",
+                "output_format": output_format.value,
+                "keep_audio": True,
+            },
+            lambda _event: None,
+            lambda _message: None,
+            backend=backend,
+        )
+        results[output_format] = result
+
+    assert len(backend.calls) == 1
+    assert results[SubtitleFormat.SRT]["srt_output"] == str(
+        tmp_path / "лекция.ru.srt"
+    )
+    for output_format in (SubtitleFormat.ASS, SubtitleFormat.VTT):
+        assert results[output_format]["srt_output"] is None
+        assert results[output_format]["output_format"] == output_format.value
+        assert Path(results[output_format]["subtitle_output"]).is_file()
+    assert (tmp_path / "лекция.ru.asr.flac").is_file()
+    assert (tmp_path / "лекция.ru.ass.asr.flac").is_file()
+    assert (tmp_path / "лекция.ru.vtt.asr.flac").is_file()
+    assert parse_ass((tmp_path / "лекция.ru.ass").read_text(encoding="utf-8"))
+    assert parse_vtt((tmp_path / "лекция.ru.vtt").read_text(encoding="utf-8"))
+
+    srt_bytes = (tmp_path / "лекция.ru.srt").read_bytes()
+    (tmp_path / "лекция.ru.vtt").unlink()
+    [rebuilt] = service.process_paths(
+        [media],
+        {"language": "ru", "output_format": "vtt", "keep_audio": True},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    assert rebuilt["state"] == "done"
+    assert len(backend.calls) == 1
+
+    [forced] = service.process_paths(
+        [media],
+        {"language": "ru", "output_format": "ass", "force": True},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    assert forced["state"] == "done"
+    assert len(backend.calls) == 2
+    assert (tmp_path / "лекция.ru.srt").read_bytes() == srt_bytes
+
+    ass_sidecar = json.loads(
+        (tmp_path / "лекция.ru.ass.asr.json").read_text(encoding="utf-8")
+    )
+    assert ass_sidecar["output_format"] == "ass"
+    assert ass_sidecar["subtitle_output"] == str(tmp_path / "лекция.ru.ass")
+    assert ass_sidecar["srt_output"] is None
+    assert ass_sidecar["outputs"]["srt"] is None
+
+
+def test_existing_ass_without_sidecar_is_skipped_without_asr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "sample.mp4"
+    media.write_bytes(b"source")
+    existing = tmp_path / "sample.ru.ass"
+    existing.write_text("не перезаписывать", encoding="utf-8", newline="")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+
+    [result] = service.process_paths(
+        [media],
+        {"language": "ru", "output_format": "ass"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "skipped"
+    assert result["subtitle_output"] == str(existing)
+    assert result["srt_output"] is None
+    assert existing.read_text(encoding="utf-8") == "не перезаписывать"
+    assert backend.calls == []
+
+
+def test_ass_collision_paths_remain_format_qualified(tmp_path: Path) -> None:
+    paths = [tmp_path / "sample.mp4", tmp_path / "sample.wav"]
+    settings = ProcessingSettings(
+        language="ru",
+        output_format=SubtitleFormat.ASS,
+        output_dir=tmp_path / "outputs",
+    )
+
+    output_map = service._build_output_map(paths, settings, tmp_path)
+
+    assert {outputs.subtitle_path.name for outputs in output_map.values()} == {
+        "sample.mp4.ru.ass",
+        "sample.wav.ru.ass",
+    }
+    assert all(
+        outputs.sidecar_path.name.endswith(".ass.asr.json")
+        for outputs in output_map.values()
+    )
+
+
+def test_ass_sidecar_diagnostics_use_rendered_centisecond_intervals() -> None:
+    transcript = Transcript(
+        text="Короткий текст.",
+        language="ru",
+        duration=1.234,
+        segments=(TranscriptSegment(0.0, 1.234, "Короткий текст."),),
+        model="test",
+        device="cpu",
+        quantized=False,
+    )
+
+    subtitle_text, diagnostics = service._build_subtitle_artifacts(
+        transcript,
+        ProcessingSettings(language="ru", output_format=SubtitleFormat.ASS),
+        1.234,
+        path=Path("sample.mp4"),
+        log=lambda _message: None,
+    )
+    [cue] = parse_ass(subtitle_text)
+
+    assert diagnostics["max_actual_duration_ms"] == round(
+        (cue.end - cue.start) * 1000
+    )
+    assert diagnostics["max_actual_cps"] == round(
+        len("Короткий текст.") / (cue.end - cue.start),
+        6,
+    )
+
+
+def test_direct_settings_object_rejects_unknown_output_format() -> None:
+    settings = ProcessingSettings(output_format="txt")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="Формат субтитров"):
+        service._validate_settings(settings)
+
+
+def test_old_v2_srt_layout_without_format_remains_full_cache_hit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "legacy-v2.mp4"
+    media.write_bytes(b"source")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+
+    service.process_paths(
+        [media],
+        {"language": "ru"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    sidecar_path = tmp_path / "legacy-v2.ru.asr.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["layout_settings"].pop("output_format")
+    sidecar["layout_settings"].pop("subtitle_renderer_version")
+    sidecar_path.write_text(
+        json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="",
+    )
+
+    [cached] = service.process_paths(
+        [media],
+        {"language": "ru"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert cached["state"] == "cached"
+    assert len(backend.calls) == 1

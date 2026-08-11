@@ -14,7 +14,7 @@
         <div class="brand-mark" aria-hidden="true">ASR</div>
         <div>
           <h1 class="brand-title">Speech to Sub</h1>
-          <p id="brandSubtitle" class="brand-sub">Локальное пакетное распознавание речи в SRT</p>
+          <p id="brandSubtitle" class="brand-sub">Локальное пакетное распознавание речи в субтитры</p>
         </div>
       </div>
 
@@ -71,7 +71,7 @@
             <div class="settings-section-heading">
               <div>
                 <h3 id="primarySettingsTitle" class="settings-section-title">Основные настройки</h3>
-                <p class="settings-section-hint">Движок, модель, язык и аудиодорожка.</p>
+                <p class="settings-section-hint">Движок, модель, язык, формат субтитров и аудиодорожка.</p>
               </div>
             </div>
             <div class="settings-section-body">
@@ -85,6 +85,17 @@
                   <option value="openai-api">OpenAI API / whisper-1</option>
                 </select>
                 <span class="field-hint">Локальные движки работают на компьютере; облачный режим передаёт аудио в OpenAI.</span>
+              </div>
+
+              <div class="field">
+                <label for="outputFormat">Формат субтитров</label>
+                <select id="outputFormat" data-setting="output_format"
+                        aria-describedby="outputFormatHint">
+                  <option value="srt">SRT</option>
+                  <option value="ass">ASS</option>
+                  <option value="vtt">VTT</option>
+                </select>
+                <span id="outputFormatHint" class="field-hint">Определяет структуру и расширение результата; по умолчанию используется SRT.</span>
               </div>
 
               <div id="cloudSettings" class="settings-group" hidden>
@@ -178,20 +189,20 @@
           <details id="srtSettings" class="settings-section settings-collapsible" open>
             <summary>
               <span>
-                <span class="settings-section-title">Разметка SRT</span>
+                <span class="settings-section-title">Разметка субтитров</span>
                 <span class="settings-section-hint">Длина строк и скорость чтения.</span>
               </span>
             </summary>
             <div class="settings-section-body">
               <div class="grid-3">
                 <div class="field">
-                  <label for="maxCharsPerLine">Базовая длина строки SRT</label>
+                  <label for="maxCharsPerLine">Базовая длина строки субтитров</label>
                   <input id="maxCharsPerLine" data-setting="max_chars_per_line"
                          type="number" min="20" max="80" step="1" inputmode="numeric">
                   <span class="field-hint">Предпочтительно не более 42 символов.</span>
                 </div>
                 <div class="field">
-                  <label for="lineLengthGap">Допуск длины строки SRT</label>
+                  <label for="lineLengthGap">Допуск длины строки субтитров</label>
                   <input id="lineLengthGap" data-setting="line_length_gap"
                          type="number" min="0" max="20" step="1" inputmode="numeric">
                   <span class="field-hint">По умолчанию 8 дополнительных символов.</span>
@@ -328,7 +339,7 @@
                 <label class="field toggle danger-toggle" for="force">
                   <span>
                     <span class="toggle-title">Перезаписать целевые результаты</span>
-                    <span class="field-hint">Обойти кеш готового SRT и распознавания, заново выполнить распознавание и выбранное выравнивание, затем атомарно заменить целевые SRT/JSON/FLAC.</span>
+                    <span class="field-hint">Обойти кеш готовых субтитров и распознавания, заново выполнить распознавание и выбранное выравнивание, затем атомарно заменить целевые субтитры, JSON и FLAC.</span>
                   </span>
                   <input id="force" data-setting="force" type="checkbox">
                 </label>
