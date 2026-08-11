@@ -32,6 +32,11 @@ const localAsrControls = Array.from(document.querySelectorAll("[data-local-asr-o
 
 const SETTINGS_STORAGE_KEY = "speechToSubSettingsV1";
 const BROWSER_LOG_LIMIT = 500;
+const PREPARATION_STATUS_PATH = "/api/preparation-status";
+const PREPARATION_POLL_INTERVAL_MS = 400;
+const PREPARATION_STATUS_TIMEOUT_MS = 4000;
+const PREPARATION_STALE_WARNING_MS = 12000;
+const CARD_PAGE_SIZE = 200;
 const ACTIVE_STATES = new Set([
   "queued",
   "probing",
@@ -75,7 +80,7 @@ const BUILTIN_DEFAULTS = {
   condition_on_previous_text: true,
   keep_audio: false,
   force: false,
-  recursive: false,
+  recursive: true,
 };
 
 const statusLabels = {
@@ -123,6 +128,7 @@ const terminalLabels = {
 const state = {
   items: [],
   itemMap: new Map(),
+  itemDataMap: new Map(),
   mode: /** @type {string | null} */ (null),
   sourcePaths: [],
   selectionLabel: "Ничего не выбрано",
@@ -133,6 +139,7 @@ const state = {
   jobDone: 0,
   completed: new Set(),
   isBusy: false,
+  isPreparing: false,
   eventSource: /** @type {EventSource | null} */ (null),
   uiConfig: null,
   itemRequestGeneration: 0,
@@ -140,6 +147,12 @@ const state = {
   canRetry: false,
   cancelRequested: false,
   logLines: [],
+  preparationGeneration: 0,
+  preparationOperationId: null,
+  preparationLogKeys: new Set(),
+  summaryCounts: Object.create(null),
+  summaryFrame: null,
+  itemPage: 0,
 };
 
 function isCloudBackend() {
@@ -166,19 +179,20 @@ function updatePickerHint() {
 
 function updateBackendMode(options = {}) {
   const cloud = isCloudBackend();
+  const locked = state.isBusy || state.isPreparing;
   if (options.resetConsent && allowCloudProcessingInput) {
     allowCloudProcessingInput.checked = false;
   }
   if (cloudSettings) {
     cloudSettings.hidden = !cloud;
     cloudSettings.querySelectorAll("[data-setting]").forEach((input) => {
-      input.disabled = state.isBusy || !cloud;
+      input.disabled = locked || !cloud;
     });
   }
   localAsrControls.forEach((control) => {
     control.hidden = cloud;
     control.querySelectorAll("[data-setting]").forEach((input) => {
-      input.disabled = state.isBusy || cloud;
+      input.disabled = locked || cloud;
     });
   });
   brandSubtitle.textContent = cloud
@@ -199,8 +213,8 @@ function updateBackendMode(options = {}) {
   updatePickerHint();
   const hasSelection = state.items.length > 0 || state.sourcePaths.length > 0;
   const cloudAllowed = !cloud || Boolean(allowCloudProcessingInput?.checked);
-  transcribeBtn.disabled = state.isBusy || !hasSelection || !cloudAllowed;
-  retryBtn.disabled = state.isBusy || !state.canRetry || !state.displayedJobId || !cloudAllowed;
+  transcribeBtn.disabled = locked || !hasSelection || !cloudAllowed;
+  retryBtn.disabled = locked || !state.canRetry || !state.displayedJobId || !cloudAllowed;
 }
 
 function appendLog(message) {
@@ -225,29 +239,41 @@ function setTerminalState(status) {
   terminalStatus.textContent = terminalLabels[normalized];
 }
 
+function updateInteractionState() {
+  const locked = state.isBusy || state.isPreparing;
+  const hasItems = state.items.length > 0;
+  const hasSelection = hasItems || state.sourcePaths.length > 0;
+  transcribeBtn.disabled = locked || !hasSelection;
+  refreshBtn.disabled = locked || !hasSelection;
+  unloadBtn.disabled = locked;
+  cancelBtn.disabled = !state.isBusy || !state.jobId || state.cancelRequested;
+  retryBtn.disabled = locked || !state.canRetry || !state.displayedJobId;
+  picker.classList.toggle("disabled", locked);
+  picker.setAttribute("aria-disabled", String(locked));
+  pickerFileBtn.disabled = locked;
+  pickerFolderBtn.disabled = locked;
+  settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
+    input.disabled = locked || input.dataset.setting === "recursive";
+  });
+  updateBackendMode();
+  if (state.isPreparing) {
+    transcribeBtn.textContent = "Подготовка списка…";
+  } else if (!state.isBusy) {
+    transcribeBtn.textContent = "Запустить";
+  }
+}
+
 function setBusy(isBusy) {
   state.isBusy = isBusy;
   if (isBusy) {
     abortItemRequest();
   }
-  const hasItems = state.items.length > 0;
-  const hasSelection = hasItems || state.sourcePaths.length > 0;
-  transcribeBtn.disabled = isBusy || !hasSelection;
-  refreshBtn.disabled = isBusy || !hasSelection;
-  unloadBtn.disabled = isBusy;
-  cancelBtn.disabled = !isBusy || !state.jobId || state.cancelRequested;
-  retryBtn.disabled = isBusy || !state.canRetry || !state.displayedJobId;
-  picker.classList.toggle("disabled", isBusy);
-  picker.setAttribute("aria-disabled", String(isBusy));
-  pickerFileBtn.disabled = isBusy;
-  pickerFolderBtn.disabled = isBusy;
-  settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
-    input.disabled = isBusy;
-  });
-  updateBackendMode();
-  if (!isBusy) {
-    transcribeBtn.textContent = "Запустить";
-  }
+  updateInteractionState();
+}
+
+function setPreparing(isPreparing) {
+  state.isPreparing = isPreparing;
+  updateInteractionState();
 }
 
 function abortItemRequest() {
@@ -285,16 +311,6 @@ function updateJobProgress() {
     return;
   }
   transcribeBtn.textContent = "Запуск…";
-}
-
-function debounce(callback, delay) {
-  let timer = null;
-  return (...args) => {
-    if (timer !== null) {
-      clearTimeout(timer);
-    }
-    timer = setTimeout(() => callback(...args), delay);
-  };
 }
 
 function clampProgress(value) {
@@ -370,7 +386,7 @@ function applySettingValues(values) {
   }
   settingsForm.querySelectorAll("[data-setting]").forEach((input) => {
     const key = input.dataset.setting;
-    if (!["allow_cloud_processing", "force"].includes(key) && Object.hasOwn(values, key)) {
+    if (!["allow_cloud_processing", "force", "recursive"].includes(key) && Object.hasOwn(values, key)) {
       setInputValue(input, values[key]);
     }
   });
@@ -394,6 +410,7 @@ function loadStoredSettings() {
     }
     delete parsed.allow_cloud_processing;
     delete parsed.force;
+    delete parsed.recursive;
     return parsed;
   } catch {
     appendLog("Не удалось прочитать сохранённые настройки.");
@@ -426,6 +443,7 @@ function persistSettings() {
       const settings = readSettings();
       delete settings.allow_cloud_processing;
       delete settings.force;
+      delete settings.recursive;
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     }
   } catch (error) {
@@ -527,6 +545,7 @@ function formatDetail(detail) {
 async function getJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { Accept: "application/json" },
+    cache: "no-store",
     signal: options.signal,
   });
   if (!response.ok) {
@@ -569,6 +588,263 @@ async function postJson(url, payload, options = {}) {
   return response.json();
 }
 
+function preparationStatusGeneration(status) {
+  const generation = Number(status?.generation);
+  return Number.isSafeInteger(generation) && generation >= 0 ? generation : 0;
+}
+
+async function getPreparationStatus(signal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort();
+  if (signal?.aborted) {
+    controller.abort();
+  } else if (signal) {
+    signal.addEventListener("abort", forwardAbort, { once: true });
+    if (signal.aborted) {
+      controller.abort();
+    }
+  }
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, PREPARATION_STATUS_TIMEOUT_MS);
+  try {
+    return await getJson(PREPARATION_STATUS_PATH, { signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new Error("Локальный сервис не ответил на запрос состояния подготовки.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+function resetPreparationLogCursor(status) {
+  const operationId = status?.operation_id ? String(status.operation_id) : null;
+  if (operationId !== state.preparationOperationId) {
+    state.preparationOperationId = operationId;
+    state.preparationLogKeys = new Set();
+  }
+}
+
+function preparationSummary(status) {
+  const discovered = Math.max(0, Number(status?.discovered) || 0);
+  const processed = Math.max(0, Number(status?.processed) || 0);
+  const totalValue = Number(status?.total);
+  const total = Number.isFinite(totalValue) && totalValue >= 0 ? totalValue : null;
+  if (status?.status === "error") {
+    return "ошибка подготовки";
+  }
+  if (!status?.active && status?.status === "done") {
+    return `${total ?? Math.max(processed, discovered)} файлов · список готов`;
+  }
+  if (status?.phase === "dialog") {
+    return "ожидание выбора";
+  }
+  if (status?.phase === "collecting") {
+    return `найдено: ${discovered}`;
+  }
+  if (status?.phase === "probing") {
+    return total === null ? `проверено: ${processed}` : `проверено: ${processed}/${total}`;
+  }
+  if (status?.phase === "queueing") {
+    return `постановка в очередь: ${discovered}`;
+  }
+  return "подготовка…";
+}
+
+function appendPreparationStatus(status, baselineGeneration, expectedOperation) {
+  const generation = preparationStatusGeneration(status);
+  if (generation <= baselineGeneration || status?.operation !== expectedOperation) {
+    return false;
+  }
+  state.preparationGeneration = Math.max(state.preparationGeneration, generation);
+  resetPreparationLogCursor(status);
+  const entries = Array.isArray(status.logs) ? status.logs : [];
+  entries.forEach((entry) => {
+    const message = String(entry?.message || "").trim();
+    if (!message) {
+      return;
+    }
+    const key = `log:${String(entry?.id ?? message)}`;
+    if (!state.preparationLogKeys.has(key)) {
+      state.preparationLogKeys.add(key);
+      appendLog(message);
+    }
+  });
+  const message = String(status?.message || "").trim();
+  if (message) {
+    statusSummary.textContent = preparationSummary(status);
+    statusSummary.title = message;
+    const key = `message:${message}`;
+    if (entries.length === 0 && !state.preparationLogKeys.has(key)) {
+      state.preparationLogKeys.add(key);
+      appendLog(message);
+    }
+  }
+  const error = String(status?.error || "").trim();
+  const errorKey = `error:${error}`;
+  if (error && !state.preparationLogKeys.has(errorKey)) {
+    state.preparationLogKeys.add(errorKey);
+    appendLog(`Ошибка подготовки: ${error}`);
+  }
+  return true;
+}
+
+function preparationDelay(signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const finish = (continued) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stop);
+      resolve(continued);
+    };
+    const stop = () => finish(false);
+    const timer = setTimeout(() => finish(true), PREPARATION_POLL_INTERVAL_MS);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+
+function createPreparationMonitorState() {
+  return {
+    lastUpdatedAt: null,
+    lastProgressAt: Date.now(),
+    staleWarningShown: false,
+    connectionWarningShown: false,
+  };
+}
+
+function isPreparationRequestActive(request) {
+  return (
+    request.generation === state.itemRequestGeneration
+    && !request.controller.signal.aborted
+  );
+}
+
+function recordPreparationProgress(status, monitor) {
+  const updatedAt = String(status.updated_at || "");
+  if (!updatedAt || updatedAt === monitor.lastUpdatedAt) {
+    return;
+  }
+  monitor.lastUpdatedAt = updatedAt;
+  monitor.lastProgressAt = Date.now();
+  monitor.staleWarningShown = false;
+}
+
+function handleMonitoredPreparationStatus(
+  status,
+  monitor,
+  baselineGeneration,
+  expectedOperation,
+) {
+  monitor.connectionWarningShown = false;
+  if (!appendPreparationStatus(status, baselineGeneration, expectedOperation)) {
+    return true;
+  }
+  recordPreparationProgress(status, monitor);
+  return Boolean(status.active);
+}
+
+function handlePreparationConnectionError(error, request, monitor) {
+  if (request.controller.signal.aborted) {
+    return false;
+  }
+  if (!monitor.connectionWarningShown) {
+    appendLog(`Потеряна связь с локальным сервисом во время подготовки: ${error.message}`);
+    monitor.connectionWarningShown = true;
+  }
+  return true;
+}
+
+function reportStalePreparation(monitor) {
+  if (
+    monitor.staleWarningShown
+    || Date.now() - monitor.lastProgressAt < PREPARATION_STALE_WARNING_MS
+  ) {
+    return;
+  }
+  appendLog("Подготовка не сообщает новый прогресс более 12 секунд; ожидание продолжается.");
+  monitor.staleWarningShown = true;
+}
+
+async function monitorPreparation(request, baselineGeneration, expectedOperation, isComplete) {
+  const monitor = createPreparationMonitorState();
+  while (isPreparationRequestActive(request)) {
+    if (!(await preparationDelay(request.controller.signal))) {
+      return;
+    }
+    try {
+      const status = await getPreparationStatus(request.controller.signal);
+      if (!handleMonitoredPreparationStatus(
+        status,
+        monitor,
+        baselineGeneration,
+        expectedOperation,
+      )) {
+        return;
+      }
+    } catch (error) {
+      if (!handlePreparationConnectionError(error, request, monitor)) {
+        return;
+      }
+    }
+    reportStalePreparation(monitor);
+    if (isComplete()) {
+      return;
+    }
+  }
+}
+
+async function captureFinalPreparationStatus(request, baselineGeneration, expectedOperation) {
+  if (request.controller.signal.aborted) {
+    return;
+  }
+  try {
+    const status = await getPreparationStatus(request.controller.signal);
+    appendPreparationStatus(status, baselineGeneration, expectedOperation);
+  } catch (error) {
+    if (!request.controller.signal.aborted) {
+      appendLog(`Не удалось получить итог подготовки: ${error.message}`);
+    }
+  }
+}
+
+async function postWithPreparationStatus(url, payload, request, expectedOperation) {
+  let baselineGeneration = state.preparationGeneration;
+  try {
+    const baseline = await getPreparationStatus(request.controller.signal);
+    baselineGeneration = Math.max(baselineGeneration, preparationStatusGeneration(baseline));
+    state.preparationGeneration = baselineGeneration;
+  } catch (error) {
+    if (request.controller.signal.aborted) {
+      throw error;
+    }
+    appendLog(`Состояние подготовки пока недоступно: ${error.message}`);
+  }
+
+  let complete = false;
+  const responsePromise = postJson(url, payload, { signal: request.controller.signal });
+  const monitorPromise = monitorPreparation(
+    request,
+    baselineGeneration,
+    expectedOperation,
+    () => complete,
+  );
+  try {
+    return await responsePromise;
+  } finally {
+    complete = true;
+    await monitorPromise;
+    await captureFinalPreparationStatus(request, baselineGeneration, expectedOperation);
+  }
+}
+
 function fileExtension(item) {
   if (item.format) {
     return String(item.format).replace(/^\./, "").toUpperCase();
@@ -600,11 +876,10 @@ function normalizeState(item) {
 }
 
 function formatDuration(seconds) {
-  const value = Number(seconds);
-  if (!Number.isFinite(value) || value < 0) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
     return null;
   }
-  const rounded = Math.round(value);
+  const rounded = Math.round(seconds);
   const hours = Math.floor(rounded / 3600);
   const minutes = Math.floor((rounded % 3600) / 60);
   const rest = rounded % 60;
@@ -633,7 +908,7 @@ function updateMeta(entry, item) {
   const probe = item?.probe && typeof item.probe === "object" ? item.probe : null;
   const duration = probe ? formatDuration(probe.duration) : null;
   if (duration) {
-    appendMeta(entry.metaEl, duration);
+    appendMeta(entry.metaEl, duration, "file-duration");
   }
   if (probe && Array.isArray(probe.streams)) {
     appendMeta(entry.metaEl, `аудиопотоков: ${probe.streams.length}`);
@@ -811,17 +1086,14 @@ function renderEmpty() {
 
 function updateSummary() {
   const total = state.items.length;
+  statusSummary.removeAttribute("title");
   if (total === 0) {
     statusSummary.textContent = "0 файлов";
     return;
   }
-  const counts = state.items.reduce((result, item) => {
-    const itemState = normalizeState(item);
-    result[itemState] = (result[itemState] || 0) + 1;
-    return result;
-  }, {});
+  const counts = state.summaryCounts;
   const ready = (counts.done || 0) + (counts.cached || 0);
-  const active = ["probing", "extracting", "downloading", "transcribing", "writing"]
+  const active = ["probing", "extracting", "downloading", "transcribing", "aligning", "writing"]
     .reduce((sum, key) => sum + (counts[key] || 0), 0);
   const parts = [`${total} файлов`];
   if (counts.queued) {
@@ -846,10 +1118,110 @@ function updateSummary() {
   statusSummary.textContent = parts.join(" · ");
 }
 
-function renderItems(items, label) {
-  state.items = Array.isArray(items) ? items.map((item) => ({ ...item })) : [];
+function cancelSummaryUpdate() {
+  if (state.summaryFrame !== null) {
+    cancelAnimationFrame(state.summaryFrame);
+    state.summaryFrame = null;
+  }
+}
+
+function scheduleSummaryUpdate() {
+  if (state.summaryFrame !== null) {
+    return;
+  }
+  state.summaryFrame = requestAnimationFrame(() => {
+    state.summaryFrame = null;
+    updateSummary();
+  });
+}
+
+function rebuildItemIndexes() {
+  state.itemDataMap = new Map();
+  state.summaryCounts = Object.create(null);
+  state.items.forEach((item) => {
+    const path = String(item.path || "");
+    state.itemDataMap.set(path, item);
+    const status = normalizeState(item);
+    state.summaryCounts[status] = (state.summaryCounts[status] || 0) + 1;
+  });
+}
+
+function updateSummaryCount(previousStatus, nextStatus) {
+  if (previousStatus === nextStatus) {
+    return;
+  }
+  state.summaryCounts[previousStatus] = Math.max(
+    0,
+    (state.summaryCounts[previousStatus] || 0) - 1,
+  );
+  state.summaryCounts[nextStatus] = (state.summaryCounts[nextStatus] || 0) + 1;
+}
+
+function paginationButton(label, title, targetPage, disabled) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn ghost";
+  button.textContent = label;
+  button.setAttribute("aria-label", title);
+  button.title = title;
+  button.disabled = disabled;
+  button.addEventListener("click", () => renderItemPage(targetPage));
+  return button;
+}
+
+function buildPagination(page, pageCount, startIndex, endIndex) {
+  const pagination = document.createElement("nav");
+  pagination.className = "file-pagination";
+  pagination.setAttribute("aria-label", "Страницы списка файлов");
+  pagination.append(
+    paginationButton("«", "Первая страница", 0, page === 0),
+    paginationButton("‹", "Предыдущая страница", page - 1, page === 0),
+  );
+
+  const status = document.createElement("span");
+  status.className = "file-pagination-status";
+  status.textContent = `${page + 1}/${pageCount} · карточки ${startIndex + 1}–${endIndex} из ${state.items.length}`;
+  pagination.append(status);
+  pagination.append(
+    paginationButton("›", "Следующая страница", page + 1, page === pageCount - 1),
+    paginationButton("»", "Последняя страница", pageCount - 1, page === pageCount - 1),
+  );
+  return pagination;
+}
+
+function renderItemPage(requestedPage) {
+  const pageCount = Math.max(1, Math.ceil(state.items.length / CARD_PAGE_SIZE));
+  const page = Math.max(0, Math.min(pageCount - 1, requestedPage));
+  const startIndex = page * CARD_PAGE_SIZE;
+  const endIndex = Math.min(startIndex + CARD_PAGE_SIZE, state.items.length);
+  state.itemPage = page;
   state.itemMap = new Map();
   fileList.innerHTML = "";
+  fileList.classList.remove("empty");
+  const fragment = document.createDocumentFragment();
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const item = state.items[index];
+    const entry = buildFileCard(item, index);
+    state.itemMap.set(String(item.path || ""), entry);
+    fragment.append(entry.card);
+  }
+  fileList.append(fragment);
+  if (pageCount > 1) {
+    fileList.append(buildPagination(page, pageCount, startIndex, endIndex));
+  }
+  fileList.dataset.renderedCount = String(endIndex - startIndex);
+  fileList.dataset.totalCount = String(state.items.length);
+  fileList.scrollTop = 0;
+}
+
+function renderItems(items, label) {
+  cancelSummaryUpdate();
+  state.items = Array.isArray(items) ? items.map((item) => ({ ...item })) : [];
+  state.itemMap = new Map();
+  rebuildItemIndexes();
+  fileList.innerHTML = "";
+  fileList.dataset.renderedCount = "0";
+  fileList.dataset.totalCount = String(state.items.length);
   if (label) {
     state.selectionLabel = String(label);
   }
@@ -863,33 +1235,29 @@ function renderItems(items, label) {
     return;
   }
 
-  fileList.classList.remove("empty");
-  const fragment = document.createDocumentFragment();
-  state.items.forEach((item, index) => {
-    const entry = buildFileCard(item, index);
-    state.itemMap.set(String(item.path || ""), entry);
-    fragment.append(entry.card);
-  });
-  fileList.append(fragment);
   updateSummary();
+  renderItemPage(0);
   setBusy(state.isBusy);
 }
 
 function updateFileState(path, payload) {
   const normalizedPath = String(path || "");
-  const entry = state.itemMap.get(normalizedPath);
-  if (!entry) {
-    return;
-  }
-  const item = state.items.find((candidate) => String(candidate.path || "") === normalizedPath);
+  const item = state.itemDataMap.get(normalizedPath);
   if (!item) {
     return;
   }
+  const previousStatus = normalizeState(item);
   Object.assign(item, payload);
   if (payload.status && !payload.state) {
     item.state = payload.status;
   }
   const status = normalizeState(item);
+  updateSummaryCount(previousStatus, status);
+  scheduleSummaryUpdate();
+  const entry = state.itemMap.get(normalizedPath);
+  if (!entry) {
+    return;
+  }
   const progress = progressFor(item, status);
   entry.card.dataset.status = status;
   entry.statusEl.textContent = ACTIVE_STATES.has(status) && progress > 0
@@ -900,7 +1268,6 @@ function updateFileState(path, payload) {
   updateMeta(entry, item);
   updateOutputs(entry, item);
   updateNotice(entry, item);
-  updateSummary();
 }
 
 function selectionLabel(result, kind) {
@@ -912,25 +1279,44 @@ function selectionLabel(result, kind) {
 }
 
 async function pick(kind) {
-  if (state.isBusy) {
+  if (state.isBusy || state.isPreparing) {
     return;
   }
   const request = beginItemRequest();
+  const settings = readSettings();
+  settings.recursive = kind === "folder";
+  statusSummary.removeAttribute("title");
+  if (kind === "folder") {
+    appendLog("Открываю системный диалог выбора папки; вложенные каталоги будут включены автоматически.");
+    statusSummary.textContent = "Ожидается выбор папки…";
+  } else {
+    appendLog("Открываю системный диалог выбора файлов.");
+    statusSummary.textContent = "Ожидается выбор файлов…";
+  }
+  setTerminalState("running");
+  setPreparing(true);
   let result;
   try {
-    result = await postJson(
+    result = await postWithPreparationStatus(
       "/api/pick",
-      { kind, settings: readSettings() },
-      { signal: request.controller.signal },
+      { kind, settings },
+      request,
+      "pick",
     );
   } finally {
     completeItemRequest(request.controller);
+    if (request.generation === state.itemRequestGeneration) {
+      setPreparing(false);
+    }
   }
   if (request.generation !== state.itemRequestGeneration || state.isBusy) {
     return;
   }
   if (result.cancelled) {
     appendLog("Выбор отменён.");
+    statusSummary.textContent = "выбор отменён";
+    statusSummary.removeAttribute("title");
+    setTerminalState("idle");
     return;
   }
   state.mode = result.mode || kind;
@@ -948,6 +1334,7 @@ async function pick(kind) {
   }
   renderItems(result.items || [], selectionLabel(result, state.mode));
   setTerminalState("idle");
+  appendLog(`Список подготовлен: ${state.items.length} файлов.`);
 }
 
 async function runPick(kind) {
@@ -958,33 +1345,50 @@ async function runPick(kind) {
       return;
     }
     appendLog(`Ошибка выбора: ${error.message}`);
+    setTerminalState("error");
   }
 }
 
 async function refreshItems(options = {}) {
-  if ((state.items.length === 0 && state.sourcePaths.length === 0) || state.isBusy) {
+  if (
+    (state.items.length === 0 && state.sourcePaths.length === 0)
+    || state.isBusy
+    || state.isPreparing
+  ) {
     return;
   }
   const request = beginItemRequest();
   const paths = state.sourcePaths.length > 0
     ? [...state.sourcePaths]
     : state.items.map((item) => item.path);
+  const settings = readSettings();
+  settings.recursive = state.mode === "folder";
+  statusSummary.removeAttribute("title");
+  appendLog("Обновляю список выбранных медиа.");
+  statusSummary.textContent = "Подготавливается обновлённый список…";
+  setTerminalState("running");
+  setPreparing(true);
   let result;
   try {
-    result = await postJson(
+    result = await postWithPreparationStatus(
       "/api/refresh",
-      { paths, settings: readSettings() },
-      { signal: request.controller.signal },
+      { paths, settings },
+      request,
+      "refresh",
     );
   } finally {
     completeItemRequest(request.controller);
+    if (request.generation === state.itemRequestGeneration) {
+      setPreparing(false);
+    }
   }
   if (request.generation !== state.itemRequestGeneration || state.isBusy) {
     return;
   }
   renderItems(result.items || [], result.path || state.selectionLabel);
+  setTerminalState("idle");
   if (!options.silent) {
-    appendLog("Список файлов обновлён.");
+    appendLog(`Список файлов обновлён: ${state.items.length}.`);
   }
 }
 
@@ -1204,6 +1608,7 @@ async function transcribe() {
   }
   const cloud = isCloudBackend();
   const requestSettings = readSettings();
+  requestSettings.recursive = state.mode === "folder";
   consumeOneShotForce();
   if (cloud) {
     allowCloudProcessingInput.checked = false;
@@ -1221,12 +1626,24 @@ async function transcribe() {
   state.items.forEach((item) => {
     updateFileState(item.path, { state: "queued", progress: 0, error: null });
   });
+  appendLog("Подготавливаю выбранные источники и создаю пакетную задачу.");
 
   try {
     const paths = state.sourcePaths.length > 0
       ? [...state.sourcePaths]
       : state.items.map((item) => item.path);
-    const result = await postJson("/api/transcribe", { paths, settings: requestSettings });
+    const request = beginItemRequest();
+    let result;
+    try {
+      result = await postWithPreparationStatus(
+        "/api/transcribe",
+        { paths, settings: requestSettings },
+        request,
+        "transcribe",
+      );
+    } finally {
+      completeItemRequest(request.controller);
+    }
     state.jobId = result.job_id;
     state.displayedJobId = result.job_id;
     setBusy(true);
@@ -1388,6 +1805,7 @@ refreshBtn.addEventListener("click", () => {
   refreshItems().catch((error) => {
     if (!isAbortError(error)) {
       appendLog(`Ошибка обновления: ${error.message}`);
+      setTerminalState("error");
     }
   });
 });
@@ -1423,26 +1841,37 @@ allowCloudProcessingInput.addEventListener("change", () => {
   updateBackendMode();
 });
 
-const refreshDebounced = debounce(() => {
-  refreshItems({ silent: true }).catch((error) => {
-    if (!isAbortError(error)) {
-      appendLog(`Ошибка обновления параметров: ${error.message}`);
-    }
-  });
-}, 600);
-
 settingsForm.addEventListener("input", () => {
   persistSettings();
-  refreshDebounced();
 });
 
 settingsForm.addEventListener("change", () => {
   persistSettings();
-  refreshDebounced();
+});
+
+function clientErrorMessage(value) {
+  if (value instanceof Error && value.message) {
+    return value.message;
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  return "причина не указана";
+}
+
+window.addEventListener("error", (event) => {
+  appendLog(`Необработанная ошибка интерфейса: ${clientErrorMessage(event.error || event.message)}`);
+  setTerminalState("error");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  appendLog(`Необработанная ошибка операции: ${clientErrorMessage(event.reason)}`);
+  setTerminalState("error");
 });
 
 window.addEventListener("beforeunload", () => {
   abortItemRequest();
+  cancelSummaryUpdate();
   if (state.eventSource) {
     state.eventSource.close();
   }

@@ -163,12 +163,12 @@ class BatchJob:
             first_request = not self.cancel_requested.is_set()
             self.cancel_requested.set()
             if first_request:
-                self.emit(
-                    {"type": "job", "status": "cancelling", "total": self.total}
-                )
+                self.emit({"type": "job", "status": "cancelling", "total": self.total})
             return True
 
-    def events_after(self, event_id: int) -> tuple[list[tuple[int, Event]], bool, Event | None]:
+    def events_after(
+        self, event_id: int
+    ) -> tuple[list[tuple[int, Event]], bool, Event | None]:
         """Возвращает события после курсора и terminal snapshot."""
         with self.lock:
             events = [
@@ -181,7 +181,9 @@ class BatchJob:
     def wait_for_events(self, event_id: int, timeout: float) -> bool:
         """Ждёт новое событие либо завершение, не удерживая worker."""
         with self.condition:
-            if self.completed or any(stored_id > event_id for stored_id, _ in self.event_history):
+            if self.completed or any(
+                stored_id > event_id for stored_id, _ in self.event_history
+            ):
                 return True
             self.condition.wait(timeout=timeout)
             return self.completed or any(
@@ -389,7 +391,9 @@ class JobRegistry:
             )
             if limit is not None:
                 jobs = jobs[:limit]
-            return [_job_summary(job.snapshot(active=not job.completed)) for job in jobs]
+            return [
+                _job_summary(job.snapshot(active=not job.completed)) for job in jobs
+            ]
 
     def current_snapshot(self) -> dict[str, Any]:
         """Возвращает активную задачу либо последнюю terminal-задачу."""
@@ -439,7 +443,9 @@ class JobRegistry:
         """Создаёт новую задачу только для неуспешных элементов исходной."""
         snapshot = self.snapshot(job_id, include_events=False)
         if not snapshot.get("terminal"):
-            raise JobStateError("Повторный запуск доступен только для завершённой задачи.")
+            raise JobStateError(
+                "Повторный запуск доступен только для завершённой задачи."
+            )
         failed_items = [
             copy.deepcopy(dict(item))
             for item in snapshot.get("items", [])
@@ -514,10 +520,19 @@ class JobRegistry:
     def _run_job(self, job: BatchJob, processor: ProcessPaths) -> None:
         logger = logging.getLogger(f"speech_to_sub.web.job.{job.job_id}")
         logger.setLevel(logging.DEBUG if job.settings.get("verbose") else logging.INFO)
-        logger.propagate = False
+        # Записи жизненного цикла попадают и в SSE, и в журнал веб-сессии.
+        logger.propagate = True
+        processor_logger = logging.getLogger(f"{logger.name}.processor")
+        processor_logger.setLevel(logger.level)
+        # Сам сервис уже пишет стадии в speech_to_sub.service. Здесь нужен только
+        # второй адресат его callback — поток SSE, без повторной записи в файл.
+        processor_logger.propagate = False
         handler = QueueLogHandler(job.emit)
-        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
         logger.addHandler(handler)
+        processor_logger.addHandler(handler)
         unhandled_error: str | None = None
         terminal_hint: dict[str, Any] = {}
 
@@ -536,7 +551,7 @@ class JobRegistry:
                     list(job.paths),
                     copy.deepcopy(job.settings),
                     emit_from_service,
-                    logger,
+                    processor_logger,
                     cancel_check=job.cancel_requested.is_set,
                 )
             _merge_results(job, results)
@@ -548,7 +563,9 @@ class JobRegistry:
                     stage="Отменено",
                 )
             else:
-                _mark_unresolved_files(job, "Обработка завершилась без итогового состояния.")
+                _mark_unresolved_files(
+                    job, "Обработка завершилась без итогового состояния."
+                )
         except Exception as exc:
             if job.cancel_requested.is_set():
                 logger.info("Пакетная обработка остановлена по запросу пользователя.")
@@ -566,6 +583,7 @@ class JobRegistry:
             terminal = _build_terminal_event(job, unhandled_error, terminal_hint)
             if not job.completed:
                 job.emit(terminal)
+            processor_logger.removeHandler(handler)
             logger.removeHandler(handler)
             handler.close()
             self._complete(job)
@@ -656,7 +674,9 @@ class JobRegistry:
         if self._last_job_id not in self._jobs:
             terminal_jobs = [job for job in self._jobs.values() if job.completed]
             self._last_job_id = (
-                max(terminal_jobs, key=lambda job: job.completed_at or job.created_at).job_id
+                max(
+                    terminal_jobs, key=lambda job: job.completed_at or job.created_at
+                ).job_id
                 if terminal_jobs
                 else None
             )
@@ -868,9 +888,13 @@ def _restore_event_history(job: BatchJob, snapshot: Mapping[str, Any]) -> None:
     """Восстанавливает валидные события и следующий номер из snapshot-а."""
     stored_events = snapshot.get("events", [])
     for entry in stored_events:
-        if not isinstance(entry, Mapping) or not isinstance(entry.get("event"), Mapping):
+        if not isinstance(entry, Mapping) or not isinstance(
+            entry.get("event"), Mapping
+        ):
             continue
-        job.event_history.append((int(entry["id"]), copy.deepcopy(dict(entry["event"]))))
+        job.event_history.append(
+            (int(entry["id"]), copy.deepcopy(dict(entry["event"])))
+        )
     job.next_event_id = max(
         int(snapshot.get("latest_event_id") or 0) + 1,
         max((event_id for event_id, _ in job.event_history), default=0) + 1,
@@ -971,7 +995,9 @@ def _format_sse_batch(
     return frames, last_event_id, False
 
 
-def _terminal_sse_frame(job: BatchJob, terminal: Event | None, cursor: int) -> str | None:
+def _terminal_sse_frame(
+    job: BatchJob, terminal: Event | None, cursor: int
+) -> str | None:
     """Возвращает отсутствующий terminal-кадр для восстановленного SSE-потока."""
     terminal_id = job.terminal_event_id
     if terminal is None or terminal_id is None or terminal_id <= cursor:

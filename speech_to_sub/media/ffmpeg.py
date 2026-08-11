@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import signal
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -19,6 +21,10 @@ LOGGER = logging.getLogger(__name__)
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 WarningCallback = Callable[[str], None]
+DEFAULT_FFPROBE_TIMEOUT_SECONDS = 30.0
+_PROCESS_TREE_KILL_TIMEOUT_SECONDS = 0.75
+_PROCESS_DRAIN_TIMEOUT_SECONDS = 0.5
+_PROCESS_FINAL_WAIT_SECONDS = 0.25
 
 
 class FFprobeTagsPayload(TypedDict, total=False):
@@ -67,7 +73,9 @@ _LANGUAGE_ALIASES: dict[str, frozenset[str]] = {
 }
 
 
-def build_ffprobe_args(path: str | Path, ffprobe_path: str | Path = "ffprobe") -> list[str]:
+def build_ffprobe_args(
+    path: str | Path, ffprobe_path: str | Path = "ffprobe"
+) -> list[str]:
     """Возвращает аргументы ffprobe без shell-интерпретации пути."""
     return [
         str(ffprobe_path),
@@ -86,18 +94,32 @@ def probe_media(
     ffprobe_path: str | Path = "ffprobe",
     *,
     runner: CommandRunner | None = None,
+    timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
 ) -> MediaProbe:
     """Запускает ffprobe и преобразует JSON в типизированные метаданные."""
     media_path = Path(path)
-    process = (runner or subprocess.run)(
-        build_ffprobe_args(media_path, ffprobe_path),
-        shell=False,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise MediaError("Тайм-аут ffprobe должен быть положительным числом секунд")
+    args = build_ffprobe_args(media_path, ffprobe_path)
+    try:
+        process = (
+            runner(
+                args,
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=timeout_seconds,
+            )
+            if runner is not None
+            else _run_ffprobe_process(args, timeout_seconds=timeout_seconds)
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise MediaError(
+            f"ffprobe не завершился за {timeout_seconds:g} с: {media_path}"
+        ) from exc
     if process.returncode != 0:
         detail = (process.stderr or "").strip() or "ffprobe не вернул описание ошибки"
         raise MediaError(f"ffprobe завершился с кодом {process.returncode}: {detail}")
@@ -111,6 +133,96 @@ def probe_media(
     return parse_ffprobe_payload(media_path, cast(Mapping[str, Any], raw_payload))
 
 
+def _run_ffprobe_process(
+    args: list[str],
+    *,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    popen_options: dict[str, Any] = {
+        "shell": False,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "strict",
+    }
+    if os.name == "nt":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(args, **popen_options)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        raise
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        if os.name == "nt":
+            _kill_windows_process_tree(process.pid)
+        else:
+            _kill_posix_process_group(process.pid)
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.communicate(timeout=_PROCESS_DRAIN_TIMEOUT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        _close_process_pipes(process)
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=_PROCESS_FINAL_WAIT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        LOGGER.error("Не удалось подтвердить завершение ffprobe PID=%s.", process.pid)
+
+
+def _kill_windows_process_tree(process_id: int) -> None:
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    taskkill = system_root / "System32" / "taskkill.exe"
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(
+            [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+            shell=False,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+            creationflags=creation_flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning(
+            "Не удалось завершить дерево ffprobe PID=%s: %s", process_id, exc
+        )
+
+
+def _kill_posix_process_group(process_id: int) -> None:
+    try:
+        os.killpg(process_id, signal.SIGKILL)
+    except OSError:
+        return
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            continue
+
+
 def parse_ffprobe_payload(path: str | Path, payload: Mapping[str, Any]) -> MediaProbe:
     """Разбирает проверенную часть JSON ffprobe без неявных преобразований."""
     raw_streams = payload.get("streams", [])
@@ -119,7 +231,10 @@ def parse_ffprobe_payload(path: str | Path, payload: Mapping[str, Any]) -> Media
 
     streams: list[AudioStreamInfo] = []
     for raw_stream in raw_streams:
-        if not isinstance(raw_stream, Mapping) or raw_stream.get("codec_type") != "audio":
+        if (
+            not isinstance(raw_stream, Mapping)
+            or raw_stream.get("codec_type") != "audio"
+        ):
             continue
         stream_index = _optional_int(raw_stream.get("index"))
         if stream_index is None or stream_index < 0:
@@ -146,7 +261,9 @@ def parse_ffprobe_payload(path: str | Path, payload: Mapping[str, Any]) -> Media
     format_payload = format_value if isinstance(format_value, Mapping) else {}
     duration = _parse_duration(format_payload.get("duration"))
     if duration is None:
-        known_durations = [stream.duration for stream in streams if stream.duration is not None]
+        known_durations = [
+            stream.duration for stream in streams if stream.duration is not None
+        ]
         duration = max(known_durations, default=0.0)
     return MediaProbe(
         path=Path(path),
@@ -195,7 +312,9 @@ def _choose_audio_stream(
 
     if requested_ordinal is not None:
         if isinstance(requested_ordinal, bool) or requested_ordinal < 0:
-            raise MediaError("Порядковый номер аудиопотока должен быть целым числом от нуля")
+            raise MediaError(
+                "Порядковый номер аудиопотока должен быть целым числом от нуля"
+            )
         for stream in available:
             if stream.ordinal == requested_ordinal:
                 return stream
@@ -277,7 +396,9 @@ def normalize_audio(
     if source_path.resolve() == destination_path.resolve():
         raise MediaError("Путь нормализованного аудио совпадает с исходным файлом")
     if destination_path.exists() and not overwrite:
-        raise MediaError(f"Файл уже существует, перезапись не разрешена: {destination_path}")
+        raise MediaError(
+            f"Файл уже существует, перезапись не разрешена: {destination_path}"
+        )
     destination_path.parent.mkdir(parents=True, exist_ok=True)
 
     process = (runner or subprocess.run)(
@@ -310,9 +431,15 @@ def get_media_duration(
     runner: CommandRunner | None = None,
 ) -> float:
     """Возвращает положительную длительность из probe или нового запуска ffprobe."""
-    probe = media if isinstance(media, MediaProbe) else probe_media(media, ffprobe_path, runner=runner)
+    probe = (
+        media
+        if isinstance(media, MediaProbe)
+        else probe_media(media, ffprobe_path, runner=runner)
+    )
     if not math.isfinite(probe.duration) or probe.duration <= 0:
-        raise MediaError(f"ffprobe не определил положительную длительность: {probe.path}")
+        raise MediaError(
+            f"ffprobe не определил положительную длительность: {probe.path}"
+        )
     return probe.duration
 
 
@@ -380,7 +507,9 @@ def _matches_preference(
     language = (preferred_language or "").strip().casefold()
     title = (stream.title or "").strip().casefold()
     stream_language = (stream.language or "").strip().casefold()
-    aliases = _LANGUAGE_ALIASES.get(language, frozenset({language}) if language else frozenset())
+    aliases = _LANGUAGE_ALIASES.get(
+        language, frozenset({language}) if language else frozenset()
+    )
     language_match = bool(aliases and stream_language in aliases)
 
     if preferred_title and title:
@@ -420,7 +549,9 @@ def _parse_duration(value: object) -> float | None:
     try:
         if ":" in text:
             hours_text, minutes_text, seconds_text = text.split(":", maxsplit=2)
-            result = int(hours_text) * 3600 + int(minutes_text) * 60 + float(seconds_text)
+            result = (
+                int(hours_text) * 3600 + int(minutes_text) * 60 + float(seconds_text)
+            )
         else:
             result = float(text)
     except (TypeError, ValueError):

@@ -17,8 +17,8 @@ def test_unknown_backend_without_explicit_model_is_domain_error() -> None:
         ProcessingSettings.from_mapping({"backend": "unknown"})
 
 
-def test_package_version_matches_v151_milestone() -> None:
-    assert __version__ == "1.5.2"
+def test_package_version_matches_v153_milestone() -> None:
+    assert __version__ == "1.5.3"
 
 
 def test_processing_settings_round_trip_subtitle_layout_limits() -> None:

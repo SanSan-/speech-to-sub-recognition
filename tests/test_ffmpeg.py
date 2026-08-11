@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from speech_to_sub.exceptions import MediaError
+from speech_to_sub.media import ffmpeg
 from speech_to_sub.media.ffmpeg import (
     build_ffmpeg_normalize_args,
     decode_audio_float32,
@@ -70,6 +73,48 @@ def test_probe_media_uses_argument_list_and_parses_audio_streams() -> None:
     assert args[-1] == "лекция с пробелом.mp4"
     assert kwargs["shell"] is False
     assert kwargs["encoding"] == "utf-8"
+    assert kwargs["timeout"] == 30.0
+
+
+def test_probe_media_timeout_is_a_bounded_russian_domain_error() -> None:
+    def timed_out(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    with pytest.raises(MediaError, match=r"ffprobe не завершился за 0\.25 с"):
+        probe_media("зависший файл.mp4", runner=timed_out, timeout_seconds=0.25)
+
+
+def test_probe_media_real_subprocess_is_terminated_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ffmpeg,
+        "build_ffprobe_args",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(8)']); "
+                "time.sleep(8)"
+            ),
+        ],
+    )
+    started = time.monotonic()
+
+    with pytest.raises(MediaError, match="ffprobe не завершился"):
+        probe_media("зависший файл.mp4", timeout_seconds=0.1)
+
+    assert time.monotonic() - started < 2.0
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])
+def test_probe_media_rejects_invalid_timeout(timeout: float) -> None:
+    with pytest.raises(MediaError, match="Тайм-аут ffprobe"):
+        probe_media("sample.mp4", timeout_seconds=timeout)
 
 
 def test_parse_ffprobe_uses_stream_duration_when_format_duration_is_missing() -> None:
@@ -143,7 +188,9 @@ def test_select_audio_stream_rejects_missing_explicit_ordinal() -> None:
         select_audio_stream(streams, requested_ordinal=7)
 
 
-def test_normalize_audio_builds_safe_command_and_requires_created_file(tmp_path: Path) -> None:
+def test_normalize_audio_builds_safe_command_and_requires_created_file(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "исходник с пробелом.mp4"
     source.write_bytes(b"media")
     destination = tmp_path / "work" / "normalized.flac"
@@ -189,7 +236,9 @@ def test_normalize_audio_does_not_hide_overwrite(tmp_path: Path) -> None:
     with pytest.raises(MediaError, match="перезапись не разрешена"):
         normalize_audio(source, destination, stream)
 
-    args = build_ffmpeg_normalize_args(source, destination, _stream(0, 1), overwrite=True)
+    args = build_ffmpeg_normalize_args(
+        source, destination, _stream(0, 1), overwrite=True
+    )
     assert "-y" in args
     assert "-n" not in args
 

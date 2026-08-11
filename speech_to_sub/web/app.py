@@ -5,6 +5,7 @@ import ipaddress
 import logging
 import os
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Callable, Mapping
 from urllib.parse import urlsplit
@@ -29,8 +30,8 @@ from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils.env_utils import (
     load_environment,
     settings_from_environment,
-    validate_loopback_host,
 )
+from speech_to_sub.utils.logging_utils import WEB_RUNTIME_LOGGING_ENV, setup_web_logging
 from speech_to_sub.web.jobs import (
     JobBusyError,
     JobNotFoundError,
@@ -44,6 +45,7 @@ from speech_to_sub.web.picker import (
     collect_media_paths,
     pick_paths,
 )
+from speech_to_sub.web.preparation import PreparationTracker
 from speech_to_sub.web.schemas import (
     PickRequest,
     ProcessingSettingsPayload,
@@ -90,8 +92,41 @@ class ServiceAdapter:
     def build_items(paths: list[str], settings: dict[str, Any]) -> list[dict[str, Any]]:
         module = importlib.import_module(SERVICE_MODULE)
         result = module.build_items(paths, settings)
-        if not isinstance(result, list) or any(not isinstance(item, Mapping) for item in result):
+        if not isinstance(result, list) or any(
+            not isinstance(item, Mapping) for item in result
+        ):
             raise TypeError("Сервис должен вернуть список карточек файлов.")
+        return [dict(item) for item in result]
+
+    @staticmethod
+    def build_items_with_progress(
+        paths: list[str],
+        settings: dict[str, Any],
+        progress_callback: Callable[[dict[str, Any]], None],
+    ) -> list[dict[str, Any]]:
+        module = importlib.import_module(SERVICE_MODULE)
+        result = module.build_items(
+            paths,
+            settings,
+            progress_callback=progress_callback,
+        )
+        if not isinstance(result, list) or any(
+            not isinstance(item, Mapping) for item in result
+        ):
+            raise TypeError("Сервис должен вернуть список карточек файлов.")
+        return [dict(item) for item in result]
+
+    @staticmethod
+    def build_pending_items(
+        paths: list[str],
+        settings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        module = importlib.import_module(SERVICE_MODULE)
+        result = module.build_pending_items(paths, settings)
+        if not isinstance(result, list) or any(
+            not isinstance(item, Mapping) for item in result
+        ):
+            raise TypeError("Сервис должен вернуть список карточек очереди.")
         return [dict(item) for item in result]
 
     @staticmethod
@@ -111,7 +146,9 @@ class ServiceAdapter:
             log.info,
             cancel_check=cancel_check,
         )
-        if not isinstance(result, list) or any(not isinstance(item, Mapping) for item in result):
+        if not isinstance(result, list) or any(
+            not isinstance(item, Mapping) for item in result
+        ):
             raise TypeError("Сервис должен вернуть список результатов файлов.")
         return [dict(item) for item in result]
 
@@ -135,9 +172,33 @@ try:
 except Exception as exc:
     logger.warning("Не удалось очистить устаревшие рабочие каталоги: %s", exc)
 job_registry = JobRegistry(store=SQLiteJobStore(_job_database_path()))
+preparation_registry = PreparationTracker()
 _picker_refresh_lock = threading.Lock()
 
-app = FastAPI(title="Speech to Sub Recognition", version=__version__)
+
+@asynccontextmanager
+async def _application_lifespan(_application: FastAPI) -> Any:
+    if os.environ.get(WEB_RUNTIME_LOGGING_ENV) == "1":
+        setup_web_logging()
+    process_id = os.getpid()
+    logger.info(
+        "Запущена локальная веб-сессия Speech to Sub версии %s, PID=%s.",
+        __version__,
+        process_id,
+    )
+    try:
+        yield
+    finally:
+        logger.info(
+            "Локальная веб-сессия Speech to Sub остановлена, PID=%s.", process_id
+        )
+
+
+app = FastAPI(
+    title="Speech to Sub Recognition",
+    version=__version__,
+    lifespan=_application_lifespan,
+)
 app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
 
@@ -154,7 +215,9 @@ async def protect_local_http_access(request: Request, call_next: Any) -> Any:
         if not _is_trusted_state_change(request, client_host=client_host):
             return JSONResponse(
                 status_code=403,
-                content={"detail": "Изменение состояния разрешено только локальному origin."},
+                content={
+                    "detail": "Изменение состояния разрешено только локальному origin."
+                },
             )
     return await call_next(request)
 
@@ -234,9 +297,7 @@ def ui_config() -> dict[str, Any]:
                     if name == "qwen3-forced-aligner"
                     else ""
                 ),
-                "compatible_backends": (
-                    list(backend_names())
-                ),
+                "compatible_backends": (list(backend_names())),
             }
             for name in aligner_names()
         ],
@@ -261,6 +322,12 @@ def ui_config() -> dict[str, Any]:
 def active_job() -> dict[str, Any]:
     """Возвращает текущую или последнюю завершённую задачу."""
     return job_registry.current_snapshot()
+
+
+@app.get("/api/preparation-status")
+def preparation_status() -> dict[str, Any]:
+    """Возвращает ход выбора, обхода каталога и проверки аудиопотоков."""
+    return preparation_registry.snapshot()
 
 
 @app.get("/api/jobs")
@@ -349,28 +416,92 @@ def retry_job(job_id: str, payload: RetryRequest | None = None) -> dict[str, Any
 def pick(payload: PickRequest) -> dict[str, Any]:
     """Открывает локальный picker и строит карточки выбранных файлов."""
     with _picker_refresh_lock:
+        recursive = payload.kind == "folder" or payload.settings.recursive
+        operation_id = _begin_preparation(
+            "pick",
+            phase="dialog",
+            message="Начат выбор локальных источников.",
+        )
         try:
-            selection = pick_paths(payload.kind, recursive=payload.settings.recursive)
+            selection = pick_paths(
+                payload.kind,
+                recursive=recursive,
+                progress_callback=lambda event: _update_preparation(
+                    operation_id, event
+                ),
+            )
         except PickerError as exc:
+            _fail_preparation(operation_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            _fail_preparation(operation_id, exc)
+            logger.exception("Необработанная ошибка системного выбора источников.")
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось завершить выбор локальных источников.",
+            ) from exc
+        if selection.folder is None and not selection.paths:
+            _finish_preparation(operation_id, "Выбор источников отменён.")
+            return _selection_payload(selection, [], recursive=recursive)
         settings = payload.settings.model_dump(mode="json")
+        settings["recursive"] = recursive
         paths = [str(path) for path in selection.paths]
-        items = _build_items(paths, settings) if paths else []
-    return _selection_payload(selection, items)
+        try:
+            items = (
+                _build_items(paths, settings, operation_id=operation_id)
+                if paths
+                else []
+            )
+        except HTTPException as exc:
+            _fail_preparation(operation_id, exc.detail)
+            raise
+        _finish_preparation(
+            operation_id,
+            f"Подготовка завершена: файлов — {len(items)}.",
+        )
+    return _selection_payload(selection, items, recursive=recursive)
 
 
-@app.post("/api/refresh", responses={400: _BAD_REQUEST_RESPONSE})
+@app.post(
+    "/api/refresh",
+    responses={400: _BAD_REQUEST_RESPONSE, 500: _INTERNAL_ERROR_RESPONSE},
+)
 def refresh(payload: RefreshRequest) -> dict[str, Any]:
     """Повторно строит карточки без запуска тяжёлого ASR."""
     with _picker_refresh_lock:
-        paths = _normalize_source_paths(payload.paths)
-        settings = payload.settings.model_dump(mode="json")
-        return {"items": _build_items(paths, settings)}
+        operation_id = _begin_preparation(
+            "refresh",
+            phase="collecting",
+            message="Начато обновление выбранных источников.",
+        )
+        try:
+            paths = _normalize_source_paths(payload.paths)
+            settings = payload.settings.model_dump(mode="json")
+            items = _build_items(paths, settings, operation_id=operation_id)
+        except HTTPException as exc:
+            _fail_preparation(operation_id, exc.detail)
+            raise
+        except Exception as exc:
+            _fail_preparation(operation_id, exc)
+            logger.exception("Необработанная ошибка обновления выбранных источников.")
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось обновить выбранные источники.",
+            ) from exc
+        _finish_preparation(
+            operation_id,
+            f"Обновление завершено: файлов — {len(items)}.",
+        )
+        return {"items": items}
 
 
 @app.post(
     "/api/transcribe",
-    responses={400: _BAD_REQUEST_RESPONSE, 409: _JOB_CONFLICT_RESPONSE},
+    responses={
+        400: _BAD_REQUEST_RESPONSE,
+        409: _JOB_CONFLICT_RESPONSE,
+        500: _INTERNAL_ERROR_RESPONSE,
+    },
 )
 def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
     """Запускает единственную фоновую пакетную задачу."""
@@ -384,8 +515,19 @@ def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
         reservation = job_registry.reserve_start()
     except JobBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    operation_id: str | None = None
     try:
-        items = _build_items(source_paths, settings)
+        operation_id = _begin_preparation(
+            "transcribe",
+            phase="queueing",
+            message="Начата постановка выбранных источников в очередь.",
+        )
+        expanded_paths = _expand_media_sources(
+            source_paths,
+            recursive=True,
+            progress_callback=lambda event: _update_preparation(operation_id, event),
+        )
+        items = _build_pending_items(expanded_paths, settings)
         paths = _media_paths_from_items(items)
         job = job_registry.start(
             paths=paths,
@@ -396,9 +538,27 @@ def transcribe(payload: TranscribeRequest) -> dict[str, Any]:
             reservation_token=reservation,
         )
     except JobBusyError as exc:
+        if operation_id:
+            _fail_preparation(operation_id, exc)
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException as exc:
+        if operation_id:
+            _fail_preparation(operation_id, exc.detail)
+        raise
+    except Exception as exc:
+        if operation_id:
+            _fail_preparation(operation_id, exc)
+        logger.exception("Необработанная ошибка постановки источников в очередь.")
+        raise HTTPException(
+            status_code=500,
+            detail="Не удалось поставить выбранные источники в очередь.",
+        ) from exc
     finally:
         job_registry.release_reservation(reservation)
+    _finish_preparation(
+        operation_id,
+        f"Задача создана: файлов в очереди — {len(items)}.",
+    )
     return {"job_id": job.job_id, "items": items}
 
 
@@ -449,30 +609,146 @@ def unload_models() -> dict[str, str]:
     return {"status": "ok", "message": "Ресурсы распознавания освобождены."}
 
 
-def _build_items(paths: list[str], settings: dict[str, Any]) -> list[dict[str, Any]]:
+def _begin_preparation(operation: str, *, phase: str, message: str) -> str:
+    operation_id = preparation_registry.begin(
+        operation,
+        phase=phase,
+        message=message,
+    )
+    logger.info(message)
+    return operation_id
+
+
+def _update_preparation(operation_id: str, event: Mapping[str, Any]) -> None:
+    message_value = event.get("message")
+    message = str(message_value) if message_value else None
+    preparation_registry.update(
+        operation_id,
+        phase=str(event["phase"]) if event.get("phase") else None,
+        discovered=_optional_int(event.get("discovered")),
+        processed=_optional_int(event.get("processed")),
+        total=_optional_int(event.get("total")),
+        message=message,
+    )
+    if message:
+        logger.info(message)
+
+
+def _finish_preparation(operation_id: str, message: str) -> None:
+    preparation_registry.finish(operation_id, message=message)
+    logger.info(message)
+
+
+def _fail_preparation(operation_id: str, error: object) -> None:
+    message = str(error) or error.__class__.__name__
+    preparation_registry.fail(operation_id, message=message)
+    logger.error("Подготовка источников завершилась ошибкой: %s", message)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_items(
+    paths: list[str],
+    settings: dict[str, Any],
+    *,
+    operation_id: str | None = None,
+) -> list[dict[str, Any]]:
     try:
         expanded_paths = _expand_media_sources(
             paths,
-            recursive=bool(settings.get("recursive")),
+            recursive=True,
+            progress_callback=(
+                (lambda event: _update_preparation(operation_id, event))
+                if operation_id
+                else None
+            ),
         )
-        items = service_api.build_items(expanded_paths, settings)
+        progress_builder = getattr(service_api, "build_items_with_progress", None)
+        if operation_id and callable(progress_builder):
+            items = progress_builder(
+                expanded_paths,
+                settings,
+                lambda event: _update_preparation(operation_id, event),
+            )
+        else:
+            items = service_api.build_items(expanded_paths, settings)
         if len(items) > MAX_BATCH_PATHS:
-            raise ValueError(f"За один запуск допускается не более {MAX_BATCH_PATHS} файлов.")
+            raise ValueError(
+                f"За один запуск допускается не более {MAX_BATCH_PATHS} файлов."
+            )
         return items
     except Exception as exc:
-        logger.warning("Не удалось подготовить карточки медиафайлов: %s", exc)
+        logger.exception("Не удалось подготовить карточки медиафайлов: %s", exc)
         raise HTTPException(
             status_code=400,
             detail=f"Не удалось подготовить файлы: {exc}",
         ) from exc
 
 
-def _expand_media_sources(paths: list[str], *, recursive: bool) -> list[str]:
+def _build_pending_items(
+    paths: list[str],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Строит карточки очереди, не повторяя ffprobe и SHA до выдачи job_id."""
+    try:
+        builder = getattr(service_api, "build_pending_items", None)
+        if callable(builder):
+            items = builder(paths, settings)
+        else:
+            items = [
+                {
+                    "path": path,
+                    "name": Path(path).name,
+                    "format": Path(path).suffix.casefold().lstrip("."),
+                    "state": "queued",
+                    "stage": "Ожидание",
+                    "progress": 0,
+                    "cached": False,
+                    "skipped": False,
+                    "error": None,
+                }
+                for path in paths
+            ]
+    except Exception as exc:
+        logger.exception("Не удалось подготовить очередь медиафайлов: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не удалось подготовить очередь: {exc}",
+        ) from exc
+    if len(items) > MAX_BATCH_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"За один запуск допускается не более {MAX_BATCH_PATHS} файлов.",
+        )
+    return items
+
+
+def _expand_media_sources(
+    paths: list[str],
+    *,
+    recursive: bool,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[str]:
     """Раскрывает каталоги с лимитом до запуска пофайлового ffprobe."""
     expanded: dict[str, str] = {}
     for raw_path in paths:
         path = Path(raw_path)
-        candidates = collect_media_paths(path, recursive=recursive) if path.is_dir() else (path,)
+        candidates = (
+            collect_media_paths(
+                path,
+                recursive=recursive,
+                progress_callback=progress_callback,
+            )
+            if path.is_dir()
+            else (path,)
+        )
         for candidate in candidates:
             value = str(candidate)
             expanded.setdefault(value.casefold(), value)
@@ -506,7 +782,10 @@ def _normalize_source_paths(raw_paths: list[str]) -> list[str]:
     seen: set[str] = set()
     for raw_path in raw_paths:
         path = Path(raw_path).expanduser().resolve(strict=False)
-        if not path.is_dir() and path.suffix.casefold() not in SUPPORTED_MEDIA_EXTENSIONS:
+        if (
+            not path.is_dir()
+            and path.suffix.casefold() not in SUPPORTED_MEDIA_EXTENSIONS
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=f"Неподдерживаемый входной путь: {path}",
@@ -522,13 +801,17 @@ def _media_paths_from_items(items: list[dict[str, Any]]) -> list[str]:
     """Извлекает фактические файлы после раскрытия выбранных каталогов."""
     item_paths = [str(item.get("path") or "") for item in items]
     if not item_paths:
-        raise HTTPException(status_code=400, detail="Не найдено поддерживаемых медиафайлов.")
+        raise HTTPException(
+            status_code=400, detail="Не найдено поддерживаемых медиафайлов."
+        )
     return _normalize_media_paths(item_paths)
 
 
 def _selection_payload(
     selection: PickSelection,
     items: list[dict[str, Any]],
+    *,
+    recursive: bool,
 ) -> dict[str, Any]:
     return {
         "mode": selection.mode,
@@ -536,6 +819,7 @@ def _selection_payload(
         "paths": [str(path) for path in selection.paths],
         "items": items,
         "cancelled": selection.folder is None and not selection.paths,
+        "recursive": recursive,
     }
 
 
@@ -584,23 +868,30 @@ def _is_trusted_state_change(request: Request, *, client_host: str) -> bool:
         return False
     origin = request.headers.get("origin")
     if origin is None:
-        return True
+        return allow_testserver
     return _origin_authority(origin, allow_testserver=allow_testserver) == host
 
 
 def _is_trusted_local_request(request: Request, *, client_host: str) -> bool:
     """Разрешает HTTP-доступ только фактическому loopback-клиенту и Host."""
     allow_testserver = client_host.casefold() == "testclient"
-    if not allow_testserver and _loopback_hostname(
-        client_host,
-        allow_testserver=False,
-    ) is None:
+    if (
+        not allow_testserver
+        and _loopback_hostname(
+            client_host,
+            allow_testserver=False,
+        )
+        is None
+    ):
         return False
-    return _local_authority(
-        request.headers.get("host", ""),
-        scheme=request.url.scheme,
-        allow_testserver=allow_testserver,
-    ) is not None
+    return (
+        _local_authority(
+            request.headers.get("host", ""),
+            scheme=request.url.scheme,
+            allow_testserver=allow_testserver,
+        )
+        is not None
+    )
 
 
 def _local_authority(
@@ -677,11 +968,9 @@ def _parse_web_port(value: str | int) -> int:
 
 def main() -> None:
     """Запускает локальный Python entrypoint с проверенным портом."""
-    import uvicorn
+    from speech_to_sub.web.__main__ import main as run_web_service
 
-    host = validate_loopback_host(os.environ.get("WEB_HOST", "127.0.0.1"))
-    port = _parse_web_port(os.environ.get("WEB_PORT", DEFAULT_WEB_PORT))
-    uvicorn.run(app, host=host, port=port)
+    run_web_service()
 
 
 if __name__ == "__main__":

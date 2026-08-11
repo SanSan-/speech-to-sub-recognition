@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,11 @@ from speech_to_sub.constants import (
     SUPPORTED_OPENAI_MODELS,
     WORK_DIR,
 )
-from speech_to_sub.exceptions import ProcessingCancelled, SpeechToSubError, ValidationError
+from speech_to_sub.exceptions import (
+    ProcessingCancelled,
+    SpeechToSubError,
+    ValidationError,
+)
 from speech_to_sub.media.ffmpeg import (
     get_media_duration,
     normalize_audio,
@@ -63,9 +68,10 @@ from speech_to_sub.utils.huggingface import (
     ensure_huggingface_model,
 )
 from speech_to_sub.utils.io_utils import (
+    MediaDiscoveryFailure,
     atomic_copy_file,
     atomic_write_text_utf8,
-    discover_media,
+    discover_media_resilient,
     read_text_utf8,
 )
 
@@ -87,6 +93,11 @@ _LAYOUT_DIAGNOSTIC_LABELS = {
 EventCallback = Callable[[dict[str, Any]], None]
 LogCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
+PreparationCallback = Callable[[dict[str, Any]], None]
+
+MAX_CARD_PROBE_WORKERS = 4
+CARD_PROGRESS_LOG_INTERVAL = 10
+VALIDATION_ERROR_STAGE = "Ошибка проверки"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +124,9 @@ class _CachedRecognition:
     recognition_settings: dict[str, Any]
 
 
-def get_preflight_status(settings_values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def get_preflight_status(
+    settings_values: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Проверяет команды и checkpoint без загрузки весов."""
     settings = ProcessingSettings.from_mapping(settings_values)
     ffmpeg = get_command_path("FFMPEG_PATH", "ffmpeg")
@@ -167,92 +180,286 @@ def get_preflight_status(settings_values: Mapping[str, Any] | None = None) -> di
 def build_items(
     paths: Iterable[str | Path],
     settings_values: Mapping[str, Any] | None = None,
+    *,
+    progress_callback: PreparationCallback | None = None,
 ) -> list[dict[str, Any]]:
-    """Строит карточки web UI без загрузки ASR-модели."""
+    """Строит карточки web UI без загрузки модели и полного SHA-256 источников."""
     settings = ProcessingSettings.from_mapping(settings_values)
     _validate_force_setting(settings)
-    media_paths = discover_media((Path(value) for value in paths), settings.recursive)
-    common_root = _common_input_root(media_paths)
+    media_paths, failures = discover_media_resilient(
+        (Path(value) for value in paths), settings.recursive
+    )
+    all_paths = _ordered_discovery_paths(media_paths, failures)
+    common_root = _common_input_root(all_paths)
     output_map = _build_output_map(media_paths, settings, common_root)
     ffprobe_path = get_command_path("FFPROBE_PATH", "ffprobe")
-    items: list[dict[str, Any]] = []
-    for path in media_paths:
-        outputs = output_map[path]
-        item: dict[str, Any] = {
-            "path": str(path),
-            "name": path.name,
-            "format": path.suffix.casefold().lstrip("."),
-            "state": "idle",
-            "stage": "Ожидание",
-            "progress": 0,
-            "srt_output": str(outputs.srt_path),
-            "sidecar_output": str(outputs.sidecar_path),
-            "audio_output": str(outputs.normalized_audio_path) if settings.keep_audio else None,
-            "cached": False,
-            "skipped": False,
-            "error": None,
-        }
-        try:
-            source = build_source_fingerprint(path)
-            item["source_fingerprint"] = source
-            probe = probe_media(path, ffprobe_path=ffprobe_path)
-            stream, warning = select_audio_stream(
-                probe,
-                requested_ordinal=settings.audio_stream_index,
-                preferred_language=settings.audio_language,
-            )
-            item["probe"] = probe.to_dict()
-            item["selected_stream"] = stream.to_dict()
-            item["warning"] = warning
-            _classify_item_from_outputs(
-                item,
-                outputs=outputs,
-                settings=settings,
-                source=source,
-                stream=stream,
-            )
-        except Exception as exc:
-            item.update(state="error", stage="Ошибка проверки", progress=100, error=str(exc))
-        items.append(item)
+    items = _build_pending_items(media_paths, settings, output_map)
+    items.extend(_build_discovery_error_item(failure) for failure in failures)
+    total = len(items)
+    _report_preparation(
+        progress_callback,
+        phase="probing",
+        discovered=total,
+        processed=0,
+        total=total,
+        message=f"Найдено медиафайлов: {total}. Начата проверка аудиопотоков.",
+    )
+    processed = 0
+    for failure in failures:
+        processed += 1
+        _report_preparation(
+            progress_callback,
+            phase="probing",
+            discovered=total,
+            processed=processed,
+            total=total,
+            message=f"Не удалось подготовить {failure.path.name}: {failure.error}",
+        )
+    if not media_paths:
+        items.sort(key=lambda item: str(item["path"]).casefold())
+        return items
+    _probe_pending_items(
+        media_paths,
+        {str(item["path"]).casefold(): item for item in items},
+        output_map=output_map,
+        settings=settings,
+        ffprobe_path=ffprobe_path,
+        progress_callback=progress_callback,
+        completed_offset=processed,
+        total_items=total,
+    )
+    items.sort(key=lambda item: str(item["path"]).casefold())
     return items
 
 
-def _classify_item_from_outputs(
+def _probe_pending_items(
+    media_paths: list[Path],
+    items_by_path: Mapping[str, dict[str, Any]],
+    *,
+    output_map: Mapping[Path, OutputPaths],
+    settings: ProcessingSettings,
+    ffprobe_path: str,
+    progress_callback: PreparationCallback | None,
+    completed_offset: int = 0,
+    total_items: int | None = None,
+) -> None:
+    total = total_items if total_items is not None else len(media_paths)
+    futures: dict[Future[tuple[MediaProbe, AudioStreamInfo, str | None]], int] = {}
+    workers = min(MAX_CARD_PROBE_WORKERS, total)
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="speech-to-sub-probe",
+    ) as executor:
+        for index, path in enumerate(media_paths):
+            futures[
+                executor.submit(
+                    _probe_card,
+                    path,
+                    ffprobe_path,
+                    settings.audio_stream_index,
+                    settings.audio_language,
+                )
+            ] = index
+        completed = completed_offset
+        for future in as_completed(futures):
+            index = futures[future]
+            path = media_paths[index]
+            message = _apply_probe_result(
+                future,
+                item=items_by_path[str(path).casefold()],
+                path=path,
+                outputs=output_map[path],
+                settings=settings,
+            )
+            completed += 1
+            if message is None and _should_log_card_progress(completed, total):
+                message = f"Проверены аудиопотоки: {completed} из {total}."
+            _report_preparation(
+                progress_callback,
+                phase="probing",
+                discovered=total,
+                processed=completed,
+                total=total,
+                message=message,
+            )
+
+
+def _apply_probe_result(
+    future: Future[tuple[MediaProbe, AudioStreamInfo, str | None]],
+    *,
+    item: dict[str, Any],
+    path: Path,
+    outputs: OutputPaths,
+    settings: ProcessingSettings,
+) -> str | None:
+    try:
+        probe, stream, warning = future.result()
+        item["probe"] = probe.to_dict()
+        item["selected_stream"] = stream.to_dict()
+        item["warning"] = warning
+        _classify_card_without_source_hash(
+            item,
+            outputs=outputs,
+            settings=settings,
+        )
+        return None
+    except Exception as exc:
+        error_text = str(exc) or exc.__class__.__name__
+        item.update(
+            state="error",
+            stage=VALIDATION_ERROR_STAGE,
+            progress=100,
+            error=error_text,
+        )
+        logger.warning("Не удалось проверить аудиопотоки файла %s: %s", path, exc)
+        return f"Ошибка проверки аудиопотоков {path.name}: {error_text}"
+
+
+def _should_log_card_progress(completed: int, total: int) -> bool:
+    return (
+        completed == 1
+        or completed == total
+        or completed % CARD_PROGRESS_LOG_INTERVAL == 0
+    )
+
+
+def build_pending_items(
+    paths: Iterable[str | Path],
+    settings_values: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Строит лёгкие карточки очереди без ffprobe, модели и чтения содержимого медиа."""
+    settings = ProcessingSettings.from_mapping(settings_values)
+    _validate_force_setting(settings)
+    media_paths, failures = discover_media_resilient(
+        (Path(value) for value in paths), settings.recursive
+    )
+    common_root = _common_input_root(_ordered_discovery_paths(media_paths, failures))
+    output_map = _build_output_map(media_paths, settings, common_root)
+    items = _build_pending_items(media_paths, settings, output_map)
+    items.extend(_build_discovery_error_item(failure) for failure in failures)
+    return sorted(items, key=lambda item: str(item["path"]).casefold())
+
+
+def _build_pending_items(
+    media_paths: list[Path],
+    settings: ProcessingSettings,
+    output_map: Mapping[Path, OutputPaths],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for path in media_paths:
+        outputs = output_map[path]
+        items.append(
+            {
+                "path": str(path),
+                "name": path.name,
+                "format": path.suffix.casefold().lstrip("."),
+                "state": "queued",
+                "stage": "Ожидание",
+                "progress": 0,
+                "srt_output": str(outputs.srt_path),
+                "sidecar_output": str(outputs.sidecar_path),
+                "audio_output": str(outputs.normalized_audio_path)
+                if settings.keep_audio
+                else None,
+                "cached": False,
+                "skipped": False,
+                "error": None,
+            }
+        )
+    return items
+
+
+def _build_discovery_error_item(
+    failure: MediaDiscoveryFailure,
+) -> dict[str, Any]:
+    return {
+        "path": str(failure.path),
+        "name": failure.path.name,
+        "format": failure.path.suffix.casefold().lstrip("."),
+        "state": "error",
+        "stage": VALIDATION_ERROR_STAGE,
+        "progress": 100,
+        "srt_output": None,
+        "sidecar_output": None,
+        "audio_output": None,
+        "cached": False,
+        "skipped": False,
+        "error": failure.error,
+    }
+
+
+def _ordered_discovery_paths(
+    media_paths: list[Path],
+    failures: list[MediaDiscoveryFailure],
+) -> list[Path]:
+    return sorted(
+        [*media_paths, *(failure.path for failure in failures)],
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def _probe_card(
+    path: Path,
+    ffprobe_path: str,
+    requested_ordinal: int | None,
+    preferred_language: str | None,
+) -> tuple[MediaProbe, AudioStreamInfo, str | None]:
+    probe = probe_media(path, ffprobe_path=ffprobe_path)
+    stream, warning = select_audio_stream(
+        probe,
+        requested_ordinal=requested_ordinal,
+        preferred_language=preferred_language,
+    )
+    return probe, stream, warning
+
+
+def _classify_card_without_source_hash(
     item: dict[str, Any],
     *,
     outputs: OutputPaths,
     settings: ProcessingSettings,
-    source: dict[str, Any],
-    stream: AudioStreamInfo,
 ) -> None:
-    """Определяет состояние карточки по флагу перезаписи и кешу результатов."""
+    """Показывает безопасный предварительный статус без чтения всего медиафайла."""
+    item["state"] = "idle"
     if settings.force:
         item.update(stage="Полное повторное распознавание")
         return
-    fingerprints = _cache_fingerprints_for_lookup(
-        outputs,
-        settings,
-        stream.ordinal,
-        backend=get_backend(settings.backend),
-    )
-    cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
-    if cache_valid and settings.keep_audio and not _has_saved_audio(outputs):
-        item.update(stage="Требуется сохранить аудио")
-    elif cache_valid:
-        item.update(state="cached", stage="Кеш", progress=100, cached=True)
-    elif outputs.srt_path.exists():
+    if outputs.srt_path.exists() and not outputs.sidecar_path.exists():
         item.update(
             state="skipped",
             stage="Существующий SRT",
             progress=100,
             skipped=True,
         )
-    elif fingerprints and _load_cached_recognition(
-        outputs,
-        source,
-        fingerprints[0],
-    ):
-        item.update(stage="Пересборка SRT из кеша распознавания")
+    elif outputs.sidecar_path.exists():
+        item.update(stage="Проверка кеша при запуске")
+
+
+def _report_preparation(
+    callback: PreparationCallback | None,
+    *,
+    phase: str,
+    discovered: int,
+    processed: int,
+    total: int,
+    message: str | None,
+) -> None:
+    if message and callback is None:
+        logger.info(message)
+    if callback is None:
+        return
+    event: dict[str, Any] = {
+        "phase": phase,
+        "discovered": discovered,
+        "processed": processed,
+        "total": total,
+    }
+    if message:
+        event["message"] = message
+    try:
+        callback(event)
+    except Exception as exc:
+        logger.warning("Не удалось передать ход подготовки карточек: %s", exc)
 
 
 def process_paths(
@@ -267,40 +474,70 @@ def process_paths(
     """Последовательно обрабатывает пачку, продолжая работу после ошибки файла."""
     settings = ProcessingSettings.from_mapping(settings_values)
     _validate_settings(settings)
-    media_paths = discover_media((Path(value) for value in paths), settings.recursive)
-    if not media_paths:
+    media_paths, failures = discover_media_resilient(
+        (Path(value) for value in paths), settings.recursive
+    )
+    ordered_paths = _ordered_discovery_paths(media_paths, failures)
+    if not ordered_paths:
         raise ValidationError("Не найдено поддерживаемых медиафайлов.")
-    common_root = _common_input_root(media_paths)
+    common_root = _common_input_root(ordered_paths)
     output_map = _build_output_map(media_paths, settings, common_root)
     ffmpeg_path = get_command_path("FFMPEG_PATH", "ffmpeg")
     ffprobe_path = get_command_path("FFPROBE_PATH", "ffprobe")
-    if not _command_exists(ffmpeg_path) or not _command_exists(ffprobe_path):
+    if media_paths and (
+        not _command_exists(ffmpeg_path) or not _command_exists(ffprobe_path)
+    ):
         raise ValidationError("FFmpeg и ffprobe должны быть доступны до запуска пачки.")
 
+    emit_event({"type": "job", "total": len(ordered_paths)})
+    if not media_paths:
+        return [
+            _discovery_failure_result(
+                failure,
+                index=index,
+                total=len(ordered_paths),
+                emit_event=emit_event,
+                log=log,
+            ).to_dict()
+            for index, failure in enumerate(failures, start=1)
+        ]
+
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    emit_event({"type": "job", "total": len(media_paths)})
     results: list[FileResult] = []
     active_backend = backend
+    failures_by_path = {str(failure.path).casefold(): failure for failure in failures}
     with tempfile.TemporaryDirectory(prefix="job-", dir=WORK_DIR) as temporary_value:
         temporary_root = Path(temporary_value)
         workspace_lock = FileLock(str(temporary_root / WORKSPACE_LOCK_NAME), timeout=0)
         with workspace_lock:
-            for index, path in enumerate(media_paths, start=1):
+            for index, path in enumerate(ordered_paths, start=1):
                 if _is_cancelled(cancel_check):
                     results.extend(
                         _cancel_remaining(
-                            media_paths[index - 1 :],
+                            ordered_paths[index - 1 :],
                             first_index=index,
-                            total=len(media_paths),
+                            total=len(ordered_paths),
                             emit_event=emit_event,
                             log=log,
                         )
                     )
                     break
+                failure = failures_by_path.get(str(path).casefold())
+                if failure is not None:
+                    results.append(
+                        _discovery_failure_result(
+                            failure,
+                            index=index,
+                            total=len(ordered_paths),
+                            emit_event=emit_event,
+                            log=log,
+                        )
+                    )
+                    continue
                 result, active_backend = _process_one(
                     path,
                     index=index,
-                    total=len(media_paths),
+                    total=len(ordered_paths),
                     settings=settings,
                     outputs=output_map[path],
                     temporary_root=temporary_root,
@@ -418,6 +655,31 @@ def build_output_paths(
     )
 
 
+def _discovery_failure_result(
+    failure: MediaDiscoveryFailure,
+    *,
+    index: int,
+    total: int,
+    emit_event: EventCallback,
+    log: LogCallback,
+) -> FileResult:
+    _emit_file(
+        emit_event,
+        failure.path,
+        index,
+        total,
+        "error",
+        VALIDATION_ERROR_STAGE,
+        100,
+        error=failure.error,
+    )
+    _write_log(
+        log,
+        f"Файл {index}/{total}: {failure.path.name} — ошибка: {failure.error}",
+    )
+    return FileResult(input_path=failure.path, state="error", error=failure.error)
+
+
 def _process_one(
     path: Path,
     *,
@@ -483,11 +745,22 @@ def _process_one_locked(
     cancel_check: CancelCheck | None,
 ) -> tuple[FileResult, AsrBackend | None]:
     started_at = datetime.now(timezone.utc).isoformat()
+    probe: MediaProbe | None = None
     _emit_file(emit_event, path, index, total, "probing", "Проверка потоков", 2)
     _write_log(log, f"Файл {index}/{total}: {path.name} — проверка потоков.")
     try:
         _raise_if_cancelled(cancel_check)
         probe = probe_media(path, ffprobe_path=ffprobe_path)
+        _emit_file(
+            emit_event,
+            path,
+            index,
+            total,
+            "probing",
+            "Потоки проверены",
+            5,
+            probe=probe,
+        )
         _raise_if_cancelled(cancel_check)
         stream, warning = select_audio_stream(
             probe,
@@ -534,7 +807,9 @@ def _process_one_locked(
                 backend,
             )
 
-        _emit_file(emit_event, path, index, total, "extracting", "Нормализация аудио", 10)
+        _emit_file(
+            emit_event, path, index, total, "extracting", "Нормализация аудио", 10
+        )
         _raise_if_cancelled(cancel_check)
         normalize_audio(
             path,
@@ -549,7 +824,9 @@ def _process_one_locked(
         )
         _raise_if_cancelled(cancel_check)
         recognition_stage = _recognition_stage(settings)
-        _emit_file(emit_event, path, index, total, "transcribing", recognition_stage, 20)
+        _emit_file(
+            emit_event, path, index, total, "transcribing", recognition_stage, 20
+        )
         _write_log(
             log,
             f"Файл {index}/{total}: {path.name} — {recognition_stage.casefold()}.",
@@ -607,7 +884,9 @@ def _process_one_locked(
             "Готово",
             100,
             outputs=outputs,
-            audio_output=(outputs.normalized_audio_path if settings.keep_audio else None),
+            audio_output=(
+                outputs.normalized_audio_path if settings.keep_audio else None
+            ),
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — SRT готов.")
         return (
@@ -616,7 +895,9 @@ def _process_one_locked(
                 state="done",
                 srt_path=outputs.srt_path,
                 sidecar_path=outputs.sidecar_path,
-                audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
+                audio_path=outputs.normalized_audio_path
+                if settings.keep_audio
+                else None,
                 probe=probe,
             ),
             backend,
@@ -632,9 +913,18 @@ def _process_one_locked(
             "Отменено",
             100,
             error=message,
+            probe=probe,
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — отменено.")
-        return FileResult(input_path=path, state="cancelled", error=message), backend
+        return (
+            FileResult(
+                input_path=path,
+                state="cancelled",
+                error=message,
+                probe=probe,
+            ),
+            backend,
+        )
     except Exception as exc:
         message = str(exc) or exc.__class__.__name__
         _emit_file(
@@ -646,9 +936,13 @@ def _process_one_locked(
             "Ошибка",
             100,
             error=message,
+            probe=probe,
         )
         _write_log(log, f"Файл {index}/{total}: {path.name} — ошибка: {message}")
-        return FileResult(input_path=path, state="error", error=message), backend
+        return (
+            FileResult(input_path=path, state="error", error=message, probe=probe),
+            backend,
+        )
 
 
 def _reuse_existing_result(
@@ -703,7 +997,9 @@ def _reuse_existing_result(
                 state="cached",
                 srt_path=outputs.srt_path,
                 sidecar_path=outputs.sidecar_path,
-                audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
+                audio_path=outputs.normalized_audio_path
+                if settings.keep_audio
+                else None,
                 cached=True,
                 probe=probe,
             ),
@@ -729,7 +1025,9 @@ def _reuse_existing_result(
                 input_path=path,
                 state="skipped",
                 srt_path=outputs.srt_path,
-                sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
+                sidecar_path=outputs.sidecar_path
+                if outputs.sidecar_path.exists()
+                else None,
                 skipped=True,
                 probe=probe,
             ),
@@ -1172,7 +1470,9 @@ def _log_alignment_fallback(
     ):
         return
     details = transcript.metadata.get("alignment_fallback")
-    segment_index = details.get("segment_index") if isinstance(details, Mapping) else None
+    segment_index = (
+        details.get("segment_index") if isinstance(details, Mapping) else None
+    )
     segment_label = (
         f"сегмента {segment_index}"
         if isinstance(segment_index, int) and not isinstance(segment_index, bool)
@@ -1435,7 +1735,9 @@ def _runtime_from_transcript(
     }
     runtime = _normalize_runtime_signature(raw)
     if runtime is None:
-        raise ValidationError("ASR backend вернул неполное описание фактического runtime.")
+        raise ValidationError(
+            "ASR backend вернул неполное описание фактического runtime."
+        )
     return runtime
 
 
@@ -1601,7 +1903,9 @@ def _validate_backend_settings(settings: ProcessingSettings) -> None:
         raise ValidationError("Разрешение облачной обработки должно быть логическим.")
     if settings.openai_model not in SUPPORTED_OPENAI_MODELS:
         variants = ", ".join(sorted(SUPPORTED_OPENAI_MODELS))
-        raise ValidationError(f"Модель OpenAI должна иметь одно из значений: {variants}.")
+        raise ValidationError(
+            f"Модель OpenAI должна иметь одно из значений: {variants}."
+        )
     if settings.backend in CLOUD_ASR_BACKENDS and not settings.allow_cloud_processing:
         raise ValidationError(
             "Облачная обработка требует явного разрешения allow_cloud_processing."
@@ -1647,7 +1951,10 @@ def _validate_chunk_settings(settings: ProcessingSettings) -> None:
 
 
 def _validate_long_form_settings(settings: ProcessingSettings) -> None:
-    if settings.long_form_window_seconds < 30 or settings.long_form_window_seconds > 3600:
+    if (
+        settings.long_form_window_seconds < 30
+        or settings.long_form_window_seconds > 3600
+    ):
         raise ValidationError("Long-form окно должно быть от 30 до 3600 секунд.")
     if (
         settings.long_form_overlap_seconds < 0
@@ -1675,6 +1982,7 @@ def _emit_file(
     outputs: OutputPaths | None = None,
     audio_output: Path | None = None,
     error: str | None = None,
+    probe: MediaProbe | None = None,
 ) -> None:
     event: dict[str, Any] = {
         "type": "file",
@@ -1694,6 +2002,8 @@ def _emit_file(
         )
     if error:
         event["error"] = error
+    if probe is not None:
+        event["probe"] = probe.to_dict()
     emit_event(event)
 
 
@@ -1720,8 +2030,7 @@ def _build_output_map(
 ) -> dict[Path, OutputPaths]:
     """Устраняет коллизии одинаковых basename, сохраняя обычные имена в остальных случаях."""
     candidates = {
-        path: build_output_paths(path, settings, common_root)
-        for path in paths
+        path: build_output_paths(path, settings, common_root) for path in paths
     }
     groups: dict[str, list[Path]] = {}
     for path, outputs in candidates.items():
@@ -1780,6 +2089,7 @@ def _command_exists(command: str) -> bool:
 __all__ = [
     "build_items",
     "build_output_paths",
+    "build_pending_items",
     "get_preflight_status",
     "process_paths",
 ]

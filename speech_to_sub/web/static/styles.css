@@ -325,6 +325,7 @@ select {
 .panel-settings {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
@@ -346,6 +347,15 @@ select {
   margin-bottom: 14px;
 }
 
+.panel-files .panel-header {
+  flex-wrap: wrap;
+}
+
+.panel-files .panel-header > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .panel-title {
   font-size: 16px;
   font-weight: 680;
@@ -363,7 +373,9 @@ select {
 }
 
 .status-summary {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
   padding: 5px 9px;
   border: 1px solid rgba(25, 118, 138, 0.18);
   border-radius: 999px;
@@ -371,6 +383,14 @@ select {
   background: var(--accent-soft);
   font-size: 11px;
   font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: right;
+  white-space: normal;
+}
+
+.panel-files .status-summary {
+  margin-left: auto;
 }
 
 .file-list {
@@ -391,6 +411,31 @@ select {
   display: grid;
   place-items: center;
   color: var(--muted);
+}
+
+.file-pagination {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(251, 248, 242, 0.96);
+  box-shadow: var(--shadow-soft);
+}
+
+.file-pagination .btn {
+  padding: 6px 10px;
+}
+
+.file-pagination-status {
+  min-width: 220px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 .empty-state {

@@ -99,18 +99,30 @@ Set-Location -LiteralPath $ProjectRoot
 $arguments = @(
     "-B",
     "-m",
-    "uvicorn",
-    "speech_to_sub.web.app:app",
-    "--host",
-    $HostAddress,
-    "--port",
-    $Port.ToString()
+    "speech_to_sub.web"
 )
 
-if ($Reload) {
-    $arguments += "--reload"
-}
-
 Write-Host "Speech to Sub: $serviceUrl"
-& $PythonPath @arguments
-exit $LASTEXITCODE
+$env:WEB_HOST = $HostAddress
+$env:WEB_PORT = $Port.ToString()
+$env:WEB_RELOAD = if ($Reload) { "1" } else { "0" }
+$runtimeMarkerName = "SPEECH_TO_SUB_WEB_RUNTIME"
+$runtimeMarkerWasDefined = Test-Path -LiteralPath "Env:$runtimeMarkerName"
+$previousRuntimeMarker = [Environment]::GetEnvironmentVariable($runtimeMarkerName, "Process")
+$processExitCode = 1
+try {
+    [Environment]::SetEnvironmentVariable($runtimeMarkerName, "1", "Process")
+    & $PythonPath @arguments
+    $processExitCode = $LASTEXITCODE
+} finally {
+    if ($runtimeMarkerWasDefined) {
+        [Environment]::SetEnvironmentVariable(
+            $runtimeMarkerName,
+            $previousRuntimeMarker,
+            "Process"
+        )
+    } else {
+        [Environment]::SetEnvironmentVariable($runtimeMarkerName, $null, "Process")
+    }
+}
+exit $processExitCode

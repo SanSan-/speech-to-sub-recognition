@@ -15,11 +15,15 @@ import uvicorn
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from speech_to_sub.utils.logging_utils import WEB_RUNTIME_LOGGING_ENV  # noqa: E402
+
+os.environ.pop(WEB_RUNTIME_LOGGING_ENV, None)
+
 E2E_ARTIFACTS = Path(__file__).resolve().parent / ".artifacts"
 E2E_ARTIFACTS.mkdir(parents=True, exist_ok=True)
-E2E_JOB_DB = Path(
-    os.environ.get("WEB_JOB_DB", E2E_ARTIFACTS / "jobs.sqlite3")
-).resolve(strict=False)
+E2E_JOB_DB = Path(os.environ.get("WEB_JOB_DB", E2E_ARTIFACTS / "jobs.sqlite3")).resolve(
+    strict=False
+)
 if E2E_ARTIFACTS.resolve() not in E2E_JOB_DB.parents:
     raise RuntimeError("E2E SQLite разрешён только внутри tests/e2e/.artifacts.")
 for database_file in (
@@ -40,7 +44,18 @@ FAKE_PATHS = (
     r"D:\E2E\Разбор алгоритма №2.mkv",
     r"D:\E2E\Ошибка дорожки 03.wav",
 )
+FOLDER_ROOT = (E2E_ARTIFACTS / "Каталог Юникод").resolve()
+FOLDER_PATHS = (
+    FOLDER_ROOT / "Лекция верхнего уровня.mp4",
+    FOLDER_ROOT / "Вложенная папка" / "Глубокий разбор №4.mkv",
+)
+for fixture_path in FOLDER_PATHS:
+    fixture_path.parent.mkdir(parents=True, exist_ok=True)
+    fixture_path.write_bytes(b"speech-to-sub e2e fixture")
+
+ALL_FAKE_PATHS = (*FAKE_PATHS, *(str(path) for path in FOLDER_PATHS))
 CONTROL_LOG_LINE = "E2E-КОНТРОЛЬ-SSE"
+FOLDER_DISCOVERY_LOG = "Сбор каталога завершён: найдено медиафайлов — 2."
 
 
 class FakeBatchService:
@@ -52,12 +67,16 @@ class FakeBatchService:
         self.cancel_seen = threading.Event()
         self.retry_entered = threading.Event()
         self.released = threading.Event()
+        self.folder_preparation_entered = threading.Event()
+        self.folder_preparation_released = threading.Event()
         self.calls: list[list[str]] = []
         self.build_settings: list[dict[str, Any]] = []
         self.process_settings: list[dict[str, Any]] = []
+        self.picker_calls: list[dict[str, Any]] = []
+        self._hold_next_folder_build = False
         self._items = {
             path: self._make_item(path, index)
-            for index, path in enumerate(FAKE_PATHS)
+            for index, path in enumerate(ALL_FAKE_PATHS)
         }
 
     @staticmethod
@@ -69,12 +88,70 @@ class FakeBatchService:
             "state": "queued",
             "stage": "В очереди",
             "progress": 0,
-            "duration_sec": 60 + index,
+            "probe": {
+                "path": path,
+                "duration": 60 + index,
+                "format_name": Path(path).suffix.casefold().lstrip("."),
+                "streams": [{"ordinal": 0, "index": 1, "codec_name": "aac"}],
+            },
             "error": None,
             "outputs": None,
         }
 
     def build_items(
+        self,
+        paths: list[str],
+        settings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return self._record_build(paths, settings)
+
+    def build_items_with_progress(
+        self,
+        paths: list[str],
+        settings: dict[str, Any],
+        progress_callback: Callable[[dict[str, Any]], None],
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            should_hold = self._hold_next_folder_build and set(paths) == {
+                str(path) for path in FOLDER_PATHS
+            }
+            if should_hold:
+                self._hold_next_folder_build = False
+        total = len(paths)
+        progress_callback(
+            {
+                "phase": "probing",
+                "processed": 0,
+                "total": total,
+                "message": f"Проверка аудиопотоков: 0 из {total}.",
+            }
+        )
+        if should_hold:
+            self.folder_preparation_entered.set()
+            if not self.folder_preparation_released.wait(timeout=45):
+                raise RuntimeError(
+                    "E2E не получил разрешение завершить подготовку папки"
+                )
+        for processed, _path in enumerate(paths, start=1):
+            progress_callback(
+                {
+                    "phase": "probing",
+                    "processed": processed,
+                    "total": total,
+                    "message": f"Проверка аудиопотоков: {processed} из {total}.",
+                }
+            )
+        return self._record_build(paths, settings)
+
+    def begin_picker(self, kind: str, *, recursive: bool) -> None:
+        with self._lock:
+            self.picker_calls.append({"kind": kind, "recursive": recursive})
+            if kind == "folder":
+                self.folder_preparation_entered.clear()
+                self.folder_preparation_released.clear()
+                self._hold_next_folder_build = True
+
+    def _record_build(
         self,
         paths: list[str],
         settings: dict[str, Any],
@@ -189,18 +266,28 @@ class FakeBatchService:
             calls = copy.deepcopy(self.calls)
             build_settings = copy.deepcopy(self.build_settings)
             process_settings = copy.deepcopy(self.process_settings)
+            picker_calls = copy.deepcopy(self.picker_calls)
         return {
             "entered": self.entered.is_set(),
             "cancel_seen": self.cancel_seen.is_set(),
             "retry_entered": self.retry_entered.is_set(),
             "released": self.released.is_set(),
+            "folder_preparation_entered": self.folder_preparation_entered.is_set(),
+            "folder_preparation_released": self.folder_preparation_released.is_set(),
+            "folder_root": str(FOLDER_ROOT),
+            "folder_paths": [str(path) for path in FOLDER_PATHS],
             "calls": calls,
             "build_settings": build_settings,
             "process_settings": process_settings,
+            "picker_calls": picker_calls,
         }
 
     def release(self) -> dict[str, bool]:
         self.released.set()
+        return {"released": True}
+
+    def release_folder_preparation(self) -> dict[str, bool]:
+        self.folder_preparation_released.set()
         return {"released": True}
 
     def _update(self, path: str, **changes: Any) -> None:
@@ -222,6 +309,7 @@ class FakeBatchService:
             "progress": item["progress"],
             "error": item["error"],
             "outputs": item["outputs"],
+            "probe": copy.deepcopy(item["probe"]),
         }
 
     @staticmethod
@@ -236,10 +324,36 @@ class FakeBatchService:
 fake_service = FakeBatchService()
 
 
-def fake_picker(kind: str, recursive: bool = False) -> PickSelection:
-    del recursive
+def fake_picker(
+    kind: str,
+    recursive: bool = False,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> PickSelection:
+    fake_service.begin_picker(kind, recursive=recursive)
+    if kind == "folder":
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "dialog",
+                    "message": "Открыт системный диалог выбора каталога.",
+                }
+            )
+            progress_callback(
+                {
+                    "phase": "collecting",
+                    "discovered": len(FOLDER_PATHS),
+                    "total": len(FOLDER_PATHS),
+                    "message": FOLDER_DISCOVERY_LOG,
+                }
+            )
+        return PickSelection(
+            mode="folder",
+            paths=FOLDER_PATHS,
+            folder=FOLDER_ROOT,
+        )
     if kind != "file":
-        raise RuntimeError(f"E2E поддерживает только выбор файлов, получено: {kind}")
+        raise RuntimeError(f"E2E не поддерживает режим выбора: {kind}")
     return PickSelection(
         mode="files",
         paths=tuple(Path(path) for path in FAKE_PATHS),
@@ -260,6 +374,11 @@ def e2e_release() -> dict[str, bool]:
     return fake_service.release()
 
 
+@web_app.app.post("/__e2e__/release-preparation")
+def e2e_release_preparation() -> dict[str, bool]:
+    return fake_service.release_folder_preparation()
+
+
 @web_app.app.post("/__e2e__/restart")
 def e2e_restart() -> dict[str, Any]:
     """Переоткрывает реестр на той же SQLite, имитируя рестарт процесса."""
@@ -275,6 +394,10 @@ def e2e_restart() -> dict[str, Any]:
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
     parser = argparse.ArgumentParser(description="Тестовый web-сервер для Playwright")
     parser.add_argument("--port", type=int, default=17862)
     args = parser.parse_args()

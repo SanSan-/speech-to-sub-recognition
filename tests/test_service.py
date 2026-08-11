@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from speech_to_sub.models import (
     TranscriptWord,
 )
 from speech_to_sub.subtitles.validator import parse_srt
+from speech_to_sub.utils import io_utils
 
 
 TEST_ENGINE_VERSION = "test-engine-1"
@@ -205,13 +208,293 @@ def test_build_items_reports_idle_skipped_and_probe_error(
 
     assert by_name[idle.name]["state"] == "idle"
     assert by_name[idle.name]["selected_stream"]["index"] == 1
-    assert by_name[idle.name]["source_fingerprint"]["sha256"]
-    assert by_name[idle.name]["source_fingerprint"]["path"] == str(idle.resolve())
+    assert "source_fingerprint" not in by_name[idle.name]
     assert by_name[skipped.name]["state"] == "skipped"
     assert by_name[skipped.name]["skipped"] is True
     assert by_name[broken.name]["state"] == "error"
-    assert by_name[broken.name]["source_fingerprint"]["sha256"]
+    assert "source_fingerprint" not in by_name[broken.name]
     assert "повреждённый контейнер" in by_name[broken.name]["error"]
+
+
+def test_build_items_never_reads_full_source_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "большая запись.mp4"
+    media.write_bytes(b"media")
+    monkeypatch.setattr(service, "probe_media", lambda path, **_kwargs: _probe(path))
+    monkeypatch.setattr(
+        service,
+        "build_source_fingerprint",
+        lambda _path: (_ for _ in ()).throw(AssertionError("SHA запрещён")),
+    )
+
+    items = service.build_items([media])
+
+    assert items[0]["state"] == "idle"
+    assert "source_fingerprint" not in items[0]
+
+
+def test_build_items_keeps_valid_card_when_neighbor_file_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid = tmp_path / "01-valid.mp4"
+    empty = tmp_path / "02-empty.mp4"
+    valid.write_bytes(b"media")
+    empty.write_bytes(b"")
+    monkeypatch.setattr(service, "probe_media", lambda path, **_kwargs: _probe(path))
+
+    items = service.build_items([tmp_path])
+
+    assert [item["name"] for item in items] == [valid.name, empty.name]
+    assert items[0]["state"] == "idle"
+    assert items[1]["state"] == "error"
+    assert "пуст" in items[1]["error"]
+
+
+def test_build_items_error_card_does_not_claim_colliding_output_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = tmp_path / "sample.mp4"
+    valid = tmp_path / "sample.mkv"
+    invalid.write_bytes(b"")
+    valid.write_bytes(b"media")
+    monkeypatch.setattr(service, "probe_media", lambda path, **_kwargs: _probe(path))
+
+    items = service.build_items(
+        [invalid, valid],
+        {"language": "ru", "keep_audio": True},
+    )
+    by_name = {item["name"]: item for item in items}
+
+    assert by_name[valid.name]["srt_output"] == str(tmp_path / "sample.ru.srt")
+    assert by_name[invalid.name]["state"] == "error"
+    assert by_name[invalid.name]["srt_output"] is None
+    assert by_name[invalid.name]["sidecar_output"] is None
+    assert by_name[invalid.name]["audio_output"] is None
+
+
+def test_build_pending_error_card_does_not_claim_colliding_output_paths(
+    tmp_path: Path,
+) -> None:
+    invalid = tmp_path / "sample.mp4"
+    valid = tmp_path / "sample.mkv"
+    invalid.write_bytes(b"")
+    valid.write_bytes(b"media")
+
+    items = service.build_pending_items(
+        [invalid, valid],
+        {"language": "ru", "keep_audio": True},
+    )
+    by_name = {item["name"]: item for item in items}
+
+    assert by_name[valid.name]["srt_output"] == str(tmp_path / "sample.ru.srt")
+    assert by_name[invalid.name]["state"] == "error"
+    assert by_name[invalid.name]["srt_output"] is None
+    assert by_name[invalid.name]["sidecar_output"] is None
+    assert by_name[invalid.name]["audio_output"] is None
+
+
+def test_build_items_isolates_disappeared_and_stat_error_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid = tmp_path / "01-valid.mp4"
+    disappeared = tmp_path / "02-disappeared.mp4"
+    inaccessible = tmp_path / "03-inaccessible.mp4"
+    for path in (valid, disappeared, inaccessible):
+        path.write_bytes(b"media")
+    real_validate = io_utils.validate_media_file
+
+    def unstable_validate(path: Path) -> Path:
+        if path.name == disappeared.name:
+            path.unlink(missing_ok=True)
+        if path.name == inaccessible.name:
+            raise PermissionError("контролируемая ошибка stat")
+        return real_validate(path)
+
+    monkeypatch.setattr(io_utils, "validate_media_file", unstable_validate)
+    monkeypatch.setattr(service, "probe_media", lambda path, **_kwargs: _probe(path))
+
+    items = service.build_items([tmp_path])
+    by_name = {item["name"]: item for item in items}
+
+    assert by_name[valid.name]["state"] == "idle"
+    assert by_name[disappeared.name]["state"] == "error"
+    assert "не найден" in by_name[disappeared.name]["error"]
+    assert by_name[inaccessible.name]["state"] == "error"
+    assert "контролируемая ошибка stat" in by_name[inaccessible.name]["error"]
+
+
+def test_build_items_bounds_parallel_ffprobe_and_preserves_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_paths = [tmp_path / f"{index:02}.mp4" for index in range(12)]
+    for path in media_paths:
+        path.write_bytes(b"media")
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    progress: list[dict[str, Any]] = []
+
+    def concurrent_probe(path: str | Path, **_kwargs: object) -> MediaProbe:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.025)
+            return _probe(path)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(service, "probe_media", concurrent_probe)
+
+    items = service.build_items(media_paths, progress_callback=progress.append)
+
+    assert peak == service.MAX_CARD_PROBE_WORKERS
+    assert [item["path"] for item in items] == [
+        str(path.resolve()) for path in media_paths
+    ]
+    assert progress[0] == {
+        "phase": "probing",
+        "discovered": 12,
+        "processed": 0,
+        "total": 12,
+        "message": "Найдено медиафайлов: 12. Начата проверка аудиопотоков.",
+    }
+    assert progress[-1]["processed"] == 12
+    assert progress[-1]["message"] == "Проверены аудиопотоки: 12 из 12."
+
+
+def test_build_pending_items_does_not_probe_or_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "очередь.wav"
+    media.write_bytes(b"audio")
+    monkeypatch.setattr(
+        service,
+        "probe_media",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ffprobe запрещён")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "build_source_fingerprint",
+        lambda _path: (_ for _ in ()).throw(AssertionError("SHA запрещён")),
+    )
+
+    items = service.build_pending_items([media], {"language": "ru"})
+
+    assert items == [
+        {
+            "path": str(media.resolve()),
+            "name": media.name,
+            "format": "wav",
+            "state": "queued",
+            "stage": "Ожидание",
+            "progress": 0,
+            "srt_output": str(tmp_path / "очередь.ru.srt"),
+            "sidecar_output": str(tmp_path / "очередь.ru.asr.json"),
+            "audio_output": None,
+            "cached": False,
+            "skipped": False,
+            "error": None,
+        }
+    ]
+
+
+def test_build_pending_isolates_disappeared_and_stat_error_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disappeared = tmp_path / "01-disappeared.mp4"
+    inaccessible = tmp_path / "02-inaccessible.mp4"
+    valid = tmp_path / "03-valid.mp4"
+    inaccessible.write_bytes(b"media")
+    valid.write_bytes(b"media")
+    real_validate = io_utils.validate_media_file
+
+    def unstable_validate(path: Path) -> Path:
+        if path.name == inaccessible.name:
+            raise PermissionError("контролируемая ошибка stat")
+        return real_validate(path)
+
+    monkeypatch.setattr(io_utils, "validate_media_file", unstable_validate)
+
+    items = service.build_pending_items([disappeared, inaccessible, valid])
+    by_name = {item["name"]: item for item in items}
+
+    assert by_name[disappeared.name]["state"] == "error"
+    assert "не найден" in by_name[disappeared.name]["error"]
+    assert by_name[inaccessible.name]["state"] == "error"
+    assert "контролируемая ошибка stat" in by_name[inaccessible.name]["error"]
+    assert by_name[valid.name]["state"] == "queued"
+
+
+def test_service_empty_folder_has_no_cards_and_process_fails_explicitly(
+    tmp_path: Path,
+) -> None:
+    empty_folder = tmp_path / "empty"
+    empty_folder.mkdir()
+
+    assert service.build_items([empty_folder]) == []
+    assert service.build_pending_items([empty_folder]) == []
+    with pytest.raises(ValidationError, match="Не найдено поддерживаемых"):
+        service.process_paths(
+            [empty_folder],
+            {"language": "ru"},
+            lambda _event: None,
+            lambda _message: None,
+        )
+
+
+def test_service_rejects_explicit_media_symlink_without_processing_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.mp4"
+    link = tmp_path / "selected.mp4"
+    target.write_bytes(b"media")
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Символические ссылки недоступны: {exc}")
+
+    items = service.build_pending_items([link])
+
+    assert len(items) == 1
+    assert items[0]["path"] == str(link)
+    assert items[0]["state"] == "error"
+    assert "ссылки" in items[0]["error"]
+
+
+def test_service_recursive_discovery_does_not_descend_into_junction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    blocked = root / "junction"
+    blocked.mkdir(parents=True)
+    valid = root / "valid.mp4"
+    hidden = blocked / "hidden.mp4"
+    valid.write_bytes(b"media")
+    hidden.write_bytes(b"media")
+    real_link_check = io_utils.is_link_or_junction
+    monkeypatch.setattr(
+        io_utils,
+        "is_link_or_junction",
+        lambda path: Path(path) == blocked or real_link_check(path),
+    )
+
+    items = service.build_pending_items([root], {"recursive": True})
+
+    assert [item["path"] for item in items] == [str(valid.resolve())]
 
 
 def test_cleanup_stale_workspaces_removes_only_safe_unlocked_job_directories(
@@ -371,11 +654,20 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
     assert backend.durations == [1.5]
+    assert first[0]["probe"]["duration"] == 2.0
+    verified_event = next(
+        event
+        for event in events
+        if event.get("state") == "probing"
+        and event.get("stage") == "Потоки проверены"
+    )
+    assert verified_event["probe"]["duration"] == 2.0
     assert any(event.get("state") == "done" for event in events)
 
     cards = service.build_items([media], {"language": "ru"})
-    assert cards[0]["state"] == "cached"
-    assert cards[0]["cached"] is True
+    assert cards[0]["state"] == "idle"
+    assert cards[0]["stage"] == "Проверка кеша при запуске"
+    assert cards[0]["cached"] is False
 
     cached = service.process_paths(
         [media],
@@ -386,6 +678,7 @@ def test_process_paths_writes_utf8_srt_sidecar_and_reuses_cache(
     )
     assert cached[0]["state"] == "cached"
     assert cached[0]["cached"] is True
+    assert cached[0]["probe"]["duration"] == 2.0
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
 
@@ -818,7 +1111,7 @@ def test_missing_srt_is_rebuilt_from_recognition_cache_without_force(
 
     assert rebuilt[0]["state"] == "done"
     assert cards[0]["state"] == "idle"
-    assert cards[0]["stage"] == "Пересборка SRT из кеша распознавания"
+    assert cards[0]["stage"] == "Проверка кеша при запуске"
     assert srt_path.is_file()
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
@@ -1256,7 +1549,8 @@ def test_cache_uses_loaded_backend_runtime_after_cpu_fallback(
     )
 
     assert first[0]["state"] == "done"
-    assert cards[0]["state"] == "cached"
+    assert cards[0]["state"] == "idle"
+    assert cards[0]["stage"] == "Проверка кеша при запуске"
     assert second[0]["state"] == "cached"
     assert len(backend.calls) == 1
     assert normalized_sources == [media.resolve()]
@@ -1432,7 +1726,7 @@ def test_cache_adds_requested_audio_without_reloading_asr(
     assert first[0]["state"] == "done"
     assert first[0]["audio_output"] is None
     assert cards[0]["state"] == "idle"
-    assert cards[0]["stage"] == "Требуется сохранить аудио"
+    assert cards[0]["stage"] == "Проверка кеша при запуске"
     assert second[0]["state"] == "cached"
     assert second[0]["audio_output"] == str(audio_path)
     assert audio_path.read_bytes() == b"normalized-audio"
@@ -1483,17 +1777,112 @@ def test_process_paths_continues_after_one_file_error(
 
     assert [item["state"] for item in results] == ["error", "done"]
     assert "тестовая ошибка FFmpeg" in results[0]["error"]
+    assert results[0]["probe"]["duration"] == 2.0
     assert results[1]["srt_output"] == str(tmp_path / "02-valid.ru.srt")
     assert normalized_sources == [valid.resolve()]
     assert len(backend.calls) == 1
-    assert any(
-        event.get("path") == str(broken.resolve()) and event.get("state") == "error"
+    broken_event = next(
+        event
         for event in events
+        if event.get("path") == str(broken.resolve())
+        and event.get("state") == "error"
     )
+    assert broken_event["probe"]["duration"] == 2.0
     assert any(
         event.get("path") == str(valid.resolve()) and event.get("state") == "done"
         for event in events
     )
+
+
+def test_process_paths_does_not_invent_duration_when_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "broken-probe.mp4"
+    media.write_bytes(b"media")
+    _install_fast_runtime(monkeypatch, tmp_path)
+
+    def fail_probe(*_args: Any, **_kwargs: Any) -> MediaProbe:
+        raise MediaError("контролируемая ошибка ffprobe")
+
+    monkeypatch.setattr(service, "probe_media", fail_probe)
+    events: list[dict[str, Any]] = []
+
+    results = service.process_paths(
+        [media],
+        {"language": "ru"},
+        events.append,
+        lambda _message: None,
+        backend=FakeBackend(),
+    )
+
+    assert results[0]["state"] == "error"
+    assert results[0]["probe"] is None
+    error_event = next(event for event in events if event.get("state") == "error")
+    assert "probe" not in error_event
+
+
+def test_process_paths_continues_after_empty_file_discovery_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty = tmp_path / "01-empty.mp4"
+    valid = tmp_path / "02-valid.mp4"
+    empty.write_bytes(b"")
+    valid.write_bytes(b"media")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    events: list[dict[str, Any]] = []
+
+    results = service.process_paths(
+        [tmp_path],
+        {"language": "ru"},
+        events.append,
+        lambda _message: None,
+        backend=FakeBackend(),
+    )
+
+    assert [item["state"] for item in results] == ["error", "done"]
+    assert "пуст" in results[0]["error"]
+    assert results[1]["srt_output"] == str(tmp_path / "02-valid.ru.srt")
+    assert any(
+        event.get("path") == str(empty.resolve()) and event.get("state") == "error"
+        for event in events
+    )
+
+
+def test_process_paths_continues_after_disappeared_and_stat_error_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disappeared = tmp_path / "01-disappeared.mp4"
+    inaccessible = tmp_path / "02-inaccessible.mp4"
+    valid = tmp_path / "03-valid.mp4"
+    inaccessible.write_bytes(b"media")
+    valid.write_bytes(b"media")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    real_validate = io_utils.validate_media_file
+
+    def unstable_validate(path: Path) -> Path:
+        if path.name == inaccessible.name:
+            raise PermissionError("контролируемая ошибка stat")
+        return real_validate(path)
+
+    monkeypatch.setattr(io_utils, "validate_media_file", unstable_validate)
+    events: list[dict[str, Any]] = []
+
+    results = service.process_paths(
+        [disappeared, inaccessible, valid],
+        {"language": "ru"},
+        events.append,
+        lambda _message: None,
+        backend=FakeBackend(),
+    )
+
+    assert [item["state"] for item in results] == ["error", "error", "done"]
+    assert "не найден" in results[0]["error"]
+    assert "контролируемая ошибка stat" in results[1]["error"]
+    assert results[2]["srt_output"] == str(tmp_path / "03-valid.ru.srt")
+    assert sum(event.get("state") == "error" for event in events) == 2
 
 
 def test_process_paths_cancels_remaining_files_after_safe_boundary(
@@ -1530,6 +1919,39 @@ def test_process_paths_cancels_remaining_files_after_safe_boundary(
         event.get("path") == str(second.resolve()) and event.get("state") == "cancelled"
         for event in events
     )
+
+
+def test_process_paths_preserves_duration_when_cancelled_after_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "cancelled-after-probe.mp4"
+    media.write_bytes(b"media")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    events: list[dict[str, Any]] = []
+    cancelled = False
+
+    def emit(event: dict[str, Any]) -> None:
+        nonlocal cancelled
+        events.append(event)
+        if event.get("stage") == "Потоки проверены":
+            cancelled = True
+
+    results = service.process_paths(
+        [media],
+        {"language": "ru"},
+        emit,
+        lambda _message: None,
+        backend=FakeBackend(),
+        cancel_check=lambda: cancelled,
+    )
+
+    assert results[0]["state"] == "cancelled"
+    assert results[0]["probe"]["duration"] == 2.0
+    cancelled_event = next(
+        event for event in events if event.get("state") == "cancelled"
+    )
+    assert cancelled_event["probe"]["duration"] == 2.0
 
 
 def test_same_basename_in_different_containers_gets_distinct_outputs(

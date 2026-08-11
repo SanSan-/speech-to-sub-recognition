@@ -130,13 +130,14 @@ def test_registry_persists_cancel_restart_retry_and_sse(tmp_path: Path) -> None:
     assert restored["source_paths"] == paths
     assert "".join(restarted.iter_sse(job.job_id)).count("КОНТРОЛЬ-SSE") == 1
     terminal_cursor = int(restored["latest_event_id"])
-    replay = "".join(
-        restarted.iter_sse(job.job_id, after_event_id=terminal_cursor)
-    )
+    replay = "".join(restarted.iter_sse(job.job_id, after_event_id=terminal_cursor))
     assert _sse_payloads(replay) == []
-    assert _sse_payloads(
-        "".join(restarted.iter_sse(job.job_id, after_event_id=terminal_cursor + 10))
-    ) == []
+    assert (
+        _sse_payloads(
+            "".join(restarted.iter_sse(job.job_id, after_event_id=terminal_cursor + 10))
+        )
+        == []
+    )
 
     retried_paths: list[str] = []
     retried_settings: dict[str, Any] = {}
@@ -180,7 +181,9 @@ def test_registry_persists_cancel_restart_retry_and_sse(tmp_path: Path) -> None:
         retried.job_id,
         job.job_id,
     ]
-    assert all("items" not in summary and "events" not in summary for summary in summaries)
+    assert all(
+        "items" not in summary and "events" not in summary for summary in summaries
+    )
     restarted.close()
 
 
@@ -309,6 +312,136 @@ def test_runtime_store_error_does_not_block_terminal_or_restart_recovery(
     assert recovered["status"] == "interrupted"
     assert recovered["items"][0]["state"] == "error"
     restarted.close()
+
+
+def test_registry_preserves_probe_for_active_terminal_and_restarted_job(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "duration.sqlite3"
+    registry = JobRegistry(store=SQLiteJobStore(database))
+    path = r"D:\Видео\длительность.mp4"
+    probe = {
+        "path": path,
+        "duration": 3661.0,
+        "format_name": "mov,mp4",
+        "streams": [{"ordinal": 0, "index": 1, "codec_name": "aac"}],
+    }
+    active = threading.Event()
+    release = threading.Event()
+
+    def processor(paths, settings, emit_event, log, *, cancel_check=None):
+        del settings, log
+        assert callable(cancel_check)
+        emit_event(
+            {
+                "type": "file",
+                "path": paths[0],
+                "state": "transcribing",
+                "stage": "Распознавание",
+                "progress": 42,
+                "probe": probe,
+            }
+        )
+        active.set()
+        assert release.wait(timeout=3)
+        emit_event(
+            {
+                "type": "file",
+                "path": paths[0],
+                "state": "error",
+                "stage": "Ошибка",
+                "progress": 100,
+                "error": "Контролируемая ошибка после ffprobe",
+            }
+        )
+        return [
+            {
+                "path": paths[0],
+                "state": "error",
+                "error": "Контролируемая ошибка после ffprobe",
+                "probe": probe,
+            }
+        ]
+
+    job = registry.start(
+        paths=[path],
+        settings={},
+        items=[{"path": path, "state": "queued"}],
+        processor=processor,
+    )
+    assert active.wait(timeout=3)
+    active_snapshot = registry.snapshot(job.job_id)
+    assert active_snapshot["items"][0]["state"] == "transcribing"
+    assert active_snapshot["items"][0]["probe"]["duration"] == 3661.0
+
+    release.set()
+    assert job.finished.wait(timeout=3)
+    terminal_snapshot = registry.snapshot(job.job_id)
+    assert terminal_snapshot["items"][0]["state"] == "error"
+    assert terminal_snapshot["items"][0]["probe"]["duration"] == 3661.0
+    registry.close()
+
+    restarted = JobRegistry(store=SQLiteJobStore(database))
+    restored = restarted.snapshot(job.job_id)
+    assert restored["items"][0]["state"] == "error"
+    assert restored["items"][0]["probe"]["duration"] == 3661.0
+    restarted.close()
+
+
+def test_job_logger_preserves_sse_and_propagates_once_with_traceback() -> None:
+    application_logger = logging.getLogger("speech_to_sub")
+    saved_handlers = list(application_logger.handlers)
+    saved_level = application_logger.level
+    saved_propagate = application_logger.propagate
+    records: list[logging.LogRecord] = []
+
+    class RecordingHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    capture = RecordingHandler()
+    application_logger.handlers = [capture]
+    application_logger.setLevel(logging.INFO)
+    application_logger.propagate = False
+    registry = JobRegistry()
+    marker = "КОНТРОЛЬ-ФАЙЛОВОГО-ЖУРНАЛА"
+
+    def failing_processor(paths, settings, emit_event, log, *, cancel_check=None):
+        del paths, settings, emit_event, cancel_check
+        logging.getLogger("speech_to_sub.service").info(marker)
+        log.info(marker)
+        raise RuntimeError("контролируемая авария worker")
+
+    try:
+        job = registry.start(
+            paths=[r"D:\Видео\лекция.mp4"],
+            settings={},
+            items=[{"path": r"D:\Видео\лекция.mp4", "state": "queued"}],
+            processor=failing_processor,
+        )
+        assert job.finished.wait(timeout=3)
+        messages = [record.getMessage() for record in records]
+        assert messages.count("Запущена пакетная обработка: файлов 1.") == 1
+        assert messages.count(marker) == 1
+        assert (
+            sum(
+                "Пакетная обработка завершилась с ошибкой" in value
+                for value in messages
+            )
+            == 1
+        )
+        assert any(record.exc_info is not None for record in records)
+
+        sse = "".join(registry.iter_sse(job.job_id))
+        assert sse.count("Запущена пакетная обработка: файлов 1.") == 1
+        assert sse.count(marker) == 1
+        assert sse.count("Пакетная обработка завершилась с ошибкой") == 1
+        assert "контролируемая авария worker" in sse
+    finally:
+        registry.reset_for_tests()
+        application_logger.handlers = saved_handlers
+        application_logger.setLevel(saved_level)
+        application_logger.propagate = saved_propagate
 
 
 def _sse_payloads(body: str) -> list[dict[str, Any]]:
