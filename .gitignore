@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 .codex
+.agents
 .scannerwork
 coverage.xml
 htmlcov/
@@ -24,4 +25,7 @@ tests/e2e/.artifacts/
 !PRD.md
 !README.md
 !CHANGELOG.md
+!AGENTS.md
+!**/openspec/**/*.md
 sonar-project.properties
+**/evidence/**
