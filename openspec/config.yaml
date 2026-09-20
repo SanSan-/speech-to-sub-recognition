@@ -1,0 +1,21 @@
+schema: spec-driven
+context: |
+  speech-to-sub-recognition: локальное пакетное ASR и SRT/ASS/WebVTT.
+  Единственный вход и обязательный маршрут: [00-start-here](context/00-start-here.md).
+  Инженерный профиль: [ENG-001](specs/engineering-governance/spec.md#requirement-eng-001-обязательные-правила).
+  Сверка фактов, планов и гипотез: [CTX-002](specs/project-context/spec.md#requirement-ctx-002-соответствие-реализации).
+  Сохранность данных и граница документальных проверок: [общий профиль, пункты 9/12/13](specs/engineering-governance/reference/python-common.md).
+  Повтор по кешу: [ART-003](specs/recognition-artifacts/spec.md#requirement-art-003-повтор-без-force); полный force: [ART-004](specs/recognition-artifacts/spec.md#requirement-art-004-полный-обход-при-force).
+  Автоматические правила: [CTX-005…008](specs/project-context/spec.md); безопасность работы агента: [SEC-CONTEXT-001…004](specs/engineering-governance/spec.md).
+  Область отдельно запрашиваемой методики аудита: [CTX-009](specs/project-context/spec.md#requirement-ctx-009-ограниченный-аудит-контекста).
+rules:
+  proposal:
+    - Потребность, границы и наблюдаемый результат задаются пунктами 4–5 [общего профиля](specs/engineering-governance/reference/python-common.md#требования-и-жизненный-цикл); открытые обязательства — [CTX-003](specs/project-context/spec.md#requirement-ctx-003-одна-активная-очередь).
+  specs:
+    - Форма требований и значимые условия — пункты 5–6 [общего профиля](specs/engineering-governance/reference/python-common.md#требования-и-жизненный-цикл).
+    - Соответствие подтверждённой реализации — [CTX-002](specs/project-context/spec.md#requirement-ctx-002-соответствие-реализации).
+  design:
+    - Связь с компонентами и доказательствами — пункт 7 [общего профиля](specs/engineering-governance/reference/python-common.md#требования-и-жизненный-цикл); решения и альтернативы — пункт 15 того же профиля.
+  tasks:
+    - Проверяемый критерий завершения и единственная очередь — [CTX-003](specs/project-context/spec.md#requirement-ctx-003-одна-активная-очередь); статусы доказательств — пункт 14 [общего профиля](specs/engineering-governance/reference/python-common.md#проверки-и-сопровождение).
+    - Точка продолжения и следующий шаг — [CTX-006](specs/project-context/spec.md#requirement-ctx-006-автоматическая-суммаризация-и-восстановление).
