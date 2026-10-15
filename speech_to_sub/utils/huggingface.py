@@ -313,7 +313,7 @@ def _load_remote_model_info(
             "Для загрузки модели требуется huggingface_hub."
         ) from exc
     except Exception as exc:
-        _raise_hub_access_error(exc, repo_id)
+        raise _hub_access_error(exc, repo_id) from exc
 
 
 def _download_snapshot(
@@ -593,14 +593,14 @@ def _validate_download_options(
         )
 
 
-def _raise_hub_access_error(exc: Exception, repo_id: str) -> None:
+def _hub_access_error(exc: Exception, repo_id: str) -> ModelDownloadError:
     if _is_repository_error(exc):
-        raise ModelRepositoryUnavailableError(
+        return ModelRepositoryUnavailableError(
             f"Репозиторий модели или его ревизия недоступны: {repo_id}"
-        ) from exc
-    raise ModelNetworkError(
+        )
+    return ModelNetworkError(
         f"Не удалось получить сведения о модели из Hugging Face Hub: {repo_id}"
-    ) from exc
+    )
 
 
 def _is_repository_error(exc: Exception) -> bool:

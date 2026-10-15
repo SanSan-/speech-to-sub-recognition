@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Literal
 
 from speech_to_sub.constants import MAX_BATCH_PATHS, SUPPORTED_MEDIA_EXTENSIONS
 from speech_to_sub.utils.io_utils import is_link_or_junction
+
+logger = logging.getLogger(__name__)
 
 
 class PickerError(RuntimeError):
@@ -292,4 +296,4 @@ def _report_progress(
     try:
         callback(event)
     except Exception:
-        return
+        logger.exception("Не удалось передать прогресс выбора медиафайлов.")

@@ -7,14 +7,13 @@ import pytest
 
 from speech_to_sub.asr.parakeet_tdt import (
     ParakeetTdtBackend,
-    _Window,
     _group_subword_tokens,
     _merge_window_segments,
     _tokens_to_words,
+    _Window,
 )
 from speech_to_sub.exceptions import ProcessingCancelled
 from speech_to_sub.models import ProcessingSettings, TranscriptSegment, TranscriptWord
-
 
 RUNTIME = {
     "backend": "parakeet-tdt-v3",

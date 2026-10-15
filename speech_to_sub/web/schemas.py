@@ -142,9 +142,8 @@ class ProcessingSettingsPayload(ApiModel):
             raise ValueError("Перекрытие должно быть короче половины окна распознавания.")
         if self.long_form_overlap_seconds >= self.long_form_window_seconds:
             raise ValueError("Long-form overlap должен быть короче основного окна.")
-        if self.aligner == "qwen3-forced-aligner":
-            if not self.aligner_model_path:
-                raise ValueError("Для Qwen3 ForcedAligner требуется путь к модели.")
+        if self.aligner == "qwen3-forced-aligner" and not self.aligner_model_path:
+            raise ValueError("Для Qwen3 ForcedAligner требуется путь к модели.")
         return self
 
 

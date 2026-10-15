@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 PREPARATION_LOG_LIMIT = 100
@@ -172,7 +172,7 @@ def _monotonic_counter(current: object, incoming: int) -> int:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 __all__ = ["PreparationTracker"]

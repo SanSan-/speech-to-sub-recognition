@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any, cast
 
 from speech_to_sub.asr.base import AsrBackend
 from speech_to_sub.exceptions import AsrModelError, ValidationError
+
+logger = logging.getLogger(__name__)
 
 BackendFactory = Callable[[], AsrBackend]
 FactoryReference = str | BackendFactory
@@ -87,6 +90,7 @@ def unload_backends() -> None:
             try:
                 backend.unload()
             except Exception as exc:  # pragma: no cover - защитный барьер выгрузки
+                logger.exception("Не удалось выгрузить ASR backend.")
                 if first_error is None:
                     first_error = exc
         _ACTIVE_BACKEND_ID = None

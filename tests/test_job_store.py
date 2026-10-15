@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from speech_to_sub.web.job_store import RECOVERY_ERROR, SCHEMA_VERSION, SQLiteJobStore
@@ -53,7 +53,7 @@ def test_roundtrip_unicode_snapshot_items_events_and_restart(tmp_path: Path) -> 
         "status": "partial",
         "active": False,
         "terminal": True,
-        "created_at": datetime(2026, 8, 8, 9, 30, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 8, 8, 9, 30, tzinfo=UTC),
         "updated_at": "2026-08-08T12:31:00+03:00",
         "completed_at": 1_754_645_460,
         "latest_event_id": 3,

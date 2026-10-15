@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, TypedDict
+from typing import Any, Literal, TypedDict
 
 from speech_to_sub.constants import (
     CLOUD_ASR_BACKENDS,
-    DEFAULT_ASR_BACKEND,
     DEFAULT_ALIGNER,
+    DEFAULT_ASR_BACKEND,
     DEFAULT_AUDIO_LANGUAGE,
     DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_BEAM_SIZE,

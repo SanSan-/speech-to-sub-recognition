@@ -60,7 +60,10 @@ class QwenAlignerWorkerRuntime:
             raise FileNotFoundError(f"Аудиофайл для ForcedAligner не найден: {audio_path}")
         model_path = self._request_model_path(payload)
         waveform = self._normalized_audio(audio_path)
-        segments = _request_segments(payload.get("segments"), len(waveform) / _SAMPLE_RATE)
+        try:
+            segments = _request_segments(payload.get("segments"), len(waveform) / _SAMPLE_RATE)
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
         self._ensure_loaded(model_path, str(payload.get("device") or "auto"))
         aligned = self._align_segments(waveform, segments, progress_callback)
         assert self._runtime is not None
@@ -166,11 +169,11 @@ def main() -> int:
 
 def _request_segments(value: Any, audio_duration: float) -> list[dict[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise ValueError("ForcedAligner не получил список ASR-сегментов.")
+        raise TypeError("ForcedAligner не получил список ASR-сегментов.")
     result: list[dict[str, Any]] = []
     for index, raw in enumerate(value):
         if not isinstance(raw, Mapping):
-            raise ValueError(f"Некорректный ASR-сегмент {index}.")
+            raise TypeError(f"Некорректный ASR-сегмент {index}.")
         segment = _request_segment(raw, index, audio_duration)
         if segment["text"]:
             result.append(segment)

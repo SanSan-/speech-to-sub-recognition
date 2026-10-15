@@ -7,13 +7,22 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Protocol
 
 from speech_to_sub.constants import SubtitleFormat
 from speech_to_sub.web.job_store import SQLiteJobStore
+
+logger = logging.getLogger(__name__)
+# Ошибки самого обработчика не направляются обратно в обработчики root.
+queue_error_logger = logging.getLogger(f"{__name__}.queue_errors")
+queue_error_logger.propagate = False
+queue_error_logger.setLevel(logging.ERROR)
+if not queue_error_logger.handlers:
+    queue_error_logger.addHandler(logging.StreamHandler())
 
 LOG_HISTORY_LIMIT = 250
 EVENT_HISTORY_LIMIT = 2_000
@@ -82,7 +91,8 @@ class QueueLogHandler(logging.Handler):
         try:
             self._emit_event({"type": "log", "message": self.format(record)})
         except Exception:
-            self.handleError(record)
+            if logging.raiseExceptions:
+                queue_error_logger.exception("Не удалось передать запись журнала подписчикам задачи.")
 
 
 @dataclass
@@ -149,6 +159,7 @@ class BatchJob:
                     self.persist_snapshot(snapshot, ((event_id, normalized),))
                 except Exception as exc:
                     self.persistence_error = str(exc) or exc.__class__.__name__
+                    logger.exception("Не удалось сохранить состояние задачи в SQLite.")
             self.condition.notify_all()
             return event_id
 
@@ -581,7 +592,7 @@ class JobRegistry:
                 )
             else:
                 unhandled_error = str(exc) or exc.__class__.__name__
-                logger.exception("Пакетная обработка завершилась с ошибкой: %s", exc)
+                logger.exception("Пакетная обработка завершилась с ошибкой.")
                 _mark_unresolved_files(job, unhandled_error)
         finally:
             terminal = _build_terminal_event(job, unhandled_error, terminal_hint)
@@ -987,7 +998,7 @@ def _epoch_to_utc(value: float | None) -> str | None:
     if value is None:
         return None
     return (
-        datetime.fromtimestamp(value, timezone.utc)
+        datetime.fromtimestamp(value, UTC)
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import sys
-import traceback
 from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any, Protocol
 
 from speech_to_sub.asr.external_worker import decode_frame, encode_frame
+
+logger = logging.getLogger(__name__)
 
 WorkerProgressCallback = Callable[[int], None]
 WorkerAction = Callable[
@@ -60,7 +62,7 @@ def handle_worker_request(
         )
         return {"id": request_id, "ok": True, "result": result}, should_stop
     except Exception as exc:
-        traceback.print_exc(file=sys.stderr)
+        logger.exception("Ошибка выполнения команды worker-а.")
         return {
             "id": request_id,
             "ok": False,

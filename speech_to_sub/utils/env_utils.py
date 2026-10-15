@@ -5,12 +5,12 @@ import math
 import os
 from pathlib import Path
 
-from speech_to_sub.asr.registry import backend_names
 from speech_to_sub.alignment.registry import aligner_names
+from speech_to_sub.asr.registry import backend_names
 from speech_to_sub.constants import (
     CLOUD_ASR_BACKENDS,
-    DEFAULT_ASR_BACKEND,
     DEFAULT_ALIGNER,
+    DEFAULT_ASR_BACKEND,
     DEFAULT_AUDIO_LANGUAGE,
     DEFAULT_BACKEND_MODEL_PATHS,
     DEFAULT_BEAM_SIZE,

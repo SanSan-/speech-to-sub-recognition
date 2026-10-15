@@ -11,9 +11,9 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Never, TextIO
+from typing import Any, Never, TextIO
 
 from speech_to_sub.exceptions import AsrModelError, ProcessingCancelled
 
@@ -432,9 +432,9 @@ def _normalize_progress(value: Any) -> int:
 
 
 __all__ = [
+    "PROTOCOL_PREFIX",
     "ExternalWorkerError",
     "PersistentNdjsonWorker",
-    "PROTOCOL_PREFIX",
     "decode_frame",
     "encode_frame",
 ]

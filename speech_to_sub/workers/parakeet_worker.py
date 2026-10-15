@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import gc
 import importlib.metadata
+import logging
 import os
 import site
 import sys
-import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from speech_to_sub.asr.external_worker import decode_frame, encode_frame
+
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -142,7 +144,7 @@ def handle_request(
             raise ValueError(f"Неизвестная команда Parakeet worker-а: {command or '?'}")
         return {"id": request_id, "ok": True, "result": result}, command == "shutdown"
     except Exception as exc:
-        traceback.print_exc(file=sys.stderr)
+        logger.exception("Ошибка выполнения команды worker-а.")
         return {
             "id": request_id,
             "ok": False,

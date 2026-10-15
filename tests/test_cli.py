@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
-from speech_to_sub import __version__
-from speech_to_sub import cli
+from speech_to_sub import __version__, cli, service
 from speech_to_sub.constants import (
     DEFAULT_QWEN_ALIGNER_MODEL_PATH,
     DEFAULT_QWEN_MODEL_PATH,
 )
 from speech_to_sub.exceptions import ValidationError
-from speech_to_sub.models import ProcessingSettings
+from speech_to_sub.models import FileResult, ProcessingSettings
 
 
 def test_cli_reports_package_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -204,6 +205,63 @@ def test_cli_selects_openai_with_explicit_cloud_permission(
     assert received["backend"] == "openai-api"
     assert received["allow_cloud_processing"] is True
     assert received["openai_model"] == "whisper-1"
+
+
+@pytest.mark.parametrize("consent_source", ["environment", "dotenv"])
+@pytest.mark.parametrize("force", [False, True])
+def test_cli_requires_fresh_cloud_consent_on_each_invocation(
+    consent_source: str,
+    force: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setting_names = {
+        "ASR_BACKEND", "ASR_ALLOW_CLOUD_PROCESSING", "OPENAI_TRANSCRIPTION_MODEL",
+    }
+    for name in set(os.environ) | setting_names:
+        if name.startswith(("ASR_", "OPENAI_")):
+            monkeypatch.setenv(name, "")
+            monkeypatch.delenv(name)
+    monkeypatch.chdir(tmp_path)
+    cloud_environment = {
+        "ASR_BACKEND": "openai-api",
+        "ASR_ALLOW_CLOUD_PROCESSING": "true",
+        "OPENAI_TRANSCRIPTION_MODEL": "whisper-1",
+    }
+    if consent_source == "environment":
+        for name, value in cloud_environment.items():
+            monkeypatch.setenv(name, value)
+    else:
+        (tmp_path / ".env").write_text(
+            "".join(f"{name}={value}\n" for name, value in cloud_environment.items()),
+            encoding="utf-8",
+        )
+    media = tmp_path / "sample.mp4"
+    media.write_bytes(b"test-media")
+    logger = logging.getLogger("speech-to-sub-cli-tests")
+    monkeypatch.setattr(cli, "setup_logging", lambda _verbose: logger)
+    monkeypatch.setattr(service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(service, "_command_exists", lambda _command: True)
+    discovery = Mock(wraps=service.discover_media_resilient)
+    processing = Mock(return_value=(FileResult(input_path=media, state="done"), None))
+    monkeypatch.setattr(service, "discover_media_resilient", discovery)
+    monkeypatch.setattr(service, "_process_one", processing)
+    arguments = ["--input", str(media)]
+    if force:
+        arguments.append("--force")
+
+    assert cli.main([*arguments, "--allow-cloud-processing"]) == 0
+    assert processing.call_count == discovery.call_count == 1
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        assert cli.main(arguments) == 1
+
+    assert "явного разрешения" in caplog.text
+    assert processing.call_count == discovery.call_count == 1
+    assert os.environ["ASR_ALLOW_CLOUD_PROCESSING"] == "true"
+    assert cli.main([*arguments, "--allow-cloud-processing"]) == 0
+    assert processing.call_count == discovery.call_count == 2
 
 
 def test_parser_returns_configuration_code_for_invalid_invocation(

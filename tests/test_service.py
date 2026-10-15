@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from filelock import FileLock
 
 from speech_to_sub import service
+from speech_to_sub.asr.external_worker import PersistentNdjsonWorker
 from speech_to_sub.constants import SubtitleFormat
 from speech_to_sub.exceptions import MediaError, ValidationError
 from speech_to_sub.models import (
     AudioStreamInfo,
     MediaProbe,
+    OutputPaths,
     ProcessingSettings,
     RuntimeSignature,
     Transcript,
@@ -23,8 +27,7 @@ from speech_to_sub.models import (
     TranscriptWord,
 )
 from speech_to_sub.subtitles.validator import parse_ass, parse_srt, parse_vtt
-from speech_to_sub.utils import io_utils
-
+from speech_to_sub.utils import cache, huggingface, io_utils
 
 TEST_ENGINE_VERSION = "test-engine-1"
 
@@ -1326,9 +1329,11 @@ def test_layout_diagnostics_log_contains_only_nonzero_events() -> None:
     )
 
     assert messages == [
-        "лекция.mp4: разметка субтитров — восстановлены текст и пунктуация сегментов: 2; "
-        "перенесены фрагменты с аномальными начальными метками: 1; "
-        "скорректированы временные границы реплик: 3; максимальный сдвиг границы, мс: 120."
+        (
+            "лекция.mp4: разметка субтитров — восстановлены текст и пунктуация сегментов: 2; "
+            "перенесены фрагменты с аномальными начальными метками: 1; "
+            "скорректированы временные границы реплик: 3; максимальный сдвиг границы, мс: 120."
+        )
     ]
 
 
@@ -1420,9 +1425,12 @@ def test_service_runs_exclusive_alignment_as_independent_stage(
     monkeypatch.setattr(service, "get_aligner", lambda _name: aligner)
 
     messages: list[str] = []
+    aligner_python = tmp_path / "aligner-python.exe"
+    aligner_python.write_bytes(b"synthetic-python")
     settings = {
         "backend": "faster-whisper",
         "aligner": "qwen3-forced-aligner",
+        "aligner_worker_python_path": str(aligner_python),
         "aligner_model_path": str(tmp_path / "aligner"),
         "language": "ru",
     }
@@ -1661,6 +1669,46 @@ def test_cache_miss_prepares_model_in_the_configured_directory(
     )
     assert any(event.get("state") == "downloading" for event in events)
     assert "unit-test-hf-token" not in "\n".join(messages)
+
+
+def test_model_download_error_keeps_token_out_of_verbose_service_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    media = tmp_path / "download-error.mp4"
+    media.write_bytes(b"source")
+    _install_fast_runtime(monkeypatch, tmp_path)
+    marker = "unit-test-private-hf-token"
+    monkeypatch.setenv("HF_TOKEN", marker)
+
+    class Api:
+        def model_info(self, **kwargs: Any) -> Any:
+            assert kwargs["token"] == marker
+            raise TimeoutError(marker)
+
+    monkeypatch.setattr(huggingface, "_create_hf_api", Api)
+    events: list[dict[str, Any]] = []
+    messages: list[str] = []
+
+    with caplog.at_level(logging.DEBUG, logger=service.__name__):
+        [result] = service.process_paths(
+            [media],
+            {
+                "backend": "faster-whisper",
+                "model_path": str(tmp_path / "model"),
+                "verbose": True,
+            },
+            events.append,
+            messages.append,
+        )
+
+    assert result["state"] == "error"
+    assert "Hugging Face Hub" in result["error"]
+    assert any(event.get("state") == "error" for event in events)
+    assert marker not in json.dumps([result, events, messages], ensure_ascii=False)
+    assert marker not in caplog.text
+    assert result["error"] in caplog.text
 
 
 def test_existing_srt_is_skipped_unless_force_is_enabled(
@@ -2342,3 +2390,662 @@ def test_old_v2_srt_layout_without_format_remains_full_cache_hit(
 
     assert cached["state"] == "cached"
     assert len(backend.calls) == 1
+
+
+
+def _seed_cache_formats(
+    media: Path,
+    backend: FakeBackend,
+    formats: tuple[SubtitleFormat, ...] = tuple(SubtitleFormat),
+) -> dict[SubtitleFormat, OutputPaths]:
+    outputs_by_format: dict[SubtitleFormat, OutputPaths] = {}
+    for output_format in formats:
+        [result] = service.process_paths(
+            [media],
+            {
+                "language": "ru",
+                "output_format": output_format.value,
+                "keep_audio": True,
+            },
+            lambda _event: None,
+            lambda _message: None,
+            backend=backend,
+        )
+        assert result["state"] == "done"
+        outputs_by_format[output_format] = service.build_output_paths(
+            media,
+            ProcessingSettings(language="ru", output_format=output_format),
+        )
+    return outputs_by_format
+
+
+def _snapshot_cache_artifacts(
+    outputs_by_format: dict[SubtitleFormat, OutputPaths],
+) -> dict[Path, bytes]:
+    return {
+        path: path.read_bytes()
+        for outputs in outputs_by_format.values()
+        for path in (
+            outputs.subtitle_path,
+            outputs.sidecar_path,
+            outputs.normalized_audio_path,
+        )
+        if path.is_file()
+    }
+
+
+def _forbid_cached_artifact_publication(*_args: Any, **_kwargs: Any) -> None:
+    raise AssertionError("Отклонённый кеш не разрешает пересборку и публикацию")
+
+
+@pytest.mark.parametrize("output_format", tuple(SubtitleFormat))
+@pytest.mark.parametrize("has_subtitle", (False, True))
+@pytest.mark.parametrize("keep_audio", (False, True))
+def test_oversized_cache_preserves_selected_and_neighbor_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: SubtitleFormat,
+    has_subtitle: bool,
+    keep_audio: bool,
+) -> None:
+    media = tmp_path / "preserve-cache.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    outputs_by_format = _seed_cache_formats(media, backend)
+    selected = outputs_by_format[output_format]
+    if not has_subtitle:
+        selected.subtitle_path.unlink()
+    limit = max(
+        outputs.sidecar_path.stat().st_size
+        for outputs in outputs_by_format.values()
+    ) + 32
+    selected.sidecar_path.write_bytes(b"{}" + b" " * (limit - 1))
+    before = _snapshot_cache_artifacts(outputs_by_format)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit, raising=False)
+    monkeypatch.setattr(
+        service, "_build_subtitle_artifacts", _forbid_cached_artifact_publication
+    )
+    monkeypatch.setattr(
+        service, "_publish_artifacts", _forbid_cached_artifact_publication
+    )
+    backend.calls.clear()
+    normalized_sources.clear()
+    events: list[dict[str, Any]] = []
+    messages: list[str] = []
+
+    [result] = service.process_paths(
+        [media],
+        {
+            "language": "ru",
+            "output_format": output_format.value,
+            "keep_audio": keep_audio,
+        },
+        events.append,
+        messages.append,
+        backend=backend,
+    )
+
+    assert result["state"] == "skipped"
+    assert result["skipped"] is True
+    assert result["subtitle_output"] == (
+        str(selected.subtitle_path) if has_subtitle else None
+    )
+    assert result["srt_output"] == (
+        str(selected.subtitle_path)
+        if has_subtitle and output_format is SubtitleFormat.SRT
+        else None
+    )
+    assert selected.subtitle_path.exists() is has_subtitle
+    assert _snapshot_cache_artifacts(outputs_by_format) == before
+    assert backend.calls == []
+    assert normalized_sources == []
+    if not has_subtitle:
+        assert all(event.get("subtitle_output") is None for event in events)
+    assert any(
+        "кеш" in message.casefold()
+        and "превышает" in message.casefold()
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize("output_format", tuple(SubtitleFormat))
+@pytest.mark.parametrize("keep_audio", (False, True))
+def test_oversized_neighbor_preserves_selected_audio_without_subtitles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: SubtitleFormat,
+    keep_audio: bool,
+) -> None:
+    media = tmp_path / "leftover-audio.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    selected = service.build_output_paths(
+        media, ProcessingSettings(language="ru", output_format=output_format)
+    )
+    neighbor_format = next(
+        candidate for candidate in SubtitleFormat if candidate is not output_format
+    )
+    neighbor = service.build_output_paths(
+        media, ProcessingSettings(language="ru", output_format=neighbor_format)
+    )
+    selected.normalized_audio_path.write_bytes(b"previous-selected-audio")
+    neighbor.sidecar_path.write_bytes(b"{}" + b" " * 63)
+    neighbor.subtitle_path.write_bytes(b"previous-neighbor-subtitles")
+    outputs_by_format = {output_format: selected, neighbor_format: neighbor}
+    before = _snapshot_cache_artifacts(outputs_by_format)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", 64, raising=False)
+    monkeypatch.setattr(
+        service, "_build_subtitle_artifacts", _forbid_cached_artifact_publication
+    )
+    monkeypatch.setattr(
+        service, "_publish_artifacts", _forbid_cached_artifact_publication
+    )
+
+    [result] = service.process_paths(
+        [media],
+        {
+            "language": "ru",
+            "output_format": output_format.value,
+            "keep_audio": keep_audio,
+        },
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "skipped"
+    assert result["subtitle_output"] is None
+    assert result["srt_output"] is None
+    assert not selected.subtitle_path.exists()
+    assert not selected.sidecar_path.exists()
+    assert _snapshot_cache_artifacts(outputs_by_format) == before
+    assert backend.calls == []
+    assert normalized_sources == []
+
+
+def test_oversized_neighbor_allows_next_valid_cache_for_empty_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "next-cache.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    neighbors = _seed_cache_formats(
+        media, backend, (SubtitleFormat.SRT, SubtitleFormat.ASS)
+    )
+    limit = max(
+        outputs.sidecar_path.stat().st_size for outputs in neighbors.values()
+    ) + 32
+    neighbors[SubtitleFormat.SRT].sidecar_path.write_bytes(
+        b"{}" + b" " * (limit - 1)
+    )
+    before = _snapshot_cache_artifacts(neighbors)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit)
+    read_paths: list[Path] = []
+    original_read = service.read_sidecar
+
+    def counted_read(path: Path) -> Any:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(service, "read_sidecar", counted_read)
+    backend.calls.clear()
+    normalized_sources.clear()
+
+    [result] = service.process_paths(
+        [media],
+        {"language": "ru", "output_format": "vtt"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "done"
+    assert parse_vtt(Path(result["subtitle_output"]).read_text(encoding="utf-8"))
+    assert _snapshot_cache_artifacts(neighbors) == before
+    assert backend.calls == []
+    assert normalized_sources == []
+    for outputs in neighbors.values():
+        assert read_paths.count(outputs.sidecar_path) == 1
+
+
+def test_oversized_neighbor_without_valid_cache_allows_new_recognition_and_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "01-no-valid-cache.mp4"
+    following = tmp_path / "02-following.mp4"
+    media.write_bytes(b"source")
+    following.write_bytes(b"following")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    neighbor = service.build_output_paths(
+        media, ProcessingSettings(language="ru", output_format=SubtitleFormat.SRT)
+    )
+    neighbor.sidecar_path.write_bytes(b"{}" + b" " * 63)
+    neighbor.subtitle_path.write_bytes(b"previous-neighbor-subtitles")
+    neighbor.normalized_audio_path.write_bytes(b"previous-neighbor-audio")
+    neighbors = {SubtitleFormat.SRT: neighbor}
+    before = _snapshot_cache_artifacts(neighbors)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", 64, raising=False)
+
+    results = service.process_paths(
+        [media, following],
+        {"language": "ru", "output_format": "vtt"},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert [result["state"] for result in results] == ["done", "done"]
+    assert all(Path(result["subtitle_output"]).is_file() for result in results)
+    assert _snapshot_cache_artifacts(neighbors) == before
+    assert normalized_sources == [media.resolve(), following.resolve()]
+    assert len(backend.calls) == 2
+
+
+def test_oversized_selected_cache_does_not_interrupt_following_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "01-oversized.mp4"
+    following = tmp_path / "02-following.mp4"
+    media.write_bytes(b"source")
+    following.write_bytes(b"following")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    selected = service.build_output_paths(media, ProcessingSettings(language="ru"))
+    selected.sidecar_path.write_bytes(b"{}" + b" " * 63)
+    selected.normalized_audio_path.write_bytes(b"previous-audio")
+    outputs = {SubtitleFormat.SRT: selected}
+    before = _snapshot_cache_artifacts(outputs)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", 64, raising=False)
+
+    results = service.process_paths(
+        [media, following],
+        {"language": "ru", "keep_audio": True},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert [result["state"] for result in results] == ["skipped", "done"]
+    assert results[0]["subtitle_output"] is None
+    assert _snapshot_cache_artifacts(outputs) == before
+    assert normalized_sources == [following.resolve()]
+    assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize("output_format", tuple(SubtitleFormat))
+@pytest.mark.parametrize("has_empty_audio", (False, True))
+def test_late_oversized_cache_preserves_results_before_audio_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: SubtitleFormat,
+    has_empty_audio: bool,
+) -> None:
+    media = tmp_path / "01-growing-cache.mp4"
+    following = tmp_path / "02-following.mp4"
+    media.write_bytes(b"source")
+    following.write_bytes(b"following")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    options = {"language": "ru", "output_format": output_format.value}
+    [first] = service.process_paths(
+        [media],
+        options,
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+    selected = service.build_output_paths(
+        media, ProcessingSettings(language="ru", output_format=output_format)
+    )
+    if has_empty_audio:
+        selected.normalized_audio_path.write_bytes(b"")
+    subtitle_bytes = selected.subtitle_path.read_bytes()
+    initial_sidecar = selected.sidecar_path.read_bytes()
+    limit = len(initial_sidecar) + 32
+    grown_sidecar = initial_sidecar + b" " * 33
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit, raising=False)
+    original_normalize = service.normalize_audio
+    original_publish = service._publish_artifacts
+    published_subtitles: list[Path] = []
+
+    def grow_cache_during_normalization(
+        source: str | Path, *args: Any, **kwargs: Any
+    ) -> Path:
+        if Path(source) == media.resolve():
+            selected.sidecar_path.write_bytes(grown_sidecar)
+        return original_normalize(source, *args, **kwargs)
+
+    def record_publication(outputs: OutputPaths, **kwargs: Any) -> None:
+        published_subtitles.append(outputs.subtitle_path)
+        original_publish(outputs, **kwargs)
+
+    monkeypatch.setattr(service, "normalize_audio", grow_cache_during_normalization)
+    monkeypatch.setattr(service, "_publish_artifacts", record_publication)
+    backend.calls.clear()
+    normalized_sources.clear()
+    events: list[dict[str, Any]] = []
+
+    results = service.process_paths(
+        [media, following],
+        {**options, "keep_audio": True},
+        events.append,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert first["state"] == "done"
+    assert [result["state"] for result in results] == ["error", "done"]
+    assert results[0]["audio_output"] is None
+    assert results[0]["error"]
+    assert selected.subtitle_path.read_bytes() == subtitle_bytes
+    assert selected.sidecar_path.read_bytes() == grown_sidecar
+    assert selected.normalized_audio_path.exists() is has_empty_audio
+    if has_empty_audio:
+        assert selected.normalized_audio_path.read_bytes() == b""
+    assert selected.subtitle_path not in published_subtitles
+    assert len(published_subtitles) == 1
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve(), following.resolve()]
+    assert all(
+        event.get("audio_output") is None
+        for event in events
+        if event.get("path") == str(media.resolve())
+    )
+
+
+@pytest.mark.parametrize("output_format", tuple(SubtitleFormat))
+def test_force_bypasses_oversized_cache_reader_and_preserves_neighbors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: SubtitleFormat,
+) -> None:
+    media = tmp_path / "force-oversized.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    outputs_by_format = _seed_cache_formats(media, backend)
+    selected = outputs_by_format[output_format]
+    selected.sidecar_path.write_bytes(b"{}" + b" " * 63)
+    selected.subtitle_path.write_bytes(b"previous-selected-subtitle")
+    selected.normalized_audio_path.write_bytes(b"previous-selected-audio")
+    before = _snapshot_cache_artifacts(
+        {
+            candidate: outputs
+            for candidate, outputs in outputs_by_format.items()
+            if candidate is not output_format
+        }
+    )
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", 64, raising=False)
+
+    def forbidden_read(_path: Path) -> Any:
+        raise AssertionError("force не должен читать прежний sidecar")
+
+    monkeypatch.setattr(service, "read_sidecar", forbidden_read)
+    backend.calls.clear()
+    normalized_sources.clear()
+
+    [result] = service.process_paths(
+        [media],
+        {
+            "language": "ru",
+            "output_format": output_format.value,
+            "keep_audio": True,
+            "force": True,
+        },
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "done"
+    assert selected.subtitle_path.read_bytes() != b"previous-selected-subtitle"
+    assert selected.normalized_audio_path.read_bytes() == b"normalized-audio"
+    assert (
+        json.loads(selected.sidecar_path.read_text(encoding="utf-8"))["status"]
+        == "done"
+    )
+    assert {path: path.read_bytes() for path in before} == before
+    assert normalized_sources == [media.resolve()]
+    assert len(backend.calls) == 1
+
+
+def test_valid_selected_cache_is_read_once_without_inspecting_oversized_neighbor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "confirmed-cache.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    outputs_by_format = _seed_cache_formats(
+        media, backend, (SubtitleFormat.SRT, SubtitleFormat.ASS)
+    )
+    selected = outputs_by_format[SubtitleFormat.SRT]
+    neighbor = outputs_by_format[SubtitleFormat.ASS]
+    limit = selected.sidecar_path.stat().st_size + 32
+    neighbor.sidecar_path.write_bytes(b"{}" + b" " * (limit - 1))
+    before = _snapshot_cache_artifacts(outputs_by_format)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit)
+    read_paths: list[Path] = []
+    original_read = service.read_sidecar
+
+    def counted_read(path: Path) -> Any:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(service, "read_sidecar", counted_read)
+    normalized_sources.clear()
+    backend.calls.clear()
+
+    [result] = service.process_paths(
+        [media],
+        {"language": "ru", "keep_audio": True},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "cached"
+    assert read_paths == [selected.sidecar_path]
+    assert normalized_sources == []
+    assert backend.calls == []
+    assert _snapshot_cache_artifacts(outputs_by_format) == before
+
+
+
+def test_oversized_cache_is_rejected_without_runtime_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = tmp_path / "unknown-runtime.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    monkeypatch.setattr(backend, "expected_runtime_signature", lambda _settings: None)
+    selected = service.build_output_paths(media, ProcessingSettings(language="ru"))
+    selected.sidecar_path.write_bytes(b"{}" + b" " * 63)
+    selected.normalized_audio_path.write_bytes(b"previous-audio")
+    outputs_by_format = {SubtitleFormat.SRT: selected}
+    before = _snapshot_cache_artifacts(outputs_by_format)
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", 64)
+    monkeypatch.setattr(
+        service, "_publish_artifacts", _forbid_cached_artifact_publication
+    )
+
+    [result] = service.process_paths(
+        [media],
+        {"language": "ru", "keep_audio": True},
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "skipped"
+    assert result["subtitle_output"] is None
+    assert _snapshot_cache_artifacts(outputs_by_format) == before
+    assert backend.calls == []
+    assert normalized_sources == []
+
+
+@pytest.mark.parametrize(
+    ("backend_id", "aligner_id", "python_field"),
+    [
+        ("qwen3-asr", "none", "worker_python_path"),
+        ("parakeet-tdt-v3", "none", "worker_python_path"),
+        ("transformers", "qwen3-forced-aligner", "aligner_worker_python_path"),
+        ("parakeet-tdt-v3", "qwen3-forced-aligner", "worker_python_path"),
+        ("parakeet-tdt-v3", "qwen3-forced-aligner", "aligner_worker_python_path"),
+    ],
+)
+@pytest.mark.parametrize("path_kind", ["missing", "directory"])
+@pytest.mark.parametrize("force", [False, True])
+def test_service_rejects_selected_worker_python_before_media(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_id: str,
+    aligner_id: str,
+    python_field: str,
+    path_kind: str,
+    force: bool,
+) -> None:
+    media = tmp_path / "isolated.mp4"
+    media.write_bytes(b"source")
+    asr_python = tmp_path / "asr-python.exe"
+    aligner_python = tmp_path / "aligner-python.exe"
+    asr_python.write_bytes(b"synthetic-asr-python")
+    aligner_python.write_bytes(b"synthetic-aligner-python")
+    invalid_python = tmp_path / "invalid-python.exe"
+    if path_kind == "directory":
+        invalid_python.mkdir()
+    for suffix in (".ru.srt", ".ru.asr.json", ".ru.asr.flac", ".ru.ass"):
+        media.with_name(media.stem + suffix).write_bytes(b"previous-result")
+    before = {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+    settings = {
+        "backend": backend_id,
+        "aligner": aligner_id,
+        "model_path": str(tmp_path / "missing-model"),
+        "aligner_model_path": str(tmp_path / "missing-aligner"),
+        "language": "ru",
+        "force": force,
+        "worker_python_path": str(asr_python),
+        "aligner_worker_python_path": str(aligner_python),
+        python_field: str(invalid_python),
+    }
+    blocked = Mock(side_effect=AssertionError("Отказ должен предшествовать обработке медиа"))
+    monkeypatch.setattr(service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(service, "_command_exists", lambda _command: True)
+    for name in ("probe_media", "normalize_audio", "ensure_huggingface_model", "_publish_artifacts"):
+        monkeypatch.setattr(service, name, blocked)
+    monkeypatch.setattr(PersistentNdjsonWorker, "__init__", blocked)
+    events: list[dict[str, Any]] = []
+
+    with pytest.raises(ValidationError, match="Python") as error:
+        service.process_paths([media], settings, events.append, lambda _message: None)
+
+    assert str(invalid_python) in str(error.value)
+    blocked.assert_not_called()
+    assert events == []
+    assert not (tmp_path / "work").exists()
+    assert {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == before
+
+
+@pytest.mark.parametrize("backend_id", ["transformers", "faster-whisper"])
+def test_service_ignores_unselected_worker_python_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_id: str,
+) -> None:
+    media = tmp_path / "local.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    backend.backend_id = backend_id
+    missing_python = tmp_path / "unused-python.exe"
+    for variable in ("QWEN_ASR_PYTHON", "PARAKEET_ASR_PYTHON", "ASR_ALIGNER_WORKER_PYTHON"):
+        monkeypatch.setenv(variable, str(missing_python))
+    blocked = Mock(side_effect=AssertionError("Невыбранная среда не должна запускаться"))
+    monkeypatch.setattr(PersistentNdjsonWorker, "__init__", blocked)
+    monkeypatch.setattr(service, "ensure_huggingface_model", blocked)
+    monkeypatch.setattr(backend, "preflight", blocked)
+
+    [result] = service.process_paths(
+        [media],
+        {
+            "backend": backend_id,
+            "aligner": "none",
+            "worker_python_path": str(missing_python),
+            "aligner_worker_python_path": str(missing_python),
+            "language": "ru",
+        },
+        lambda _event: None,
+        lambda _message: None,
+        backend=backend,
+    )
+
+    assert result["state"] == "done"
+    assert Path(result["subtitle_output"]).is_file()
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+    blocked.assert_not_called()
+
+
+@pytest.mark.parametrize("backend_id", ["qwen3-asr", "parakeet-tdt-v3"])
+def test_service_selected_worker_python_preserves_compatible_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_id: str,
+) -> None:
+    media = tmp_path / "cached-isolated.mp4"
+    media.write_bytes(b"source")
+    normalized_sources = _install_fast_runtime(monkeypatch, tmp_path)
+    backend = FakeBackend()
+    backend.backend_id = backend_id
+    monkeypatch.setattr(service, "get_backend", lambda _name: backend)
+    python_path = tmp_path / "selected runtime" / "python.exe"
+    python_path.parent.mkdir()
+    python_path.write_bytes(b"synthetic-python")
+    missing_python = tmp_path / "unused-python.exe"
+    for variable in ("QWEN_ASR_PYTHON", "PARAKEET_ASR_PYTHON", "ASR_ALIGNER_WORKER_PYTHON"):
+        monkeypatch.setenv(variable, str(missing_python))
+    blocked = Mock(side_effect=AssertionError("Проверка Python не должна подготавливать модель"))
+    monkeypatch.setattr(PersistentNdjsonWorker, "__init__", blocked)
+    monkeypatch.setattr(service, "ensure_huggingface_model", blocked)
+    monkeypatch.setattr(service, "activate_backend", blocked)
+    monkeypatch.setattr(backend, "preflight", blocked)
+    settings = {
+        "backend": backend_id,
+        "aligner": "none",
+        "worker_python_path": str(python_path),
+        "aligner_worker_python_path": str(missing_python),
+        "model_path": str(tmp_path / "missing-model"),
+        "language": "ru",
+        "keep_audio": True,
+    }
+
+    [created] = service.process_paths(
+        [media], settings, lambda _event: None, lambda _message: None, backend=backend,
+    )
+    outputs = {
+        SubtitleFormat.SRT: service.build_output_paths(
+            media, ProcessingSettings.from_mapping(settings),
+        )
+    }
+    before = _snapshot_cache_artifacts(outputs)
+    [cached] = service.process_paths(
+        [media], settings, lambda _event: None, lambda _message: None,
+    )
+
+    assert created["state"] == "done"
+    assert cached["state"] == "cached"
+    assert len(backend.calls) == 1
+    assert normalized_sources == [media.resolve()]
+    assert _snapshot_cache_artifacts(outputs) == before
+    assert not (tmp_path / "missing-model").exists()
+    blocked.assert_not_called()

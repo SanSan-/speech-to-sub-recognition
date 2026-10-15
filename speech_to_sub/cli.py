@@ -4,8 +4,8 @@ import argparse
 import logging
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from speech_to_sub import __version__
 from speech_to_sub.alignment.registry import aligner_names
@@ -68,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-cloud-processing",
         action="store_true",
-        default=None,
-        help="Разрешить передачу аудио выбранному облачному сервису.",
+        default=False,
+        help="Разрешить передачу аудио выбранному облачному сервису только в текущем запуске.",
     )
     parser.add_argument(
         "--openai-model",

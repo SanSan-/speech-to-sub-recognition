@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from speech_to_sub.exceptions import MediaError
-from speech_to_sub.media import ffmpeg
+from speech_to_sub.media import ffmpeg, windows_process
 from speech_to_sub.media.ffmpeg import (
     build_ffmpeg_normalize_args,
     decode_audio_float32,
@@ -19,6 +21,7 @@ from speech_to_sub.media.ffmpeg import (
     probe_media,
     select_audio_stream,
 )
+from speech_to_sub.media.windows_process import CREATE_SUSPENDED, WindowsProcessJob
 from speech_to_sub.models import AudioStreamInfo
 
 
@@ -109,6 +112,154 @@ def test_probe_media_real_subprocess_is_terminated_after_timeout(
         probe_media("зависший файл.mp4", timeout_seconds=0.1)
 
     assert time.monotonic() - started < 2.0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Проверка завершения дерева Windows")
+@pytest.mark.parametrize("parent_exits", [False, True])
+def test_terminate_process_tree_without_external_kill_utility(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parent_exits: bool
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    script = (
+        "import pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(8)']); "
+        "pid_path = pathlib.Path(sys.argv[1]); "
+        "pending_path = pid_path.with_suffix('.tmp'); "
+        "pending_path.write_text(str(child.pid), encoding='utf-8'); "
+        "pending_path.replace(pid_path); "
+        f"time.sleep({0 if parent_exits else 8})"
+    )
+    job = WindowsProcessJob()
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(child_pid_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED,
+    )
+    child = None
+
+    def unavailable_taskkill(args: list[str], **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", unavailable_taskkill)
+    try:
+        job.assign_and_resume(process.pid)
+        ready_deadline = time.monotonic() + 3.0
+        while not child_pid_path.is_file() and time.monotonic() < ready_deadline:
+            time.sleep(0.01)
+        assert child_pid_path.is_file()
+        child = psutil.Process(int(child_pid_path.read_text(encoding="utf-8")))
+        assert child.is_running()
+        if parent_exits:
+            process.wait(timeout=2.0)
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.communicate(timeout=0.01)
+        started = time.monotonic()
+
+        ffmpeg._terminate_process_tree(process, windows_job=job)
+
+        assert time.monotonic() - started < 2.0
+        assert process.poll() is not None
+        assert not child.is_running()
+    finally:
+        job.close()
+        if child is not None and child.is_running():
+            child.kill()
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=2.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Проверка владения деревом Windows")
+def test_probe_media_does_not_start_when_job_assignment_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "started.txt"
+    processes: list[subprocess.Popen[str]] = []
+    popen = subprocess.Popen
+
+    def capture_process(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    kernel32 = windows_process._load_kernel32()
+    monkeypatch.setattr(kernel32, "AssignProcessToJobObject", lambda *_args: False)
+    monkeypatch.setattr(windows_process, "_load_kernel32", lambda: kernel32)
+
+    monkeypatch.setattr(subprocess, "Popen", capture_process)
+    monkeypatch.setattr(
+        ffmpeg,
+        "build_ffprobe_args",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('started', encoding='utf-8')",
+            str(marker),
+        ],
+    )
+
+    with pytest.raises(OSError):
+        probe_media("sample.mp4", timeout_seconds=0.1)
+
+    assert not marker.exists()
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Проверка дескрипторов Windows")
+@pytest.mark.parametrize("operation", ["CreateJobObjectW", "SetInformationJobObject"])
+def test_windows_process_job_releases_handle_on_setup_failure(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    kernel32 = windows_process._load_kernel32()
+    close_handle = kernel32.CloseHandle
+    closed_handles: list[int] = []
+
+    def record_close(handle: int) -> int:
+        closed_handles.append(handle)
+        return close_handle(handle)
+
+    monkeypatch.setattr(kernel32, operation, lambda *_args: 0)
+    monkeypatch.setattr(kernel32, "CloseHandle", record_close)
+    monkeypatch.setattr(windows_process, "_load_kernel32", lambda: kernel32)
+
+    with pytest.raises(OSError):
+        WindowsProcessJob()
+
+    assert len(closed_handles) == (1 if operation == "SetInformationJobObject" else 0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Проверка дескрипторов Windows")
+def test_windows_process_job_rejects_invalid_process_without_leaking_job() -> None:
+    job = WindowsProcessJob()
+    try:
+        with pytest.raises(OSError):
+            job.assign_and_resume(0)
+    finally:
+        job.close()
+    job.close()
+
+
+def test_probe_media_real_subprocess_returns_valid_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ffmpeg,
+        "build_ffprobe_args",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            "print('{\"streams\": [], \"format\": {\"duration\": \"12.5\"}}')",
+        ],
+    )
+
+    probe = probe_media("sample.mp4")
+
+    assert probe.duration == 12.5
+    assert probe.streams == ()
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])

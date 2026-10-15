@@ -7,15 +7,16 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import uvicorn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from speech_to_sub.utils.logging_utils import WEB_RUNTIME_LOGGING_ENV  # noqa: E402
+from speech_to_sub.utils.logging_utils import WEB_RUNTIME_LOGGING_ENV
 
 os.environ.pop(WEB_RUNTIME_LOGGING_ENV, None)
 
@@ -34,10 +35,10 @@ for database_file in (
     database_file.unlink(missing_ok=True)
 os.environ["WEB_JOB_DB"] = str(E2E_JOB_DB)
 
-from speech_to_sub.web import app as web_app  # noqa: E402
-from speech_to_sub.web.job_store import SQLiteJobStore  # noqa: E402
-from speech_to_sub.web.jobs import JobRegistry  # noqa: E402
-from speech_to_sub.web.picker import PickSelection  # noqa: E402
+from speech_to_sub.web import app as web_app
+from speech_to_sub.web.job_store import SQLiteJobStore
+from speech_to_sub.web.jobs import JobRegistry
+from speech_to_sub.web.picker import PickSelection
 
 FAKE_PATHS = (
     r"D:\E2E\Лекция 01.mp4",

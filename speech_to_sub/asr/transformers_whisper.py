@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 from speech_to_sub.asr.base import CancelCheck, ProgressCallback
 from speech_to_sub.exceptions import AsrModelError, ProcessingCancelled
@@ -15,8 +16,8 @@ from speech_to_sub.models import (
     TranscriptSegment,
     TranscriptWord,
 )
-from speech_to_sub.utils.io_utils import validate_model_path
 from speech_to_sub.utils.env_utils import get_command_path
+from speech_to_sub.utils.io_utils import validate_model_path
 from speech_to_sub.utils.model_utils import (
     clear_model_memory,
     package_version,
@@ -92,6 +93,10 @@ class TransformersWhisperBackend:
                     generation=generation,
                 )
             except Exception as exc:
+                if not settings.allow_cpu_fallback or self._device_label != "cuda":
+                    raise AsrModelError(
+                        f"Локальная ASR-модель завершилась ошибкой: {exc}"
+                    ) from exc
                 output = self._retry_inference_on_cpu(
                     exc,
                     audio_samples=audio_samples,
@@ -168,11 +173,6 @@ class TransformersWhisperBackend:
         generation: Mapping[str, Any],
     ) -> Any:
         """Один раз повторяет неудачный CUDA-инференс на CPU, если это разрешено."""
-        if not settings.allow_cpu_fallback or self._device_label != "cuda":
-            raise AsrModelError(
-                f"Локальная ASR-модель завершилась ошибкой: {cuda_error}"
-            ) from cuda_error
-
         logger.warning("Инференс ASR на CUDA не удался, пробую CPU: %s", cuda_error)
         requested_key = self._load_key
         self.unload()
@@ -227,7 +227,7 @@ class TransformersWhisperBackend:
             token = self._processor.tokenizer.convert_ids_to_tokens(language_id)
             return _normalize_language_label(token, None)
         except Exception as exc:
-            logger.warning("Не удалось определить язык Whisper автоматически: %s", exc)
+            logger.warning("Не удалось определить язык Whisper автоматически: %s", exc, exc_info=True)
             return None
 
     def _load(

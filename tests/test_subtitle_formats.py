@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from itertools import pairwise
 
 import pytest
 
@@ -33,7 +34,7 @@ def test_srt_renderer_preserves_legacy_bytes() -> None:
     expected = (
         "1\n00:00:00,000 --> 00:00:01,234\nПривет, мир!\n\n"
         "2\n00:00:01,234 --> 00:00:03,000\nВторая\nстрока\n"
-    ).encode("utf-8")
+    ).encode()
 
     assert render_subtitles(cues, SubtitleFormat.SRT).encode("utf-8") == expected
     assert render_srt(cues).encode("utf-8") == expected
@@ -133,7 +134,7 @@ def test_renderers_quantize_zero_one_and_ten_millisecond_cues(
     assert all(cue.end > cue.start for cue in parsed)
     assert all(
         current.start >= previous.end
-        for previous, current in zip(parsed, parsed[1:], strict=False)
+        for previous, current in pairwise(parsed)
     )
 
 

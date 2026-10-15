@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from speech_to_sub.constants import (
     CLOUD_ASR_BACKENDS,
@@ -14,7 +17,7 @@ from speech_to_sub.constants import (
     SubtitleFormat,
 )
 from speech_to_sub.models import ProcessingSettings
-from speech_to_sub.utils.io_utils import atomic_write_json, read_text_utf8, sha256_file
+from speech_to_sub.utils.io_utils import atomic_write_json, sha256_file
 
 
 def build_source_fingerprint(path: Path) -> dict[str, Any]:
@@ -122,15 +125,37 @@ def build_layout_fingerprint(settings: ProcessingSettings) -> dict[str, Any]:
     }
 
 
-def load_sidecar(path: Path) -> dict[str, Any] | None:
-    """Читает sidecar или возвращает None при неверном формате."""
+SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarReadResult:
+    """Результат чтения с отдельным отказом по пределу входных байтов."""
+
+    data: dict[str, Any] | None = None
+    size_rejected: bool = False
+
+
+def read_sidecar(path: Path) -> SidecarReadResult:
+    """Ограничивает вход до декодирования и разбора JSON-кеша."""
     if not path.is_file():
-        return None
+        return SidecarReadResult()
     try:
-        value = json.loads(read_text_utf8(path))
+        with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size > SIDECAR_MAX_BYTES:
+                return SidecarReadResult(size_rejected=True)
+            payload = stream.read(SIDECAR_MAX_BYTES + 1)
+        if len(payload) > SIDECAR_MAX_BYTES:
+            return SidecarReadResult(size_rejected=True)
+        value = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
+        return SidecarReadResult()
+    return SidecarReadResult(data=value if isinstance(value, dict) else None)
+
+
+def load_sidecar(path: Path) -> dict[str, Any] | None:
+    """Читает допустимый sidecar или возвращает None при отказе."""
+    return read_sidecar(path).data
 
 
 def sidecar_matches(

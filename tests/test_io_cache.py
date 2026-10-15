@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 from speech_to_sub.constants import SIDECAR_SCHEMA_VERSION, SubtitleFormat
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
-from speech_to_sub.utils import io_utils
+from speech_to_sub.utils import cache, io_utils
 from speech_to_sub.utils.cache import (
     build_layout_fingerprint,
     build_recognition_fingerprint,
@@ -35,7 +36,7 @@ def test_utf8_reader_is_strict_and_atomic_writer_does_not_add_bom(
     target = tmp_path / "результат.txt"
     atomic_write_text_utf8(target, "Первая строка\nSecond line\n")
 
-    expected = "Первая строка\nSecond line\n".encode("utf-8")
+    expected = "Первая строка\nSecond line\n".encode()
     assert target.read_bytes() == expected
     assert read_text_utf8(target) == expected.decode("utf-8")
     assert has_utf8_bom(target) is False
@@ -541,3 +542,85 @@ def test_legacy_pipeline7_builder2_sidecar_reuses_only_recognition() -> None:
     )
     assert sidecar_fingerprints({**legacy, "sidecar_schema_version": 99}) is None
     assert sidecar_fingerprints({**legacy, "sidecar_schema_version": 2.0}) is None
+
+
+def test_sidecar_production_limit_is_64_mib() -> None:
+    assert cache.SIDECAR_MAX_BYTES == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_sidecar_byte_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: int,
+) -> None:
+    limit = 32
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit, raising=False)
+    path = tmp_path / "boundary.asr.json"
+    payload = b'{"ok": true}' + b" " * (limit - len(b'{"ok": true}') + extra_bytes)
+    path.write_bytes(payload)
+    if extra_bytes:
+        monkeypatch.setattr(
+            cache.json, "loads", lambda *_args: pytest.fail("JSON сверх лимита разобран"),
+        )
+    assert load_sidecar(path) == (None if extra_bytes else {"ok": True})
+    assert path.read_bytes() == payload
+
+
+def test_sidecar_limit_counts_utf8_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = '{"text": "яяяяяяяяяяяя"}'
+    limit = len(text)
+    assert len(text.encode("utf-8")) > limit
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit, raising=False)
+    path = tmp_path / "utf8.asr.json"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(
+        cache.json, "loads", lambda *_args: pytest.fail("JSON сверх лимита разобран"),
+    )
+    assert load_sidecar(path) is None
+
+
+def test_sidecar_growing_stream_is_bounded_before_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 32
+    monkeypatch.setattr(cache, "SIDECAR_MAX_BYTES", limit, raising=False)
+    path = tmp_path / "growing.asr.json"
+    path.write_bytes(b"{}")  # Предварительный размер меньше фактического потока.
+    handle = path.open("rb")
+
+    class BoundedStream(io.BytesIO):
+        consumed = 0
+
+        def fileno(self) -> int:
+            return handle.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= limit + 1 - self.consumed
+            chunk = super().read(size)
+            self.consumed += len(chunk)
+            return chunk
+
+    stream = BoundedStream(b"\xff" * (limit + 100))
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stream)
+    monkeypatch.setattr(
+        cache.json, "loads", lambda *_args: pytest.fail("JSON сверх лимита разобран"),
+    )
+    try:
+        assert load_sidecar(path) is None
+    finally:
+        handle.close()
+    assert stream.consumed == limit + 1
+
+
+@pytest.mark.parametrize("payload", [None, b"\xff", b"not-json", b"[]"])
+def test_sidecar_ordinary_read_failure_is_not_size_rejection(
+    tmp_path: Path, payload: bytes | None,
+) -> None:
+    path = tmp_path / "invalid.asr.json"
+    if payload is not None:
+        path.write_bytes(payload)
+    result = cache.read_sidecar(path)
+    assert result.data is None
+    assert result.size_rejected is False
+    assert load_sidecar(path) is None

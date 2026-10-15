@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 
 from speech_to_sub.constants import (
     DEFAULT_LINE_LENGTH_GAP,
@@ -276,7 +276,7 @@ def _rounded_timestamp_units(seconds: float, *, units_per_second: int) -> int:
             "Временная метка субтитров должна быть конечной и неотрицательной"
         )
     integral_seconds = math.floor(seconds)
-    fraction_units = int(round((seconds - integral_seconds) * units_per_second))
+    fraction_units = round((seconds - integral_seconds) * units_per_second)
     if fraction_units == units_per_second:
         integral_seconds += 1
         fraction_units = 0
@@ -1463,7 +1463,7 @@ def _interval_is_valid(start: float, end: float) -> bool:
 def _duration_milliseconds(duration: float) -> int:
     milliseconds = duration * 1000
     if math.isfinite(milliseconds):
-        return int(round(milliseconds))
+        return round(milliseconds)
     return int(duration) * 1000
 
 

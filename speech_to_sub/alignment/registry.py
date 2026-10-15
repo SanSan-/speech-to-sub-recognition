@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from speech_to_sub.alignment.base import AlignmentAdapter
-from speech_to_sub.asr.base import CancelCheck, ProgressCallback
 from speech_to_sub.alignment.qwen_forced import QwenForcedAlignerAdapter
+from speech_to_sub.asr.base import CancelCheck, ProgressCallback
 from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings, RuntimeSignature, Transcript
 
@@ -17,7 +17,6 @@ class NoAlignmentAdapter:
 
     def preflight(self, settings: ProcessingSettings) -> None:
         del settings
-        return None
 
     def expected_runtime_signature(
         self,

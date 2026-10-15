@@ -4,16 +4,20 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
+import pytest
+
+from speech_to_sub.utils.cache import build_source_fingerprint
 from speech_to_sub.web.job_store import SQLiteJobStore
 from speech_to_sub.web.jobs import (
     JobRegistry,
+    QueueLogHandler,
     _normalize_snapshot_for_read,
     _prepare_retry_item,
 )
-from speech_to_sub.utils.cache import build_source_fingerprint
 
 
 class RecordingStore(SQLiteJobStore):
@@ -558,3 +562,39 @@ def _sse_payloads(body: str) -> list[dict[str, Any]]:
         for line in body.splitlines()
         if line.startswith("data: ")
     ]
+
+
+@pytest.mark.parametrize("raise_exceptions", [False, True])
+def test_queue_log_handler_isolates_callback_failure_on_root(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raise_exceptions: bool,
+) -> None:
+    calls = 0
+
+    def broken_callback(_event: dict[str, Any]) -> None:
+        nonlocal calls
+        calls += 1
+        raise LookupError("Подписчик уже отключён")
+
+    handler = QueueLogHandler(broken_callback)
+    root_logger = logging.getLogger()
+    error_logger = logging.getLogger("speech_to_sub.web.jobs.queue_errors")
+    monkeypatch.setattr(logging, "raiseExceptions", raise_exceptions)
+    root_logger.addHandler(handler)
+    error_logger.addHandler(caplog.handler)
+    try:
+        logging.getLogger("test.queue_handler").warning("Стадия готова")
+    finally:
+        root_logger.removeHandler(handler)
+        error_logger.removeHandler(caplog.handler)
+        handler.close()
+
+    errors = [record for record in caplog.records if record.name == error_logger.name]
+    assert calls == 1
+    if raise_exceptions:
+        assert len(errors) == 1
+        assert errors[0].message == "Не удалось передать запись журнала подписчикам задачи."
+        assert errors[0].exc_info is not None
+    else:
+        assert errors == []

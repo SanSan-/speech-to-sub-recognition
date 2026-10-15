@@ -5,9 +5,10 @@ import ipaddress
 import logging
 import os
 import threading
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Callable, Mapping
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -26,22 +27,23 @@ from speech_to_sub.constants import (
     MAX_BATCH_PATHS,
     SUPPORTED_MEDIA_EXTENSIONS,
 )
+from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils.env_utils import (
     load_environment,
     settings_from_environment,
 )
 from speech_to_sub.utils.logging_utils import WEB_RUNTIME_LOGGING_ENV, setup_web_logging
+from speech_to_sub.web.job_store import SQLiteJobStore
 from speech_to_sub.web.jobs import (
     JobBusyError,
     JobNotFoundError,
     JobRegistry,
     JobStateError,
 )
-from speech_to_sub.web.job_store import SQLiteJobStore
 from speech_to_sub.web.picker import (
-    PickSelection,
     PickerError,
+    PickSelection,
     collect_media_paths,
     pick_paths,
 )
@@ -155,10 +157,10 @@ class ServiceAdapter:
     @staticmethod
     def unload() -> None:
         module = importlib.import_module("speech_to_sub.asr.registry")
-        unload_backends = getattr(module, "unload_backends")
+        unload_backends = module.unload_backends
         unload_backends()
         aligner_module = importlib.import_module("speech_to_sub.alignment.registry")
-        getattr(aligner_module, "unload_aligners")()
+        aligner_module.unload_aligners()
 
     @staticmethod
     def cleanup_workspaces() -> list[Path]:
@@ -170,7 +172,7 @@ service_api = ServiceAdapter()
 try:
     service_api.cleanup_workspaces()
 except Exception as exc:
-    logger.warning("Не удалось очистить устаревшие рабочие каталоги: %s", exc)
+    logger.warning("Не удалось очистить устаревшие рабочие каталоги: %s", exc, exc_info=True)
 job_registry = JobRegistry(store=SQLiteJobStore(_job_database_path()))
 preparation_registry = PreparationTracker()
 _picker_refresh_lock = threading.Lock()
@@ -211,14 +213,15 @@ async def protect_local_http_access(request: Request, call_next: Any) -> Any:
             status_code=403,
             content={"detail": "Локальный API доступен только через loopback."},
         )
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        if not _is_trusted_state_change(request, client_host=client_host):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": "Изменение состояния разрешено только локальному origin."
-                },
-            )
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _is_trusted_state_change(
+        request, client_host=client_host
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "Изменение состояния разрешено только локальному origin."
+            },
+        )
     return await call_next(request)
 
 
@@ -235,6 +238,7 @@ def health() -> dict[str, Any]:
     try:
         preflight = service_api.get_preflight_status(settings.model_dump(mode="json"))
     except Exception as exc:
+        logger.exception("Не удалось проверить готовность локального сервиса.")
         preflight = {
             "status": "degraded",
             "backend": {
@@ -606,7 +610,7 @@ def unload_models() -> dict[str, str]:
         try:
             service_api.unload()
         except Exception as exc:
-            logger.exception("Не удалось выгрузить локальную модель: %s", exc)
+            logger.exception("Не удалось выгрузить локальную модель.")
             raise HTTPException(
                 status_code=500,
                 detail=f"Не удалось выгрузить локальную модель: {exc}",
@@ -692,7 +696,7 @@ def _build_items(
             )
         return items
     except Exception as exc:
-        logger.exception("Не удалось подготовить карточки медиафайлов: %s", exc)
+        logger.exception("Не удалось подготовить карточки медиафайлов.")
         raise HTTPException(
             status_code=400,
             detail=f"Не удалось подготовить файлы: {exc}",
@@ -724,7 +728,7 @@ def _build_pending_items(
                 for path in paths
             ]
     except Exception as exc:
-        logger.exception("Не удалось подготовить очередь медиафайлов: %s", exc)
+        logger.exception("Не удалось подготовить очередь медиафайлов.")
         raise HTTPException(
             status_code=400,
             detail=f"Не удалось подготовить очередь: {exc}",
@@ -834,7 +838,7 @@ def _environment_settings() -> tuple[ProcessingSettingsPayload, str | None]:
     try:
         settings = settings_from_environment()
         return ProcessingSettingsPayload.model_validate(settings.to_dict()), None
-    except Exception:
+    except (ValidationError, ValueError):
         fallback = ProcessingSettings()
         warning = "Локальные настройки окружения некорректны."
         return ProcessingSettingsPayload.model_validate(fallback.to_dict()), warning

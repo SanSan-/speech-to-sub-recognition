@@ -13,8 +13,8 @@ import pytest
 from speech_to_sub.asr.openai_api import (
     MAX_UPLOAD_BYTES,
     OpenAiApiBackend,
-    OpenAiAuthenticationError,
     OpenAiAudioPreparationError,
+    OpenAiAuthenticationError,
     OpenAiRateLimitError,
     OpenAiResponseError,
 )

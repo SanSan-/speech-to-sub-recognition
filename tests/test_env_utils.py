@@ -16,7 +16,6 @@ from speech_to_sub.exceptions import ValidationError
 from speech_to_sub.models import ProcessingSettings
 from speech_to_sub.utils.env_utils import settings_from_environment
 
-
 _SETTING_VARIABLES = (
     "ASR_BACKEND",
     "ASR_MODEL_PATH",

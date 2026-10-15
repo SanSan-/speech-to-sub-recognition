@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -131,3 +132,45 @@ def test_worker_rejects_segment_over_180_seconds(
 
     with pytest.raises(ValueError, match="180"):
         runtime.align(payload)
+
+
+@pytest.mark.parametrize(
+    ("segments", "message"),
+    [
+        (None, "ForcedAligner не получил список ASR-сегментов."),
+        ("text", "ForcedAligner не получил список ASR-сегментов."),
+        ([None], "Некорректный ASR-сегмент 0."),
+    ],
+)
+def test_worker_preserves_invalid_segment_error_without_loading_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    segments: Any,
+    message: str,
+) -> None:
+    model_path = _checkpoint(tmp_path)
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    runtime = qwen_aligner_worker.QwenAlignerWorkerRuntime()
+    load_model = Mock(side_effect=AssertionError("Загрузка модели не разрешена."))
+    monkeypatch.setattr(runtime, "_normalized_audio", lambda _path: [0.0])
+    monkeypatch.setattr(runtime, "_ensure_loaded", load_model)
+    request = {
+        "id": "invalid-segments",
+        "command": "align",
+        "payload": {
+            "audio_path": str(audio),
+            "model_path": str(model_path),
+            "segments": segments,
+        },
+    }
+
+    response, should_stop = qwen_aligner_worker.handle_request(runtime, request, None)
+
+    assert response == {
+        "id": "invalid-segments",
+        "ok": False,
+        "error": {"type": "ValueError", "message": message},
+    }
+    assert should_stop is False
+    load_model.assert_not_called()

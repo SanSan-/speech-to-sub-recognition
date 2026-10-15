@@ -11,11 +11,12 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from filelock import FileLock, Timeout as FileLockTimeout
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from speech_to_sub.alignment.base import AlignmentAdapter
 from speech_to_sub.alignment.registry import aligner_names, get_aligner
@@ -28,8 +29,8 @@ from speech_to_sub.constants import (
     MAX_LINE_LENGTH_GAP,
     SIDECAR_SCHEMA_VERSION,
     SUPPORTED_OPENAI_MODELS,
-    SubtitleFormat,
     WORK_DIR,
+    SubtitleFormat,
 )
 from speech_to_sub.exceptions import (
     ProcessingCancelled,
@@ -62,9 +63,9 @@ from speech_to_sub.utils.cache import (
     build_layout_fingerprint,
     build_recognition_fingerprint,
     build_source_fingerprint,
-    load_sidecar,
-    sidecar_recognition_matches,
+    read_sidecar,
     sidecar_matches,
+    sidecar_recognition_matches,
     write_sidecar,
 )
 from speech_to_sub.utils.env_utils import get_command_path
@@ -79,6 +80,7 @@ from speech_to_sub.utils.io_utils import (
     discover_media_resilient,
     read_text_utf8,
 )
+from speech_to_sub.utils.worker_runtime import validate_selected_worker_pythons
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,13 @@ class _CachedRecognition:
     transcript: Transcript
     normalized_duration: float
     recognition_settings: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheLookup:
+    complete: bool = False
+    recognition: _CachedRecognition | None = None
+    size_rejected: bool = False
 
 
 def get_preflight_status(
@@ -319,7 +328,7 @@ def _apply_probe_result(
             progress=100,
             error=error_text,
         )
-        logger.warning("Не удалось проверить аудиопотоки файла %s: %s", path, exc)
+        logger.warning("Не удалось проверить аудиопотоки файла %s: %s", path, exc, exc_info=True)
         return f"Ошибка проверки аудиопотоков {path.name}: {error_text}"
 
 
@@ -475,7 +484,7 @@ def _report_preparation(
     try:
         callback(event)
     except Exception as exc:
-        logger.warning("Не удалось передать ход подготовки карточек: %s", exc)
+        logger.warning("Не удалось передать ход подготовки карточек: %s", exc, exc_info=True)
 
 
 def process_paths(
@@ -504,6 +513,8 @@ def process_paths(
         not _command_exists(ffmpeg_path) or not _command_exists(ffprobe_path)
     ):
         raise ValidationError("FFmpeg и ffprobe должны быть доступны до запуска пачки.")
+    if media_paths:
+        validate_selected_worker_pythons(settings)
 
     emit_event({"type": "job", "total": len(ordered_paths)})
     if not media_paths:
@@ -782,7 +793,7 @@ def _process_one_locked(
     log: LogCallback,
     cancel_check: CancelCheck | None,
 ) -> tuple[FileResult, AsrBackend | None]:
-    started_at = datetime.now(timezone.utc).isoformat()
+    started_at = datetime.now(UTC).isoformat()
     probe: MediaProbe | None = None
     _emit_file(emit_event, path, index, total, "probing", "Проверка потоков", 2)
     _write_log(log, f"Файл {index}/{total}: {path.name} — проверка потоков.")
@@ -891,7 +902,7 @@ def _process_one_locked(
             path=path,
             log=log,
         )
-        finished_at = datetime.now(timezone.utc).isoformat()
+        finished_at = datetime.now(UTC).isoformat()
         aligner_runtime = _loaded_aligner_runtime(aligner, settings, transcript)
         if settings.aligner != "none" and aligner_runtime is None:
             aligner_runtime = _expected_aligner_runtime(aligner, settings)
@@ -977,30 +988,33 @@ def _process_one_locked(
             ),
             backend,
         )
-    except Exception as exc:
+    except SpeechToSubError as exc:
         message = str(exc) or exc.__class__.__name__
-        _emit_file(
-            emit_event,
-            path,
-            index,
-            total,
-            "error",
-            "Ошибка",
-            100,
+    except Exception as exc:
+        logger.debug("Ошибка обработки файла %s", path, exc_info=True)
+        message = str(exc) or exc.__class__.__name__
+    _emit_file(
+        emit_event,
+        path,
+        index,
+        total,
+        "error",
+        "Ошибка",
+        100,
+        error=message,
+        probe=probe,
+    )
+    _write_log(log, f"Файл {index}/{total}: {path.name} — ошибка: {message}")
+    return (
+        FileResult(
+            input_path=path,
+            state="error",
+            output_format=settings.output_format,
             error=message,
             probe=probe,
-        )
-        _write_log(log, f"Файл {index}/{total}: {path.name} — ошибка: {message}")
-        return (
-            FileResult(
-                input_path=path,
-                state="error",
-                output_format=settings.output_format,
-                error=message,
-                probe=probe,
-            ),
-            backend,
-        )
+        ),
+        backend,
+    )
 
 
 def _reuse_existing_result(
@@ -1027,79 +1041,98 @@ def _reuse_existing_result(
         stream.ordinal,
         backend=backend if backend is not None else get_backend(settings.backend),
     )
-    cache_valid = _is_valid_cache_candidate(outputs, source, fingerprints)
-    if cache_valid:
-        if settings.keep_audio and not _has_saved_audio(outputs):
-            _save_cached_audio(
+    lookup = _lookup_cache(outputs, source, fingerprints)
+    if lookup.complete:
+        return _complete_cached_result(context, probe=probe, stream=stream), None
+    if outputs.subtitle_path.exists() or (
+        lookup.size_rejected and _has_existing_artifact(outputs)
+    ):
+        return (
+            _skip_existing_result(
                 context,
-                stream=stream,
-            )
-        _emit_file(
-            context.emit_event,
-            path,
-            context.index,
-            context.total,
-            "cached",
-            "Готовый кеш",
-            100,
-            outputs=outputs,
-            audio_output=outputs.normalized_audio_path if settings.keep_audio else None,
-        )
-        _write_log(
-            context.log,
-            f"Файл {context.index}/{context.total}: {path.name} — готовый кеш.",
-        )
-        return (
-            FileResult(
-                input_path=path,
-                state="cached",
-                subtitle_path=outputs.subtitle_path,
-                output_format=outputs.output_format,
-                sidecar_path=outputs.sidecar_path,
-                audio_path=outputs.normalized_audio_path
-                if settings.keep_audio
-                else None,
-                cached=True,
                 probe=probe,
+                size_rejected=lookup.size_rejected,
             ),
             None,
         )
-    if outputs.subtitle_path.exists():
-        _emit_file(
-            context.emit_event,
-            path,
-            context.index,
-            context.total,
-            "skipped",
-            f"{outputs.output_format.display_name} уже существует",
-            100,
-            outputs=outputs,
-        )
-        _write_log(
-            context.log,
-            f"Файл {context.index}/{context.total}: {path.name} — "
-            f"{outputs.output_format.display_name} безопасно пропущен.",
-        )
-        return (
-            FileResult(
-                input_path=path,
-                state="skipped",
-                subtitle_path=outputs.subtitle_path,
-                output_format=outputs.output_format,
-                sidecar_path=outputs.sidecar_path
-                if outputs.sidecar_path.exists()
-                else None,
-                skipped=True,
-                probe=probe,
-            ),
-            None,
-        )
-    cached_recognition = (
-        _load_cached_recognition(outputs, source, fingerprints[0])
-        if fingerprints is not None
-        else None
+    return None, lookup.recognition
+
+
+def _complete_cached_result(
+    context: _FileProcessingContext,
+    *,
+    probe: MediaProbe,
+    stream: AudioStreamInfo,
+) -> FileResult:
+    path = context.path
+    settings = context.settings
+    outputs = context.outputs
+    if settings.keep_audio and not _has_saved_audio(outputs):
+        _save_cached_audio(context, stream=stream)
+    _emit_file(
+        context.emit_event,
+        path,
+        context.index,
+        context.total,
+        "cached",
+        "Готовый кеш",
+        100,
+        outputs=outputs,
+        audio_output=outputs.normalized_audio_path if settings.keep_audio else None,
     )
-    return None, cached_recognition
+    _write_log(
+        context.log,
+        f"Файл {context.index}/{context.total}: {path.name} — готовый кеш.",
+    )
+    return FileResult(
+        input_path=path,
+        state="cached",
+        subtitle_path=outputs.subtitle_path,
+        output_format=outputs.output_format,
+        sidecar_path=outputs.sidecar_path,
+        audio_path=outputs.normalized_audio_path if settings.keep_audio else None,
+        cached=True,
+        probe=probe,
+    )
+
+
+def _skip_existing_result(
+    context: _FileProcessingContext,
+    *,
+    probe: MediaProbe,
+    size_rejected: bool,
+) -> FileResult:
+    path = context.path
+    outputs = context.outputs
+    stage = (
+        "JSON-кеш превышает 64 МиБ; существующие результаты сохранены"
+        if size_rejected
+        else f"{outputs.output_format.display_name} уже существует"
+    )
+    _emit_file(
+        context.emit_event,
+        path,
+        context.index,
+        context.total,
+        "skipped",
+        stage,
+        100,
+        outputs=outputs if outputs.subtitle_path.exists() else None,
+    )
+    _write_log(
+        context.log,
+        f"Файл {context.index}/{context.total}: {path.name} — "
+        f"{stage}; файл безопасно пропущен.",
+    )
+    return FileResult(
+        input_path=path,
+        state="skipped",
+        subtitle_path=outputs.subtitle_path if outputs.subtitle_path.exists() else None,
+        output_format=outputs.output_format,
+        sidecar_path=outputs.sidecar_path if outputs.sidecar_path.exists() else None,
+        skipped=True,
+        probe=probe,
+    )
 
 
 def _rebuild_subtitle_from_cached_recognition(
@@ -1167,7 +1200,7 @@ def _build_reused_sidecar(
     normalized_duration: float,
     subtitle_layout: Mapping[str, int | float],
 ) -> dict[str, Any]:
-    finished_at = datetime.now(timezone.utc).isoformat()
+    finished_at = datetime.now(UTC).isoformat()
     return _build_sidecar_payload(
         started_at=started_at,
         finished_at=finished_at,
@@ -1644,10 +1677,10 @@ def _is_valid_cache(
     *,
     recognition_settings: dict[str, Any],
     layout_settings: dict[str, Any],
+    sidecar: dict[str, Any] | None,
 ) -> bool:
     if not outputs.subtitle_path.is_file():
         return False
-    sidecar = load_sidecar(outputs.sidecar_path)
     if not sidecar_matches(
         sidecar,
         source,
@@ -1667,6 +1700,7 @@ def _is_valid_cache(
             line_length_gap=int(layout_settings["line_length_gap"]),
         )
     except Exception:
+        logger.debug("Не удалось проверить кеш субтитров %s", outputs.subtitle_path, exc_info=True)
         return False
     return True
 
@@ -1683,22 +1717,6 @@ def _cached_line_length_target(
             if isinstance(exceeded, (int, float)) and exceeded > 0:
                 return None
     return int(layout_settings["max_chars_per_line"])
-
-
-def _is_valid_cache_candidate(
-    outputs: OutputPaths,
-    source: dict[str, Any],
-    fingerprints: tuple[dict[str, Any], dict[str, Any]] | None,
-) -> bool:
-    """Проверяет найденную пару fingerprints как готовый кеш субтитров."""
-    if fingerprints is None:
-        return False
-    return _is_valid_cache(
-        outputs,
-        source,
-        recognition_settings=fingerprints[0],
-        layout_settings=fingerprints[1],
-    )
 
 
 def _cache_fingerprints_for_lookup(
@@ -1732,20 +1750,72 @@ def _cache_fingerprints_for_lookup(
     )
 
 
-def _load_cached_recognition(
+def _has_existing_artifact(outputs: OutputPaths) -> bool:
+    return any(
+        path.exists()
+        for path in (
+            outputs.subtitle_path,
+            outputs.sidecar_path,
+            outputs.normalized_audio_path,
+        )
+    )
+
+
+def _lookup_cache(
     outputs: OutputPaths,
     source: dict[str, Any],
-    recognition_settings: dict[str, Any],
-) -> _CachedRecognition | None:
+    fingerprints: tuple[dict[str, Any], dict[str, Any]] | None,
+) -> _CacheLookup:
+    """Читает кандидатов по одному и сохраняет причину отказа по размеру."""
+    size_rejected = False
     for sidecar_path in _recognition_sidecar_candidates(outputs):
-        sidecar = load_sidecar(sidecar_path)
-        cached = _cached_recognition_from_sidecar(
-            sidecar,
-            source,
-            recognition_settings,
+        result = read_sidecar(sidecar_path)
+        if result.size_rejected:
+            size_rejected = True
+            if _has_existing_artifact(outputs):
+                return _CacheLookup(size_rejected=True)
+        selected = _selected_cache_lookup(
+            outputs,
+            sidecar_path=sidecar_path,
+            source=source,
+            fingerprints=fingerprints,
+            sidecar=result.data,
+            size_rejected=size_rejected,
         )
-        if cached is not None:
-            return cached
+        if selected is not None:
+            return selected
+        if fingerprints is not None:
+            cached = _cached_recognition_from_sidecar(
+                result.data,
+                source,
+                fingerprints[0],
+            )
+            if cached is not None:
+                return _CacheLookup(recognition=cached)
+    return _CacheLookup(size_rejected=size_rejected)
+
+
+def _selected_cache_lookup(
+    outputs: OutputPaths,
+    *,
+    sidecar_path: Path,
+    source: dict[str, Any],
+    fingerprints: tuple[dict[str, Any], dict[str, Any]] | None,
+    sidecar: dict[str, Any] | None,
+    size_rejected: bool,
+) -> _CacheLookup | None:
+    if sidecar_path != outputs.sidecar_path:
+        return None
+    if fingerprints is not None and _is_valid_cache(
+        outputs,
+        source,
+        recognition_settings=fingerprints[0],
+        layout_settings=fingerprints[1],
+        sidecar=sidecar,
+    ):
+        return _CacheLookup(complete=True)
+    if outputs.subtitle_path.exists():
+        return _CacheLookup(size_rejected=size_rejected)
     return None
 
 
@@ -1920,7 +1990,12 @@ def _record_saved_audio(
     audio_source: Path,
     duration: float,
 ) -> None:
-    sidecar = load_sidecar(outputs.sidecar_path)
+    result = read_sidecar(outputs.sidecar_path)
+    if result.size_rejected:
+        raise ValidationError(
+            "JSON-кеш превышает 64 МиБ; прежние результаты сохранены, аудио не опубликовано."
+        )
+    sidecar = result.data
     if sidecar is None:
         raise ValidationError("Не найден sidecar подтверждённого кеша.")
     raw_outputs = sidecar.get("outputs")

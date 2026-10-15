@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_JOBS = 16
@@ -597,12 +597,12 @@ def _json_text(value: Any) -> str:
 def _json_object(value: str, label: str) -> dict[str, Any]:
     decoded = json.loads(value)
     if not isinstance(decoded, dict):
-        raise ValueError(f"{label} в SQLite должен быть JSON-объектом.")
+        raise TypeError(f"{label} в SQLite должен быть JSON-объектом.")
     return decoded
 
 
 def _utc_now() -> str:
-    return _format_utc(datetime.now(timezone.utc))
+    return _format_utc(datetime.now(UTC))
 
 
 def _utc_timestamp(value: Any, fallback: str) -> str:
@@ -611,7 +611,7 @@ def _utc_timestamp(value: Any, fallback: str) -> str:
     if isinstance(value, datetime):
         timestamp = value
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        timestamp = datetime.fromtimestamp(value, timezone.utc)
+        timestamp = datetime.fromtimestamp(value, UTC)
     elif isinstance(value, str):
         normalized = value.strip()
         if not normalized:
@@ -625,8 +625,8 @@ def _utc_timestamp(value: Any, fallback: str) -> str:
     else:
         raise TypeError("UTC timestamp должен быть строкой, datetime или Unix-временем.")
     if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return _format_utc(timestamp.astimezone(timezone.utc))
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return _format_utc(timestamp.astimezone(UTC))
 
 
 def _format_utc(value: datetime) -> str:

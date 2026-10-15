@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
+from itertools import pairwise
 
 import pytest
 
@@ -17,7 +18,6 @@ from speech_to_sub.subtitles.builder import (
 )
 from speech_to_sub.subtitles.layout import visible_character_count
 from speech_to_sub.subtitles.validator import validate_cues, validate_srt
-
 
 TARGET_CPS = 17.0
 MAX_DURATION = 7.0
@@ -731,7 +731,7 @@ def _segments_from_word_cuts(
 ) -> tuple[TranscriptSegment, ...]:
     boundaries = (0, *cuts, len(words))
     result = []
-    for segment_id, (left, right) in enumerate(zip(boundaries, boundaries[1:])):
+    for segment_id, (left, right) in enumerate(pairwise(boundaries)):
         segment_words = words[left:right]
         result.append(
             TranscriptSegment(

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,23 +15,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from speech_to_sub.alignment.registry import aligner_names, unload_aligners  # noqa: E402
-from speech_to_sub.asr.registry import backend_names, unload_backends  # noqa: E402
-from speech_to_sub.benchmark import ResourceSampler, analyze_srt  # noqa: E402
-from speech_to_sub.media.ffmpeg import probe_media  # noqa: E402
-from speech_to_sub.models import ProcessingSettings  # noqa: E402
-from speech_to_sub.service import process_paths  # noqa: E402
-from speech_to_sub.utils.io_utils import (  # noqa: E402
+from speech_to_sub.alignment.registry import aligner_names, unload_aligners
+from speech_to_sub.asr.registry import backend_names, unload_backends
+from speech_to_sub.benchmark import ResourceSampler, analyze_srt
+from speech_to_sub.media.ffmpeg import probe_media
+from speech_to_sub.models import ProcessingSettings
+from speech_to_sub.service import process_paths
+from speech_to_sub.utils.io_utils import (
     atomic_write_json,
     read_text_utf8,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
     _configure_console()
     parser = _build_parser()
     args = parser.parse_args(argv)
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     input_path = args.input.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     result_path = args.result.expanduser().resolve()
@@ -71,20 +74,23 @@ def main(argv: list[str] | None = None) -> int:
                 log=lambda message: print(message, flush=True),
             )
         except Exception as exc:  # benchmark обязан сохранить диагностический JSON
+            logger.exception("Ошибка выполнения ASR benchmark.")
             error = f"{type(exc).__name__}: {exc}"
         finally:
             try:
                 unload_backends()
             except Exception as unload_error:
+                logger.exception("Ошибка выгрузки модели после ASR benchmark.")
                 if error is None:
                     error = f"Ошибка выгрузки backend: {unload_error}"
             try:
                 unload_aligners()
             except Exception as unload_error:
+                logger.exception("Ошибка выгрузки модели после ASR benchmark.")
                 if error is None:
                     error = f"Ошибка выгрузки aligner: {unload_error}"
     wall_seconds = time.perf_counter() - wall_started
-    finished_at = datetime.now(timezone.utc)
+    finished_at = datetime.now(UTC)
     item = results[0] if results else {}
     if error is None and item.get("state") != "done":
         error = str(item.get("error") or f"Неожиданное состояние: {item.get('state')}")

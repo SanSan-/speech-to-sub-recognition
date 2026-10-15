@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 from speech_to_sub.models import ProcessingSettings, RuntimeSignature, Transcript
 

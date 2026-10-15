@@ -5,9 +5,10 @@ import json
 import os
 import shutil
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from speech_to_sub.constants import SUPPORTED_MEDIA_EXTENSIONS
 from speech_to_sub.exceptions import ValidationError

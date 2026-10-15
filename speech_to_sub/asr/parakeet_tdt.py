@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -11,7 +10,10 @@ from pathlib import Path
 from typing import Any, cast
 
 from speech_to_sub.asr.base import CancelCheck, ProgressCallback
-from speech_to_sub.asr.external_worker import ExternalWorkerError, PersistentNdjsonWorker
+from speech_to_sub.asr.external_worker import (
+    ExternalWorkerError,
+    PersistentNdjsonWorker,
+)
 from speech_to_sub.exceptions import AsrModelError, ProcessingCancelled, ValidationError
 from speech_to_sub.models import (
     ProcessingSettings,
@@ -20,9 +22,12 @@ from speech_to_sub.models import (
     TranscriptSegment,
     TranscriptWord,
 )
+from speech_to_sub.utils.worker_runtime import (
+    require_worker_python,
+    resolve_worker_python,
+)
 
 WORKER_MODULE = "speech_to_sub.workers.parakeet_worker"
-DEFAULT_WORKER_RELATIVE_PATH = Path("resources/runtimes/parakeet/Scripts/python.exe")
 _SUPPORTED_LANGUAGES = frozenset({"auto", "en", "ru"})
 
 WorkerFactory = Callable[[Path, str], PersistentNdjsonWorker]
@@ -130,12 +135,7 @@ class ParakeetTdtBackend:
         cancel_check: CancelCheck | None = None,
     ) -> _PreparedRequest:
         model_path = _local_checkpoint(settings.model_path)
-        worker_python = _worker_python_path(settings)
-        if not worker_python.is_file():
-            raise ValidationError(
-                "Python изолированного Parakeet runtime не найден: "
-                f"{worker_python}. Укажите PARAKEET_ASR_PYTHON или worker_python_path."
-            )
+        worker_python = require_worker_python(settings, self.backend_id)
         result = self._client_for(worker_python).request(
             "preflight",
             {
@@ -485,11 +485,7 @@ def _local_checkpoint(value: Path | str) -> Path:
 
 
 def _worker_python_path(settings: ProcessingSettings) -> Path:
-    configured = getattr(settings, "worker_python_path", None)
-    raw_path = configured or os.environ.get("PARAKEET_ASR_PYTHON")
-    if raw_path:
-        return Path(str(raw_path)).expanduser().resolve()
-    return (Path(__file__).resolve().parents[2] / DEFAULT_WORKER_RELATIVE_PATH).resolve()
+    return resolve_worker_python(settings, ParakeetTdtBackend.backend_id)
 
 
 def _settings_key(settings: ProcessingSettings) -> tuple[str, str, str, bool]:

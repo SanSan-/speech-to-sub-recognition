@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from collections.abc import Sequence
 from typing import Literal
 
 from speech_to_sub.exceptions import ValidationError
@@ -581,9 +581,7 @@ def _merge_global_hyphen_suffixes(
 ) -> tuple[TranscriptWord, ...]:
     result: list[TranscriptWord] = []
     for word in words:
-        if result and _is_hyphen_suffix(word.text):
-            result[-1] = _merge_words(result[-1], word, separator="")
-        elif result and result[-1].text.endswith("-"):
+        if result and (_is_hyphen_suffix(word.text) or result[-1].text.endswith("-")):
             result[-1] = _merge_words(result[-1], word, separator="")
         else:
             result.append(word)

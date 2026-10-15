@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 
 from speech_to_sub.exceptions import ValidationError
@@ -123,7 +125,7 @@ def test_builder_uses_segment_timestamps_and_limits_text_to_two_lines() -> None:
     assert len(cues) >= 2
     assert all(len(cue.text.splitlines()) <= 2 for cue in cues)
     assert all(max(map(len, cue.text.splitlines())) <= 24 for cue in cues)
-    assert all(left.end <= right.start for left, right in zip(cues, cues[1:]))
+    assert all(left.end <= right.start for left, right in pairwise(cues))
 
 
 def test_build_srt_creates_valid_utf8_text_without_bom() -> None:
@@ -384,7 +386,10 @@ def test_builder_keeps_raw_speech_inside_extended_cue() -> None:
     assert cues[0].text == (
         "Первая содержательная фраза.\nВторая содержательная фраза."
     )
-    assert cues[0].start <= 5.0 <= 6.8 <= 7.0 <= 8.8 <= cues[0].end
+    assert all(
+        cues[0].start <= word.start <= word.end <= cues[0].end
+        for word in segment.words
+    )
 
 
 def test_builder_merges_hyphen_suffix_across_segments() -> None:

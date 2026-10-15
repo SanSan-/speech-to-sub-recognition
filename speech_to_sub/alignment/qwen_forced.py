@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -12,7 +11,10 @@ from typing import Any, cast
 
 from speech_to_sub.asr.base import CancelCheck, ProgressCallback
 from speech_to_sub.asr.checkpoints import require_local_checkpoint
-from speech_to_sub.asr.external_worker import ExternalWorkerError, PersistentNdjsonWorker
+from speech_to_sub.asr.external_worker import (
+    ExternalWorkerError,
+    PersistentNdjsonWorker,
+)
 from speech_to_sub.constants import QWEN_ALIGNMENT_MAX_SEGMENT_SECONDS
 from speech_to_sub.exceptions import AsrModelError, ProcessingCancelled, ValidationError
 from speech_to_sub.models import (
@@ -22,9 +24,12 @@ from speech_to_sub.models import (
     TranscriptSegment,
     TranscriptWord,
 )
+from speech_to_sub.utils.worker_runtime import (
+    require_worker_python,
+    resolve_worker_python,
+)
 
 WORKER_MODULE = "speech_to_sub.workers.qwen_aligner_worker"
-DEFAULT_WORKER_RELATIVE_PATH = Path("resources/runtimes/qwen/Scripts/python.exe")
 MAX_ALIGNMENT_SEGMENT_SECONDS = float(QWEN_ALIGNMENT_MAX_SEGMENT_SECONDS)
 
 WorkerFactory = Callable[[Path, str], PersistentNdjsonWorker]
@@ -64,13 +69,7 @@ class QwenForcedAlignerAdapter:
     def preflight(self, settings: ProcessingSettings) -> Path:
         """Проверяет локальные веса и Python worker-а без загрузки модели."""
         model_path = _model_path(settings)
-        worker_python = _worker_python_path(settings)
-        if not worker_python.is_file():
-            raise ValidationError(
-                "Python изолированного Qwen runtime не найден: "
-                f"{worker_python}. Укажите ASR_ALIGNER_WORKER_PYTHON или "
-                "aligner_worker_python_path."
-            )
+        require_worker_python(settings, self.aligner_id)
         return model_path
 
     def expected_runtime_signature(self, settings: ProcessingSettings) -> RuntimeSignature:
@@ -658,16 +657,7 @@ def _model_path(settings: ProcessingSettings) -> Path:
 
 
 def _worker_python_path(settings: ProcessingSettings) -> Path:
-    configured = settings.aligner_worker_python_path
-    raw_path = (
-        configured
-        or os.environ.get("ASR_ALIGNER_WORKER_PYTHON")
-        or os.environ.get("QWEN_ASR_PYTHON")
-    )
-    if raw_path:
-        return Path(str(raw_path)).expanduser().resolve()
-    project_root = Path(__file__).resolve().parents[2]
-    return (project_root / DEFAULT_WORKER_RELATIVE_PATH).resolve()
+    return resolve_worker_python(settings, QwenForcedAlignerAdapter.aligner_id)
 
 
 def _settings_key(settings: ProcessingSettings) -> tuple[str, str, str, bool]:

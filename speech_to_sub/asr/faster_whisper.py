@@ -111,6 +111,8 @@ class FasterWhisperBackend:
             except ProcessingCancelled:
                 raise
             except Exception as exc:
+                if not settings.allow_cpu_fallback or self._device_label != "cuda":
+                    raise AsrModelError(f"faster-whisper завершился ошибкой: {exc}") from exc
                 transcript = self._retry_on_cpu(
                     exc,
                     audio_path,
@@ -186,8 +188,6 @@ class FasterWhisperBackend:
         progress_callback: ProgressCallback | None,
         cancel_check: CancelCheck | None,
     ) -> Transcript:
-        if not settings.allow_cpu_fallback or self._device_label != "cuda":
-            raise AsrModelError(f"faster-whisper завершился ошибкой: {original_error}") from original_error
         logger.warning("Инференс faster-whisper на CUDA не удался, повторяю на CPU: %s", original_error)
         requested_key = self._load_key
         self.unload()

@@ -316,8 +316,8 @@ def _format_ass_timestamp(total_centiseconds: int) -> str:
 
 __all__ = [
     "ASS_DEFAULT_STYLE",
-    "ASS_EVENT_MASK",
     "ASS_EVENTS_FORMAT",
+    "ASS_EVENT_MASK",
     "ASS_SCRIPT_INFO_LINES",
     "ASS_STYLE_FORMAT",
     "AssEvent",

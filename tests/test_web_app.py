@@ -7,8 +7,9 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,8 +17,8 @@ from fastapi.testclient import TestClient
 from speech_to_sub import service as service_module
 from speech_to_sub.asr import registry as asr_registry
 from speech_to_sub.models import AudioStreamInfo, MediaProbe
-from speech_to_sub.web import app as web_app
 from speech_to_sub.web import __main__ as web_main
+from speech_to_sub.web import app as web_app
 from speech_to_sub.web.__main__ import _read_port, _read_reload
 from speech_to_sub.web.job_store import SQLiteJobStore
 from speech_to_sub.web.jobs import JobNotFoundError, JobRegistry
@@ -219,8 +220,8 @@ def test_static_page_and_config_have_no_secret_fields(
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.6.0"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.6.0"
+    assert health.json()["version"] == "1.8.0"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.8.0"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"
@@ -1793,3 +1794,46 @@ def _parse_sse_events(body: str) -> list[dict[str, Any]]:
                 }
             )
     return events
+
+
+@pytest.mark.parametrize(
+    "invalid_settings",
+    [
+        {"ASR_BACKEND": "invalid-secret-marker"},
+        {"ASR_LONG_FORM_WINDOW_SECONDS": "5", "ASR_LONG_FORM_OVERLAP_SECONDS": "5"},
+    ],
+)
+def test_health_preserves_safe_fallback_for_invalid_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_service: FakeService,
+    caplog: pytest.LogCaptureFixture,
+    invalid_settings: dict[str, str],
+) -> None:
+    for name, value in invalid_settings.items():
+        monkeypatch.setenv(name, value)
+
+    response = TestClient(web_app.app).get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["settings_error"] == "Локальные настройки окружения некорректны."
+    assert fake_service.preflight_settings[-1]["backend"] == "faster-whisper"
+    assert "invalid-secret-marker" not in response.text
+    assert "invalid-secret-marker" not in caplog.text
+
+
+def test_health_isolates_unexpected_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_service: FakeService,
+) -> None:
+    def failed_preflight(_settings: dict[str, Any]) -> dict[str, Any]:
+        raise LookupError("Контролируемый отказ проверки готовности")
+
+    monkeypatch.setattr(fake_service, "get_preflight_status", failed_preflight)
+
+    response = TestClient(web_app.app).get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["backend"]["available"] is False
+    assert response.json()["backend"]["error"] == "Контролируемый отказ проверки готовности"

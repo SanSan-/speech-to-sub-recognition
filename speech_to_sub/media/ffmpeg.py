@@ -15,6 +15,7 @@ from typing import Any, TypedDict, cast
 import numpy as np
 
 from speech_to_sub.exceptions import MediaError
+from speech_to_sub.media.windows_process import CREATE_SUSPENDED, WindowsProcessJob
 from speech_to_sub.models import AudioStreamInfo, MediaProbe
 
 LOGGER = logging.getLogger(__name__)
@@ -22,7 +23,6 @@ LOGGER = logging.getLogger(__name__)
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 WarningCallback = Callable[[str], None]
 DEFAULT_FFPROBE_TIMEOUT_SECONDS = 30.0
-_PROCESS_TREE_KILL_TIMEOUT_SECONDS = 0.75
 _PROCESS_DRAIN_TIMEOUT_SECONDS = 0.5
 _PROCESS_FINAL_WAIT_SECONDS = 0.25
 
@@ -146,25 +146,36 @@ def _run_ffprobe_process(
         "encoding": "utf-8",
         "errors": "strict",
     }
+    windows_job = None
     if os.name == "nt":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        windows_job = WindowsProcessJob()
+        popen_options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
+        )
     else:
         popen_options["start_new_session"] = True
-    process = subprocess.Popen(args, **popen_options)
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(process)
-        raise
+        process = subprocess.Popen(args, **popen_options)
+        try:
+            if windows_job is not None:
+                windows_job.assign_and_resume(process.pid)
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except BaseException:
+            _terminate_process_tree(process, windows_job=windows_job)
+            raise
+    finally:
+        if windows_job is not None:
+            windows_job.close()
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
-def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    if process.poll() is None:
-        if os.name == "nt":
-            _kill_windows_process_tree(process.pid)
-        else:
-            _kill_posix_process_group(process.pid)
+def _terminate_process_tree(
+    process: subprocess.Popen[str], *, windows_job: WindowsProcessJob | None = None
+) -> None:
+    if windows_job is not None:
+        windows_job.close()
+    elif process.poll() is None:
+        _kill_posix_process_group(process.pid)
     if process.poll() is None:
         try:
             process.kill()
@@ -184,26 +195,6 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=_PROCESS_FINAL_WAIT_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         LOGGER.error("Не удалось подтвердить завершение ffprobe PID=%s.", process.pid)
-
-
-def _kill_windows_process_tree(process_id: int) -> None:
-    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    taskkill = system_root / "System32" / "taskkill.exe"
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        subprocess.run(
-            [str(taskkill), "/PID", str(process_id), "/T", "/F"],
-            shell=False,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
-            creationflags=creation_flags,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        LOGGER.warning(
-            "Не удалось завершить дерево ffprobe PID=%s: %s", process_id, exc
-        )
 
 
 def _kill_posix_process_group(process_id: int) -> None:

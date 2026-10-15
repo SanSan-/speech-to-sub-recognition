@@ -185,7 +185,8 @@ class OpenAiApiBackend:
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            raise _map_openai_error(exc) from None
+            exc = _map_openai_error(exc)
+            raise exc from None
         self._client_key_digest = digest
         return self._client
 
@@ -394,7 +395,8 @@ def _request_transcription(
         with chunk_path.open("rb") as audio_file:
             return client.audio.transcriptions.create(file=audio_file, **kwargs)
     except Exception as exc:
-        raise _map_openai_error(exc) from None
+        exc = _map_openai_error(exc)
+        raise exc from None
 
 
 def _normalize_response(
@@ -721,13 +723,13 @@ def _map_openai_error(exc: Exception) -> OpenAiApiError:
 
 __all__ = [
     "DEFAULT_OPENAI_TRANSCRIPTION_MODEL",
+    "SUPPORTED_MODELS",
     "OpenAiApiBackend",
     "OpenAiApiError",
-    "OpenAiAuthenticationError",
     "OpenAiAudioPreparationError",
+    "OpenAiAuthenticationError",
     "OpenAiConnectionError",
     "OpenAiRateLimitError",
     "OpenAiRequestError",
     "OpenAiResponseError",
-    "SUPPORTED_MODELS",
 ]

@@ -9,7 +9,8 @@ import threading
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any
+from itertools import pairwise
+from typing import Any, Self
 
 import psutil
 
@@ -39,7 +40,7 @@ class ResourceSampler(AbstractContextManager["ResourceSampler"]):
         self.peak_vram_mib: int | None = self.start_vram_mib
         self.vram_scope: str | None = "total_gpu" if self.start_vram_mib is not None else None
 
-    def __enter__(self) -> ResourceSampler:
+    def __enter__(self) -> Self:
         self._thread = threading.Thread(
             target=self._sample_loop,
             name="asr-resource-sampler",
@@ -124,7 +125,7 @@ def analyze_srt(
     cue_durations = [cue.end - cue.start for cue in cues]
     overlap_count = sum(
         current.start < previous.end
-        for previous, current in zip(cues, cues[1:])
+        for previous, current in pairwise(cues)
     )
     visible_chars = [
         len(" ".join(line.strip() for line in cue.text.splitlines()))
@@ -154,7 +155,7 @@ def analyze_srt(
         "word_timestamp_count": len(word_spans),
         "non_monotonic_word_timestamp_count": sum(
             current[0] < previous[1]
-            for previous, current in zip(word_spans, word_spans[1:])
+            for previous, current in pairwise(word_spans)
         ),
         "word_timestamps_after_300_seconds": sum(
             start >= 300.0 for start, _end, _text in word_spans
