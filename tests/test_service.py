@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -550,6 +551,71 @@ def test_cleanup_stale_workspaces_removes_only_safe_unlocked_job_directories(
     assert unmanaged.is_dir()
     assert wrong_prefix.is_dir()
     assert outside.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Требуется Windows junction")
+def test_cleanup_stale_workspaces_preserves_junction_target(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    target = work_dir / "user-data"
+    nested = target / "nested"
+    nested.mkdir(parents=True)
+    marker = target / service.WORKSPACE_LOCK_NAME
+    payloads = {
+        marker: b"user-owned-marker",
+        target / "original.txt": b"original-data",
+        nested / "original.bin": b"nested-original-data",
+    }
+    for path, content in payloads.items():
+        path.write_bytes(content)
+    stale = work_dir / "job-stale"
+    stale.mkdir()
+    stale_marker = stale / service.WORKSPACE_LOCK_NAME
+    stale_marker.write_text("", encoding="utf-8")
+    junction = work_dir / "job-junction"
+    powershell = (
+        Path(os.environ["SystemRoot"])
+        / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    try:
+        subprocess.run(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "$ErrorActionPreference = 'Stop'; "
+                    "New-Item -ItemType Junction -Path $env:ASR_TEST_JUNCTION "
+                    "-Target $env:ASR_TEST_JUNCTION_TARGET | Out-Null"
+                ),
+            ],
+            env={
+                **os.environ,
+                "ASR_TEST_JUNCTION": str(junction),
+                "ASR_TEST_JUNCTION_TARGET": str(target),
+            },
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert junction.is_junction()
+        assert junction.resolve(strict=True) == target.resolve(strict=True)
+        for path in (target, marker, stale, stale_marker):
+            os.utime(path, (100.0, 100.0))
+
+        removed = service.cleanup_stale_workspaces(
+            work_dir, ttl_seconds=100, now=1_000.0,
+        )
+
+        assert target.is_dir()
+        assert junction.is_junction()
+        assert junction.resolve(strict=True) == target.resolve(strict=True)
+        assert {path: path.read_bytes() for path in payloads} == payloads
+        assert removed == [stale.resolve()]
+        assert not stale.exists()
+    finally:
+        if junction.is_junction():
+            junction.rmdir()
 
 
 def test_preflight_uses_selected_registry_backend(

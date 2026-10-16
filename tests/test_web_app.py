@@ -220,8 +220,8 @@ def test_static_page_and_config_have_no_secret_fields(
     assert config.status_code == 200
     assert health.status_code == 200
     assert health.json()["service"] == "speech-to-sub-recognition"
-    assert health.json()["version"] == "1.8.0"
-    assert client.get("/openapi.json").json()["info"]["version"] == "1.8.0"
+    assert health.json()["version"] == "1.9.0"
+    assert client.get("/openapi.json").json()["info"]["version"] == "1.9.0"
     assert health.json()["backend"]["id"] == "faster-whisper"
     defaults = config.json()["defaults"]
     assert defaults["backend"] == "faster-whisper"

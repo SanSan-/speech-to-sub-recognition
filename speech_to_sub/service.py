@@ -78,6 +78,7 @@ from speech_to_sub.utils.io_utils import (
     atomic_copy_file,
     atomic_write_text_utf8,
     discover_media_resilient,
+    is_link_or_junction,
     read_text_utf8,
 )
 from speech_to_sub.utils.worker_runtime import validate_selected_worker_pythons
@@ -636,7 +637,7 @@ def _stale_workspace_target(
     now: float,
 ) -> Path | None:
     """Проверяет имя, границы, маркер и возраст рабочего каталога."""
-    if not candidate.name.startswith("job-") or candidate.is_symlink():
+    if not candidate.name.startswith("job-") or is_link_or_junction(candidate):
         return None
     try:
         target = candidate.resolve(strict=True)

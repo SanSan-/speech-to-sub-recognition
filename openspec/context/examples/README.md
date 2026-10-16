@@ -87,3 +87,16 @@
 ```powershell
 .\.venv\Scripts\python.exe -B -X utf8 -m pytest -p no:cacheprovider -q tests/test_io_cache.py tests/test_service.py
 ```
+
+## Сохранность цели junction при очистке
+
+Исключение junction по [WEB-010](../../specs/local-web-workflow/spec.md#requirement-web-010-очистка-и-история) выполняется в
+[service.py](../../../speech_to_sub/service.py) через общий детектор `is_link_or_junction` из
+[io_utils.py](../../../speech_to_sub/utils/io_utils.py).
+
+В [test_service.py](../../../tests/test_service.py) сценарий `test_cleanup_stale_workspaces_preserves_junction_target`
+создаёт настоящий NTFS junction на соседний пользовательский каталог внутри временного `WORK_DIR`.
+Проверяются сохранность ссылки и её прежней цели, неизменность байтов маркера и файлов, включая вложенный,
+и удаление отдельного обычного устаревшего `job-*`. Сценарий выполняется на Windows;
+`test_cleanup_stale_workspaces_removes_only_safe_unlocked_job_directories` сохраняет проверки возраста,
+активной блокировки, маркера владения и границ очистки.
